@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>{{ title }}</title>
+</head>
+<body>
+    <h1>Trading Dashboard</h1>
+
+    <h2>Live Data</h2>
+
+    <p><strong>Price:</strong> <span id="price"></span></p>
+    <p><strong>Signal:</strong> <span id="signal"></span></p>
+    <p><strong>Strategy:</strong> <span id="strategy"></span></p>
+    <p><strong>Source:</strong> <span id="source"></span></p>
+
+    <h3>Paper Trading</h3>
+
+    <p><strong>Balance (USD):</strong> <span id="balance"></span></p>
+    <p><strong>Position (BTC):</strong> <span id="position"></span></p>
+    <p><strong>Total Equity:</strong> <span id="equity"></span></p>
+
+    <button onclick="connectExchange()">Connect Exchange</button>
+    <button onclick="fetchMarket()">Fetch BTC Price</button>
+    <button onclick="startStream()">Start Live BTC Stream</button>
+    
+    <script>
+        let socket;
+
+        async function connectExchange() {
+            const res = await fetch("/connect/mock");
+            const data = await res.json();
+            document.getElementById("output").innerText =
+                JSON.stringify(data, null, 2);
+        }
+
+        async function fetchMarket() {
+            const res = await fetch("/market/btc");
+            const data = await res.json();
+            document.getElementById("output").innerText =
+                JSON.stringify(data, null, 2);
+        }
+
+        function startStream() {
+            socket = new WebSocket("ws://127.0.0.1:9000/ws/price/btc");
+
+            function formatUSD(value) {
+                if (value === null || value === undefined) return "-";
+
+                const number = Number(value);
+
+                return number.toLocaleString("en-US", {
+                    style: "currency",
+                    currency: "USD",
+                    minimumFractionDigits: 2
+                });
+            }
+
+            socket.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+
+                document.getElementById("price").innerText = formatUSD(data.price_usd);
+                document.getElementById("strategy").innerText = data.strategy ?? "-";
+                document.getElementById("source").innerText = data.source ?? "-";
+
+                document.getElementById("balance").innerText = formatUSD(data.balance_usd);
+                document.getElementById("position").innerText = data.position_btc ?? "-";
+                document.getElementById("equity").innerText = formatUSD(data.total_equity);
+
+                let signalElement = document.getElementById("signal");
+                signalElement.innerText = data.signal ?? "WAIT";
+
+                if (data.signal === "BUY") {
+                    signalElement.style.color = "green";
+                } else if (data.signal === "SELL") {
+                    signalElement.style.color = "red";
+                } else if (data.signal === "HOLD") {
+                    signalElement.style.color = "orange";
+                } else {
+                    signalElement.style.color = "gray";
+                }
+            };
+
+            socket.onclose = function() {
+                console.log("WebSocket closed");
+            };
+        }
+
+    </script>
+
+    <p><a href="/backtest.html">Go to Backtest Page</a></p>
+
+</body>
+</html>

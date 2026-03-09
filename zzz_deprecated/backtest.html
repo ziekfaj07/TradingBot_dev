@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Backtest Page</title>
+</head>
+<body>
+
+<h1>EMA Backtest</h1>
+
+<input type="text" id="symbol" value="bitcoin">
+<input type="number" id="days" value="180">
+<button onclick="runBacktest()">Run Backtest</button>
+
+<hr>
+
+<div id="results"></div>
+
+<script>
+async function runBacktest() {
+
+    const symbol = document.getElementById("symbol").value;
+    const days = document.getElementById("days").value;
+
+    const response = await fetch(`/api/backtest/${symbol}?days=${days}`);
+    const data = await response.json();
+
+    if (data.error) {
+        document.getElementById("results").innerHTML = data.error;
+        return;
+    }
+
+    const r = data.results;
+
+    document.getElementById("results").innerHTML = `
+        <p><strong>Symbol:</strong> ${data.symbol}</p>
+        <p><strong>Days Tested:</strong> ${data.days_tested}</p>
+        <p><strong>Initial Balance:</strong> $${r.initial_balance.toFixed(2)}</p>
+        <p><strong>Final Equity:</strong> $${r.final_equity.toFixed(2)}</p>
+        <p><strong>Profit:</strong> $${r.profit.toFixed(2)}</p>
+        <p><strong>Return:</strong> ${r.return_percent.toFixed(2)}%</p>
+        <p><strong>Total Trades:</strong> ${r.total_trades}</p>
+    `;
+}
+</script>
+
+</body>
+</html>
