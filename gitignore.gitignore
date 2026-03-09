@@ -1,5 +1,7 @@
 # Python
 __pycache__/
+*.py[cod]
+*$py.class
 *.pyc
 *.pyo
 *.pyd
@@ -9,6 +11,9 @@ __pycache__/
 # Virtual env
 venv/
 .venv/
+env/
+ENV/
+*_venv/
 
 # Env secrets
 .env
@@ -25,3 +30,6 @@ Thumbs.db
 # Logs / data (optional — adjust to your project)
 logs/
 data/
+
+# data files
+.parquet
