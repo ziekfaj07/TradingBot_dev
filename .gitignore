@@ -33,3 +33,4 @@ data/
 
 # data files
 .parquet
+*.parquet
