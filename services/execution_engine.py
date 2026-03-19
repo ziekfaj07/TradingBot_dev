@@ -261,10 +261,8 @@ class ExecutionEngine:
 
         return state, fill
     
-    def enter_short():
-        print("You've just entered a SHORT position")
-        print("This is just a place holder function for entering SHORT position")
+    def enter_short(self, *args, **kwargs):
+        raise NotImplementedError("Short trading is not implemented yet.")
 
-    def exit_short():
-        print("You've exited you SHORT position")
-        print("This is just a place holder function for exiting SHORT position")
+    def exit_short(self, *args, **kwargs):
+        raise NotImplementedError("Short trading is not implemented yet.")

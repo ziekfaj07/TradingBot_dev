@@ -112,6 +112,7 @@ class ModeController:
         self._bars: list[dict] = []
         self._last_processed_bar_ts: int | None = None
         self._last_signal: int = 0
+        self._fills: list = []
 
     # -----------------------
     # Public API
@@ -281,6 +282,8 @@ class ModeController:
             "bar_count": len(self._bars),
             "last_processed_bar_ts": self._last_processed_bar_ts,
             "last_signal": self._last_signal,
+            "fill_count": len(self._fills),
+            "fills": [getattr(f, "__dict__", f) for f in self._fills[-10:]],
             "paper_state": self._serialize_state(),
         }
 
@@ -310,6 +313,7 @@ class ModeController:
         self._last_processed_bar_ts = None
         self._last_signal = 0
         self._trade_id = 0
+        self._fills = []
 
     def _build_runtime_objects(self) -> None:
         cfg = self._status.config
@@ -344,7 +348,7 @@ class ModeController:
                 self._status.state = EngineState.ERROR
                 self._status.last_error = str(e)
                 self._status.stopped_at = time.time()
-            raise
+            return
 
     async def _paper_step(self) -> None:
         cfg = self._status.config
@@ -551,16 +555,30 @@ class ModeController:
             state=self._state,
             market_price=price,
             market_type=self._status.config.market_type,
-            # leverage=self._status.config.leverage,
         )
 
+        # Current engine method returns a bool liquidation condition, not a price.
+        # So do not store it as liquidation_price.
         if self._status.config.market_type == "futures":
-            liq = self._engine.compute_liquidation_price(
+            is_liquidatable = self._engine.compute_liquidation_price(
                 state=self._state,
+                market_type=self._status.config.market_type,
+                market_price=price,
                 leverage=self._status.config.leverage,
-                maintenance_margin=self._status.config.maintenance_margin,
             )
-            self._state.liquidation_price = liq
+            self._state.liquidation_price = None
+
+            if is_liquidatable and self._state.position_qty != 0.0:
+                self._trade_id += 1
+                self._state, fill = self._engine.liquidate(
+                    ts_iso=str(int(time.time())),
+                    state=self._state,
+                    close=price,
+                    market_type=self._status.config.market_type,
+                    trade_id=self._trade_id,
+                )
+                if fill:
+                    self._fills.append(fill)
 
     def _serialize_state(self) -> dict | None:
         if self._state is None:

@@ -49,29 +49,33 @@ def run_signal_backed_loop(
         close = float(df["close"].iloc[i])
         signal = int(df["signal"].iloc[i])
 
-        # futures liquidation guard
-        if engine.liquidation_check(state, market_type, close, leverage) and state.pos_qty != 0.0:
+        if (
+            engine.compute_liquidation_price(
+                state=state,
+                market_type=market_type,
+                market_price=close,
+                leverage=leverage,
+            )
+            and state.position_qty != 0.0
+        ):
             state, fill = engine.liquidate(ts_iso, state, close, market_type, trade_id)
             if fill:
                 trades.append(fill.__dict__)
                 liquidated = True
-                # after liquidation, reset baseline to current cash
                 open_trade_equity_baseline = state.cash
-                trade_id += 1
+            trade_id += 1
 
-        # ENTRY/EXIT logic (long-only unless allow_short + futures)
-        if signal == 1 and state.pos_qty == 0.0:
+        if signal == 1 and state.position_qty == 0.0:
             trade_id += 1
             state, fill = engine.enter_long(ts_iso, state, close, market_type, leverage, trade_id)
             if fill:
                 trades.append(fill.__dict__)
-                # baseline: equity right after entry (or current equity)
                 open_trade_equity_baseline = engine.mark_equity(state, market_type, close)
 
-        elif signal == -1 and state.pos_qty > 0.0:
+        elif signal == -1 and state.position_qty > 0.0:
+            trade_id += 1
             state, fill = engine.exit_long(ts_iso, state, close, market_type, trade_id)
             if fill:
-                # compute realized pnl vs baseline
                 realized_pnl = float(fill.equity_after) - float(open_trade_equity_baseline)
                 fill.pnl = realized_pnl
                 trades.append(fill.__dict__)
