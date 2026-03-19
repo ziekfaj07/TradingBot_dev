@@ -51,7 +51,11 @@ class GateIOService(MarketDataService):
     SYMBOL_MAP = {
         "btcusdt": "BTC_USDT",
         "ethusdt": "ETH_USDT",
-        "solusdt": "SOL_USDT"
+        "solusdt": "SOL_USDT",
+        "dogeusdt": "DOGE_USDT",
+        "pepeusdt": "PEPE_USDT",
+        "wifusdt": "WIF_USDT",
+        "bonkusdt": "BONK_USDT"
     }
 
     INTERVAL_MAP = {

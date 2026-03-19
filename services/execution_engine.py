@@ -54,7 +54,7 @@ class ExecutionEngine:
 
     # ---------- Risk / liquidation ----------
 
-    def compte_liquidation_price(self, state: PortfolioState, market_type: str, market_price: float, leverage: float) -> bool:
+    def compute_liquidation_price(self, state: PortfolioState, market_type: str, market_price: float, leverage: float) -> bool:
         mt = (market_type or "spot").lower()
         if mt != "futures":
             return False
@@ -260,3 +260,11 @@ class ExecutionEngine:
         state.side = None
 
         return state, fill
+    
+    def enter_short():
+        print("You've just entered a SHORT position")
+        print("This is just a place holder function for entering SHORT position")
+
+    def exit_short():
+        print("You've exited you SHORT position")
+        print("This is just a place holder function for exiting SHORT position")
