@@ -163,21 +163,27 @@ class ExecutionEngine:
         if sell_px <= 0 or not math.isfinite(sell_px):
             return state, None
 
+        exit_qty = float(state.position_qty)
         entry_px = float(state.entry_price) if state.entry_price is not None else float(sell_px)
 
         if mt == "spot":
-            notional = abs(state.position_qty) * sell_px
+            notional = abs(exit_qty) * sell_px
             fee = notional * self.fee_rate
             state.cash = float(notional - fee)
 
         else:
             # Futures (linear): realize PnL into wallet, then pay exit fee
-            pnl = float(state.position_qty) * (float(sell_px) - entry_px)
+            pnl = float(exit_qty) * (float(sell_px) - entry_px)
             state.cash = float(state.cash) + pnl
 
-            notional = abs(state.position_qty) * sell_px
+            notional = abs(exit_qty) * sell_px
             fee = notional * self.fee_rate
             state.cash = float(state.cash) - float(fee)
+
+        # reset position before computing ending equity
+        state.position_qty = 0.0
+        state.entry_price = None
+        state.side = None
 
         eq_after = self.mark_equity(state, mt, close)
 
@@ -186,7 +192,7 @@ class ExecutionEngine:
             type="EXIT",
             side="long",
             price=float(sell_px),
-            qty=float(state.position_qty),
+            qty=float(exit_qty),
             fee=float(fee),
             equity_after=float(eq_after),
             entry_price=float(entry_px),
@@ -194,11 +200,6 @@ class ExecutionEngine:
             trade_id=int(trade_id),
             pnl=None,  # caller (BacktestService) sets realized pnl vs baseline if desired
         )
-
-        # reset position
-        state.position_qty = 0.0
-        state.entry_price = None
-        state.side = None
 
         return state, fill
 
@@ -225,9 +226,10 @@ class ExecutionEngine:
             state.side = None
             return state, None
 
+        exit_qty = float(state.position_qty)
         entry_px = float(state.entry_price) if state.entry_price is not None else float(exit_px)
 
-        notional = abs(state.position_qty) * exit_px
+        notional = abs(exit_qty) * exit_px
         fee = notional * self.fee_rate
 
         if mt == "spot":
@@ -235,8 +237,13 @@ class ExecutionEngine:
             state.cash = float(state.cash + state.position_qty * exit_px - fee)
         else:
             # Futures linear: realize pnl and pay fee
-            pnl = float(state.position_qty) * (float(exit_px) - entry_px)
+            pnl = float(exit_qty) * (float(exit_px) - entry_px)
             state.cash = float(state.cash) + pnl - float(fee)
+
+        # reset
+        state.position_qty = 0.0
+        state.entry_price = None
+        state.side = None
 
         eq_after = self.mark_equity(state, mt, close)
 
@@ -245,7 +252,7 @@ class ExecutionEngine:
             type="LIQUIDATION",
             side=state.side or "long",
             price=float(exit_px),
-            qty=float(state.position_qty),
+            qty=float(exit_qty),
             fee=float(fee),
             equity_after=float(eq_after),
             entry_price=float(entry_px),
@@ -253,11 +260,6 @@ class ExecutionEngine:
             trade_id=int(trade_id),
             pnl=None,
         )
-
-        # reset
-        state.position_qty = 0.0
-        state.entry_price = None
-        state.side = None
 
         return state, fill
     
