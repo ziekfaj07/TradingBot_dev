@@ -1,5 +1,8 @@
+from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 
 from routers.dashboard_router import router as dashboard_router
 from routers.backtest_router import router as backtest_router
@@ -24,8 +27,25 @@ app.include_router(export_router)
 app.include_router(run_router)
 app.include_router(ws_router)
 
+BASE_DIR = Path(__file__).resolve().parent
+FRONTEND_DIR = BASE_DIR / "templates"
 
-# Then define routes
+
+@app.get("/")
+def root():
+    return FileResponse(FRONTEND_DIR / "dashboard.html")
+
+
+@app.get("/dashboard")
+def dashboard_page():
+    return FileResponse(FRONTEND_DIR / "dashboard.html")
+
+
+@app.get("/backtest")
+def backtest_page():
+    return FileResponse(FRONTEND_DIR / "backtest.html")
+
+
 @app.get("/health")
 def health_check():
     return {"status": "ok", "message": "Trading Lab backend running"}

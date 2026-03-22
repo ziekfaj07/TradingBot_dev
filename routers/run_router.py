@@ -36,6 +36,10 @@ class ConfigureBody(BaseModel):
     equity_stride: int | None = None
     poll_seconds: float | None = None
 
+    ema_short: int | None = None
+    ema_long: int | None = None
+    candle_limit: int | None = None
+
 
 @router.get("/status")
 async def status():

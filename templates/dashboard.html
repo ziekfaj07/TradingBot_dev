@@ -1,93 +1,952 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>{{ title }}</title>
+  <meta charset="utf-8" />
+  <title>{{ title or "Trading Dashboard" }}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root {
+      --bg: #0f172a;
+      --panel: #111827;
+      --panel-2: #1f2937;
+      --text: #e5e7eb;
+      --muted: #94a3b8;
+      --green: #22c55e;
+      --red: #ef4444;
+      --yellow: #f59e0b;
+      --blue: #38bdf8;
+      --border: #334155;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: Arial, Helvetica, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    .container {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+
+    h1, h2, h3 {
+      margin-top: 0;
+    }
+
+    .subtle {
+      color: var(--muted);
+    }
+
+    .grid {
+      display: grid;
+      gap: 16px;
+    }
+
+    .grid-2 {
+      grid-template-columns: 1.2fr 1fr;
+    }
+
+    .grid-3 {
+      grid-template-columns: repeat(3, 1fr);
+    }
+
+    .grid-4 {
+      grid-template-columns: repeat(4, 1fr);
+    }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px;
+    }
+
+    .card h3 {
+      margin-bottom: 12px;
+    }
+
+    .row {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      min-width: 140px;
+      flex: 1;
+    }
+
+    label {
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    input, select, button, textarea {
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--text);
+      padding: 10px 12px;
+      font-size: 14px;
+    }
+
+    button {
+      cursor: pointer;
+      transition: 0.15s ease;
+    }
+
+    button:hover {
+      opacity: 0.92;
+    }
+
+    .btn-primary { background: #2563eb; }
+    .btn-green { background: #166534; }
+    .btn-red { background: #991b1b; }
+    .btn-gray { background: #374151; }
+
+    .metric {
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+    }
+
+    .metric .label {
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+
+    .metric .value {
+      font-size: 20px;
+      font-weight: 700;
+    }
+
+    .status-pill {
+      display: inline-block;
+      border-radius: 999px;
+      padding: 6px 10px;
+      font-size: 12px;
+      font-weight: 700;
+      border: 1px solid var(--border);
+    }
+
+    .pill-running { background: rgba(34, 197, 94, 0.15); color: #86efac; }
+    .pill-stopped { background: rgba(239, 68, 68, 0.15); color: #fca5a5; }
+    .pill-wait { background: rgba(148, 163, 184, 0.15); color: #cbd5e1; }
+    .pill-buy { background: rgba(34, 197, 94, 0.15); color: #86efac; }
+    .pill-sell { background: rgba(239, 68, 68, 0.15); color: #fca5a5; }
+
+    .good { color: var(--green); }
+    .bad { color: var(--red); }
+    .warn { color: var(--yellow); }
+    .muted { color: var(--muted); }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+
+    th, td {
+      text-align: left;
+      padding: 10px 8px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+
+    th {
+      color: var(--muted);
+      font-weight: 600;
+    }
+
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .scroll {
+      overflow-x: auto;
+    }
+
+    #messages {
+      white-space: pre-wrap;
+      line-height: 1.45;
+      font-size: 13px;
+      color: var(--muted);
+      max-height: 180px;
+      overflow: auto;
+    }
+
+    #equityChart {
+      width: 100%;
+      height: 260px;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+    }
+
+    .tiny {
+      font-size: 12px;
+    }
+
+    .danger-note {
+      margin-top: 10px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: rgba(239, 68, 68, 0.08);
+      border: 1px solid rgba(239, 68, 68, 0.25);
+      color: #fecaca;
+    }
+
+    .ok-note {
+      margin-top: 10px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: rgba(34, 197, 94, 0.08);
+      border: 1px solid rgba(34, 197, 94, 0.25);
+      color: #bbf7d0;
+    }
+
+    @media (max-width: 1100px) {
+      .grid-2, .grid-3, .grid-4 {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
 </head>
 <body>
-    <h1>Trading Dashboard</h1>
+  <div class="container">
+    <div class="row" style="justify-content: space-between; margin-bottom: 16px;">
+      <div>
+        <h1>Trading Bot Dashboard</h1>
+        <div class="subtle">Run the bot from the browser, observe trades live, and validate runtime behavior quickly.</div>
+      </div>
+      <div class="row">
+        <a href="/backtest" style="color: var(--blue); text-decoration: none;">Backtest Page</a>
+      </div>
+    </div>
 
-    <h2>Live Data</h2>
+    <div class="grid grid-2">
+      <div class="card">
+        <h3>Bot Control Panel</h3>
 
-    <p><strong>Price:</strong> <span id="price"></span></p>
-    <p><strong>Signal:</strong> <span id="signal"></span></p>
-    <p><strong>Strategy:</strong> <span id="strategy"></span></p>
-    <p><strong>Source:</strong> <span id="source"></span></p>
+        <div class="grid grid-4">
+          <div class="field">
+            <label>Mode</label>
+            <select id="mode">
+              <option value="paper" selected>paper</option>
+              <option value="backtest">backtest</option>
+              <option value="live">live</option>
+            </select>
+          </div>
 
-    <h3>Paper Trading</h3>
+          <div class="field">
+            <label>Symbol</label>
+            <input id="symbol" value="SOLUSDT" />
+          </div>
 
-    <p><strong>Balance (USD):</strong> <span id="balance"></span></p>
-    <p><strong>Position (BTC):</strong> <span id="position"></span></p>
-    <p><strong>Total Equity:</strong> <span id="equity"></span></p>
+          <div class="field">
+            <label>Interval</label>
+            <select id="interval">
+              <option value="1m" selected>1m</option>
+              <option value="5m">5m</option>
+              <option value="15m">15m</option>
+              <option value="1h">1h</option>
+              <option value="4h">4h</option>
+              <option value="1d">1d</option>
+            </select>
+          </div>
 
-    <button onclick="connectExchange()">Connect Exchange</button>
-    <button onclick="fetchMarket()">Fetch BTC Price</button>
-    <button onclick="startStream()">Start Live BTC Stream</button>
-    
-    <script>
-        let socket;
+          <div class="field">
+            <label>Market Type</label>
+            <select id="market_type">
+              <option value="spot" selected>spot</option>
+              <option value="futures">futures</option>
+            </select>
+          </div>
+        </div>
 
-        async function connectExchange() {
-            const res = await fetch("/connect/mock");
-            const data = await res.json();
-            document.getElementById("output").innerText =
-                JSON.stringify(data, null, 2);
+        <div class="grid grid-4" style="margin-top: 12px;">
+          <div class="field">
+            <label>Initial Balance</label>
+            <input id="initial_balance" type="number" step="0.01" value="1000" />
+          </div>
+
+          <div class="field">
+            <label>Fee Rate</label>
+            <input id="fee_rate" type="number" step="0.0001" value="0.001" />
+          </div>
+
+          <div class="field">
+            <label>Slippage (bps)</label>
+            <input id="slippage_bps" type="number" step="0.1" value="2" />
+          </div>
+
+          <div class="field">
+            <label>Leverage</label>
+            <input id="leverage" type="number" step="1" value="1" />
+          </div>
+        </div>
+
+        <div class="grid grid-4" style="margin-top: 12px;">
+          <div class="field">
+            <label>EMA Short</label>
+            <input id="ema_short" type="number" step="1" value="9" />
+          </div>
+
+          <div class="field">
+            <label>EMA Long</label>
+            <input id="ema_long" type="number" step="1" value="21" />
+          </div>
+
+          <div class="field">
+            <label>Candle Limit</label>
+            <input id="candle_limit" type="number" step="1" value="300" />
+          </div>
+
+          <div class="field">
+            <label>Poll Seconds</label>
+            <input id="poll_seconds" type="number" step="1" value="1" />
+          </div>
+        </div>
+
+        <div class="grid grid-4" style="margin-top: 12px;">
+          <div class="field">
+            <label>Allow Short</label>
+            <select id="allow_short">
+              <option value="false" selected>false</option>
+              <option value="true">true</option>
+            </select>
+          </div>
+
+          <div class="field">
+            <label>Max Leverage</label>
+            <input id="max_leverage" type="number" step="1" value="1" />
+          </div>
+
+          <div class="field">
+            <label>Max Qty</label>
+            <input id="max_qty" type="number" step="0.0001" value="100000" />
+          </div>
+
+          <div class="field">
+            <label>Maintenance Margin</label>
+            <input id="maintenance_margin" type="number" step="0.0001" value="0.005" />
+          </div>
+        </div>
+
+        <div class="grid grid-4" style="margin-top: 12px;">
+          <div class="field">
+            <label>Include Equity</label>
+            <select id="include_equity">
+              <option value="true" selected>true</option>
+              <option value="false">false</option>
+            </select>
+          </div>
+
+          <div class="field">
+            <label>Equity Stride</label>
+            <input id="equity_stride" type="number" step="1" value="1" />
+          </div>
+
+          <div class="field">
+            <label>Start</label>
+            <input id="start" placeholder="optional" />
+          </div>
+
+          <div class="field">
+            <label>End</label>
+            <input id="end" placeholder="optional" />
+          </div>
+        </div>
+
+        <div class="row" style="margin-top: 16px;">
+          <button class="btn-primary" id="configureBtn">Configure</button>
+          <button class="btn-green" id="startBtn">Start</button>
+          <button class="btn-red" id="stopBtn">Stop</button>
+          <button class="btn-gray" id="refreshBtn">Refresh Status</button>
+
+          <label class="row tiny" style="margin-left: 8px;">
+            <input id="autoRefresh" type="checkbox" />
+            Auto-refresh
+          </label>
+        </div>
+
+        <div id="configWarnings"></div>
+      </div>
+
+      <div class="card">
+        <h3>Runtime Summary</h3>
+
+        <div class="row" style="margin-bottom: 12px;">
+          <div>
+            <div class="tiny muted">Bot State</div>
+            <div id="botStatePill" class="status-pill pill-stopped">unknown</div>
+          </div>
+          <div>
+            <div class="tiny muted">Last Signal</div>
+            <div id="signalPill" class="status-pill pill-wait">WAIT</div>
+          </div>
+        </div>
+
+        <div class="grid grid-3">
+          <div class="metric">
+            <div class="label">Mode</div>
+            <div class="value" id="metricMode">-</div>
+          </div>
+          <div class="metric">
+            <div class="label">Run ID</div>
+            <div class="value mono" id="metricRunId" style="font-size: 13px;">-</div>
+          </div>
+          <div class="metric">
+            <div class="label">Fill Count</div>
+            <div class="value" id="metricFillCount">0</div>
+          </div>
+        </div>
+
+        <div class="grid grid-3" style="margin-top: 12px;">
+          <div class="metric">
+            <div class="label">Cash</div>
+            <div class="value" id="metricCash">-</div>
+          </div>
+          <div class="metric">
+            <div class="label">Position Qty</div>
+            <div class="value" id="metricPositionQty">-</div>
+          </div>
+          <div class="metric">
+            <div class="label">Entry Price</div>
+            <div class="value" id="metricEntryPrice">-</div>
+          </div>
+        </div>
+
+        <div class="grid grid-3" style="margin-top: 12px;">
+          <div class="metric">
+            <div class="label">Equity</div>
+            <div class="value" id="metricEquity">-</div>
+          </div>
+          <div class="metric">
+            <div class="label">Realized PnL</div>
+            <div class="value" id="metricRealizedPnl">-</div>
+          </div>
+          <div class="metric">
+            <div class="label">Liquidation Price</div>
+            <div class="value" id="metricLiquidationPrice">-</div>
+          </div>
+        </div>
+
+        <div class="grid grid-4" style="margin-top: 12px;">
+          <div class="metric">
+            <div class="label">Latest Close</div>
+            <div class="value" id="metricLatestClose">-</div>
+          </div>
+          <div class="metric">
+            <div class="label">Latest Bar TS</div>
+            <div class="value mono" id="metricLatestBarTs" style="font-size: 13px;">-</div>
+          </div>
+          <div class="metric">
+            <div class="label">Last Processed TS</div>
+            <div class="value mono" id="metricProcessedTs" style="font-size: 13px;">-</div>
+          </div>
+          <div class="metric">
+            <div class="label">Bar Count</div>
+            <div class="value" id="metricBarCount">-</div>
+          </div>
+        </div>
+
+        <div class="ok-note" id="lastErrorBox" style="display:none;"></div>
+        <div class="danger-note" id="dangerBox" style="display:none;"></div>
+      </div>
+    </div>
+
+    <div class="grid grid-2" style="margin-top: 16px;">
+      <div class="card">
+        <h3>Equity Monitor</h3>
+        <canvas id="equityChart" width="800" height="260"></canvas>
+        <div class="tiny subtle" style="margin-top: 8px;">
+          Live equity chart from polled status snapshots. Useful for spotting drift, churn, and execution issues.
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Live Notes</h3>
+        <div id="messages">Waiting for status...</div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top: 16px;">
+      <h3>Recent Fills</h3>
+      <div class="scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Timestamp</th>
+              <th>Type</th>
+              <th>Side</th>
+              <th>Price</th>
+              <th>Qty</th>
+              <th>Fee</th>
+              <th>Trade ID</th>
+              <th>PnL</th>
+              <th>Equity After</th>
+            </tr>
+          </thead>
+          <tbody id="fillsBody">
+            <tr><td colspan="9" class="muted">No fills yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top: 16px;">
+      <h3>Raw Status</h3>
+      <pre id="rawStatus" class="mono" style="white-space: pre-wrap; overflow:auto; max-height: 300px;"></pre>
+    </div>
+  </div>
+
+  <script>
+    const API_BASE = "/api/run";
+
+    let refreshTimer = null;
+    let equityPoints = [];
+    let lastSeenFillCount = 0;
+
+    function num(v, digits = 6) {
+      if (v === null || v === undefined || Number.isNaN(Number(v))) return "-";
+      return Number(v).toLocaleString("en-US", {
+        minimumFractionDigits: 0,
+        maximumFractionDigits: digits
+      });
+    }
+
+    function usd(v) {
+      if (v === null || v === undefined || Number.isNaN(Number(v))) return "-";
+      return Number(v).toLocaleString("en-US", {
+        style: "currency",
+        currency: "USD",
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2
+      });
+    }
+
+    function boolValue(id) {
+      return document.getElementById(id).value === "true";
+    }
+
+    function readText(id) {
+      return document.getElementById(id).value.trim();
+    }
+
+    function readNumber(id) {
+      const value = document.getElementById(id).value;
+      return value === "" ? null : Number(value);
+    }
+
+    function buildPayload() {
+      const payload = {
+        symbol: readText("symbol").toUpperCase(),
+        interval: readText("interval"),
+        market_type: readText("market_type"),
+        start: readText("start") || null,
+        end: readText("end") || null,
+        initial_balance: readNumber("initial_balance"),
+        fee_rate: readNumber("fee_rate"),
+        slippage_bps: readNumber("slippage_bps"),
+        allow_short: boolValue("allow_short"),
+        leverage: readNumber("leverage"),
+        maintenance_margin: readNumber("maintenance_margin"),
+        max_leverage: readNumber("max_leverage"),
+        max_qty: readNumber("max_qty"),
+        include_equity: boolValue("include_equity"),
+        equity_stride: readNumber("equity_stride"),
+        poll_seconds: readNumber("poll_seconds"),
+        ema_short: readNumber("ema_short"),
+        ema_long: readNumber("ema_long"),
+        candle_limit: readNumber("candle_limit")
+      };
+
+      return payload;
+    }
+
+    function validateConfig(payload) {
+      const warnings = [];
+
+      if (!payload.symbol) warnings.push("Symbol is required.");
+      if (!payload.interval) warnings.push("Interval is required.");
+      if ((payload.ema_short ?? 0) >= (payload.ema_long ?? 0)) {
+        warnings.push("EMA Short should be lower than EMA Long.");
+      }
+      if ((payload.fee_rate ?? 0) >= 0.01) {
+        warnings.push("Fee rate looks very high. 0.01 means 1% per side.");
+      }
+      if ((payload.poll_seconds ?? 0) < 1) {
+        warnings.push("Poll seconds below 1 may be too aggressive.");
+      }
+      if (payload.market_type === "spot" && (payload.leverage ?? 1) !== 1) {
+        warnings.push("Spot mode usually uses leverage = 1.");
+      }
+      if (payload.market_type === "spot" && (payload.maintenance_margin ?? 0) >= 1) {
+        warnings.push("Maintenance margin of 1 is usually not meaningful for spot mode.");
+      }
+      if ((payload.max_qty ?? 0) <= 0) {
+        warnings.push("Max qty must be greater than 0.");
+      }
+
+      return warnings;
+    }
+
+    function renderConfigWarnings(warnings) {
+      const box = document.getElementById("configWarnings");
+      if (!warnings.length) {
+        box.innerHTML = `<div class="ok-note">Config looks sane.</div>`;
+        return;
+      }
+
+      box.innerHTML = `
+        <div class="danger-note">
+          <strong>Config warnings</strong><br>
+          ${warnings.map(w => `• ${w}`).join("<br>")}
+        </div>
+      `;
+    }
+
+    async function setMode() {
+      const mode = readText("mode");
+      const res = await fetch(`${API_BASE}/mode`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode })
+      });
+      return await res.json();
+    }
+
+    async function configureBot() {
+      const payload = buildPayload();
+      renderConfigWarnings(validateConfig(payload));
+
+      const res = await fetch(`${API_BASE}/configure`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      return { ok: res.ok, data: await res.json() };
+    }
+
+    async function startBot() {
+      const res = await fetch(`${API_BASE}/start`, { method: "POST" });
+      return { ok: res.ok, data: await res.json() };
+    }
+
+    async function stopBot() {
+      const res = await fetch(`${API_BASE}/stop`, { method: "POST" });
+      return { ok: res.ok, data: await res.json() };
+    }
+
+    async function fetchStatus() {
+      const res = await fetch(`${API_BASE}/status`);
+      const data = await res.json();
+      return { ok: res.ok, data };
+    }
+
+    function appendMessage(text) {
+      const el = document.getElementById("messages");
+      const ts = new Date().toLocaleTimeString();
+      el.textContent = `[${ts}] ${text}\n` + el.textContent;
+    }
+
+    function setStatePill(state) {
+      const el = document.getElementById("botStatePill");
+      el.textContent = state || "unknown";
+      el.className = "status-pill " + (state === "running" ? "pill-running" : "pill-stopped");
+    }
+
+    function setSignalPill(signal) {
+      const el = document.getElementById("signalPill");
+      if (signal === 1) {
+        el.textContent = "BUY / LONG";
+        el.className = "status-pill pill-buy";
+      } else if (signal === -1) {
+        el.textContent = "SELL / EXIT";
+        el.className = "status-pill pill-sell";
+      } else {
+        el.textContent = "WAIT";
+        el.className = "status-pill pill-wait";
+      }
+    }
+
+    function drawEquityChart() {
+      const canvas = document.getElementById("equityChart");
+      const ctx = canvas.getContext("2d");
+      const w = canvas.width;
+      const h = canvas.height;
+
+      ctx.clearRect(0, 0, w, h);
+      ctx.fillStyle = "#1f2937";
+      ctx.fillRect(0, 0, w, h);
+
+      if (equityPoints.length < 2) {
+        ctx.fillStyle = "#94a3b8";
+        ctx.font = "14px Arial";
+        ctx.fillText("Waiting for more equity points...", 20, 30);
+        return;
+      }
+
+      const values = equityPoints.map(p => p.equity);
+      const min = Math.min(...values);
+      const max = Math.max(...values);
+      const pad = 20;
+      const range = max - min || 1;
+
+      ctx.strokeStyle = "#334155";
+      ctx.lineWidth = 1;
+
+      for (let i = 0; i < 4; i++) {
+        const y = pad + ((h - pad * 2) * i / 3);
+        ctx.beginPath();
+        ctx.moveTo(pad, y);
+        ctx.lineTo(w - pad, y);
+        ctx.stroke();
+      }
+
+      ctx.strokeStyle = "#38bdf8";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+
+      equityPoints.forEach((p, i) => {
+        const x = pad + (i * (w - pad * 2) / Math.max(1, equityPoints.length - 1));
+        const y = h - pad - ((p.equity - min) / range) * (h - pad * 2);
+
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+
+      ctx.stroke();
+
+      ctx.fillStyle = "#e5e7eb";
+      ctx.font = "12px Arial";
+      ctx.fillText(`Min: ${usd(min)}`, pad, h - 6);
+      ctx.fillText(`Max: ${usd(max)}`, w - 110, h - 6);
+    }
+
+    function renderFills(fills) {
+      const tbody = document.getElementById("fillsBody");
+
+      if (!fills || !fills.length) {
+        tbody.innerHTML = `<tr><td colspan="9" class="muted">No fills yet.</td></tr>`;
+        return;
+      }
+
+      tbody.innerHTML = fills.slice().reverse().map(fill => {
+        const pnlClass = fill.pnl == null ? "muted" : (Number(fill.pnl) >= 0 ? "good" : "bad");
+        return `
+          <tr>
+            <td class="mono">${fill.timestamp ?? "-"}</td>
+            <td>${fill.type ?? "-"}</td>
+            <td>${fill.side ?? "-"}</td>
+            <td>${num(fill.price, 6)}</td>
+            <td>${num(fill.qty, 6)}</td>
+            <td>${num(fill.fee, 6)}</td>
+            <td>${fill.trade_id ?? "-"}</td>
+            <td class="${pnlClass}">${fill.pnl == null ? "-" : num(fill.pnl, 6)}</td>
+            <td>${num(fill.equity_after, 6)}</td>
+          </tr>
+        `;
+      }).join("");
+    }
+
+    function updateFormFromStatus(status) {
+      const cfg = status?.config;
+      if (!cfg) return;
+
+      const setIfExists = (id, value) => {
+        const el = document.getElementById(id);
+        if (!el || value === undefined || value === null) return;
+        el.value = String(value);
+      };
+
+      setIfExists("symbol", cfg.symbol);
+      setIfExists("interval", cfg.interval);
+      setIfExists("market_type", cfg.market_type);
+      setIfExists("start", cfg.start === "string" ? "" : (cfg.start ?? ""));
+      setIfExists("end", cfg.end === "string" ? "" : (cfg.end ?? ""));
+      setIfExists("initial_balance", cfg.initial_balance);
+      setIfExists("fee_rate", cfg.fee_rate);
+      setIfExists("slippage_bps", cfg.slippage_bps);
+      setIfExists("allow_short", cfg.allow_short);
+      setIfExists("leverage", cfg.leverage);
+      setIfExists("maintenance_margin", cfg.maintenance_margin);
+      setIfExists("max_leverage", cfg.max_leverage);
+      setIfExists("max_qty", cfg.max_qty);
+      setIfExists("include_equity", cfg.include_equity);
+      setIfExists("equity_stride", cfg.equity_stride);
+      setIfExists("poll_seconds", cfg.poll_seconds);
+      setIfExists("ema_short", cfg.ema_short);
+      setIfExists("ema_long", cfg.ema_long);
+      setIfExists("candle_limit", cfg.candle_limit);
+    }
+
+    function renderStatus(status) {
+      document.getElementById("rawStatus").textContent = JSON.stringify(status, null, 2);
+
+      setStatePill(status.state);
+      setSignalPill(status.runtime?.last_signal);
+
+      document.getElementById("metricMode").textContent = status.mode ?? "-";
+      document.getElementById("metricRunId").textContent = status.run_id ?? "-";
+      document.getElementById("metricFillCount").textContent = status.runtime?.fill_count ?? 0;
+
+      const ps = status.runtime?.paper_state ?? {};
+      const latestBar = status.runtime?.latest_bar ?? {};
+
+      document.getElementById("metricCash").textContent = usd(ps.cash);
+      document.getElementById("metricPositionQty").textContent = num(ps.position_qty, 6);
+      document.getElementById("metricEntryPrice").textContent = num(ps.entry_price, 6);
+      document.getElementById("metricEquity").textContent = usd(ps.equity);
+      document.getElementById("metricRealizedPnl").textContent = num(ps.realized_pnl, 6);
+      document.getElementById("metricRealizedPnl").className =
+        "value " + ((Number(ps.realized_pnl ?? 0) >= 0) ? "good" : "bad");
+      document.getElementById("metricLiquidationPrice").textContent = num(ps.liquidation_price, 6);
+
+      document.getElementById("metricLatestClose").textContent = num(latestBar.close, 6);
+      document.getElementById("metricLatestBarTs").textContent = latestBar.timestamp ?? "-";
+      document.getElementById("metricProcessedTs").textContent = status.runtime?.last_processed_bar_ts ?? "-";
+      document.getElementById("metricBarCount").textContent = status.runtime?.bar_count ?? "-";
+
+      renderFills(status.runtime?.fills ?? []);
+
+      const lastErrorBox = document.getElementById("lastErrorBox");
+      const dangerBox = document.getElementById("dangerBox");
+
+      if (status.last_error) {
+        dangerBox.style.display = "block";
+        dangerBox.textContent = `Last error: ${status.last_error}`;
+      } else {
+        dangerBox.style.display = "none";
+        dangerBox.textContent = "";
+      }
+
+      lastErrorBox.style.display = "block";
+      lastErrorBox.textContent =
+        `Engine: ${status.runtime?.has_engine} | ` +
+        `State: ${status.runtime?.has_state} | ` +
+        `Last Signal: ${status.runtime?.last_signal}`;
+
+      const fillCount = Number(status.runtime?.fill_count ?? 0);
+      if (fillCount > lastSeenFillCount) {
+        const fills = status.runtime?.fills ?? [];
+        const newest = fills[fills.length - 1];
+        appendMessage(
+          `New fill: ${newest?.type ?? "-"} ${newest?.side ?? "-"} ` +
+          `trade_id=${newest?.trade_id ?? "-"} price=${newest?.price ?? "-"}`
+        );
+      }
+      lastSeenFillCount = fillCount;
+
+      const equity = Number(ps.equity ?? NaN);
+      if (!Number.isNaN(equity)) {
+        equityPoints.push({ ts: Date.now(), equity });
+        if (equityPoints.length > 120) equityPoints.shift();
+        drawEquityChart();
+      }
+
+      updateFormFromStatus(status);
+      renderConfigWarnings(validateConfig(buildPayload()));
+    }
+
+    async function doConfigure() {
+      try {
+        appendMessage("Setting mode...");
+        await setMode();
+
+        appendMessage("Sending configuration...");
+        const result = await configureBot();
+
+        if (!result.ok) {
+          appendMessage("Configure failed.");
+          document.getElementById("dangerBox").style.display = "block";
+          document.getElementById("dangerBox").textContent = JSON.stringify(result.data, null, 2);
+          return;
         }
 
-        async function fetchMarket() {
-            const res = await fetch("/market/btc");
-            const data = await res.json();
-            document.getElementById("output").innerText =
-                JSON.stringify(data, null, 2);
+        appendMessage("Configuration applied.");
+        await refreshStatus();
+      } catch (err) {
+        appendMessage(`Configure error: ${err}`);
+      }
+    }
+
+    async function doStart() {
+      try {
+        appendMessage("Starting bot...");
+        const result = await startBot();
+        appendMessage(result.ok ? "Bot started." : "Start failed.");
+        await refreshStatus();
+      } catch (err) {
+        appendMessage(`Start error: ${err}`);
+      }
+    }
+
+    async function doStop() {
+      try {
+        appendMessage("Stopping bot...");
+        const result = await stopBot();
+        appendMessage(result.ok ? "Bot stopped." : "Stop failed.");
+        await refreshStatus();
+      } catch (err) {
+        appendMessage(`Stop error: ${err}`);
+      }
+    }
+
+    async function refreshStatus() {
+      try {
+        const result = await fetchStatus();
+        if (!result.ok) {
+          appendMessage("Status fetch failed.");
+          return;
         }
+        renderStatus(result.data);
+      } catch (err) {
+        appendMessage(`Status error: ${err}`);
+      }
+    }
 
-        function startStream() {
-            socket = new WebSocket("ws://127.0.0.1:9000/ws/price/btc");
+    function setupAutoRefresh() {
+      if (refreshTimer) clearInterval(refreshTimer);
 
-            function formatUSD(value) {
-                if (value === null || value === undefined) return "-";
-
-                const number = Number(value);
-
-                return number.toLocaleString("en-US", {
-                    style: "currency",
-                    currency: "USD",
-                    minimumFractionDigits: 2
-                });
-            }
-
-            socket.onmessage = function(event) {
-                const data = JSON.parse(event.data);
-
-                document.getElementById("price").innerText = formatUSD(data.price_usd);
-                document.getElementById("strategy").innerText = data.strategy ?? "-";
-                document.getElementById("source").innerText = data.source ?? "-";
-
-                document.getElementById("balance").innerText = formatUSD(data.balance_usd);
-                document.getElementById("position").innerText = data.position_btc ?? "-";
-                document.getElementById("equity").innerText = formatUSD(data.total_equity);
-
-                let signalElement = document.getElementById("signal");
-                signalElement.innerText = data.signal ?? "WAIT";
-
-                if (data.signal === "BUY") {
-                    signalElement.style.color = "green";
-                } else if (data.signal === "SELL") {
-                    signalElement.style.color = "red";
-                } else if (data.signal === "HOLD") {
-                    signalElement.style.color = "orange";
-                } else {
-                    signalElement.style.color = "gray";
-                }
-            };
-
-            socket.onclose = function() {
-                console.log("WebSocket closed");
-            };
+      refreshTimer = setInterval(() => {
+        if (document.getElementById("autoRefresh").checked) {
+          refreshStatus();
         }
+      }, 2000);
+    }
 
-    </script>
+    document.getElementById("configureBtn").addEventListener("click", doConfigure);
+    document.getElementById("startBtn").addEventListener("click", doStart);
+    document.getElementById("stopBtn").addEventListener("click", doStop);
+    document.getElementById("refreshBtn").addEventListener("click", refreshStatus);
 
-    <p><a href="/backtest.html">Go to Backtest Page</a></p>
+    [
+      "symbol","interval","market_type","initial_balance","fee_rate","slippage_bps","leverage",
+      "ema_short","ema_long","candle_limit","poll_seconds","allow_short","max_leverage",
+      "max_qty","maintenance_margin","include_equity","equity_stride","start","end"
+    ].forEach(id => {
+      document.getElementById(id).addEventListener("input", () => {
+        renderConfigWarnings(validateConfig(buildPayload()));
+      });
+      document.getElementById(id).addEventListener("change", () => {
+        renderConfigWarnings(validateConfig(buildPayload()));
+      });
+    });
 
+    setupAutoRefresh();
+    renderConfigWarnings(validateConfig(buildPayload()));
+  </script>
 </body>
 </html>
