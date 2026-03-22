@@ -7,10 +7,13 @@ class PortfolioState:
     cash: float
     position_qty: float = 0.0           # +long, -short
     entry_price: Optional[float] = None
-    side: Optional[str] = None     # "long" or "short"
+    side: Optional[str] = None          # "long" or "short"
     equity: float = 0.0
-    liquidation_price: float = 0.0
+    liquidation_price: Optional[float] = None
     realized_pnl: float = 0.0
+
+    # active round-trip trade id
+    active_trade_id: Optional[int] = None
 
     # futures bookkeeping
     margin: float = 0.0
@@ -20,8 +23,8 @@ class PortfolioState:
 @dataclass
 class Fill:
     timestamp: str
-    type: str                      # ENTRY / EXIT / LIQUIDATION
-    side: str                      # long / short
+    type: str                           # ENTRY / EXIT / LIQUIDATION
+    side: str                           # long / short
     price: float
     qty: float
     fee: float

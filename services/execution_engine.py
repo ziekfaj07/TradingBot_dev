@@ -52,6 +52,71 @@ class ExecutionEngine:
 
         return float(state.cash + state.position_qty * (market_price - state.entry_price))
 
+    # ---------- Internal helpers ----------
+
+    def _set_active_trade_id(self, state: PortfolioState, trade_id: int) -> None:
+        """
+        Best-effort persistence of the currently open trade ID on state.
+        This keeps ENTRY and EXIT/LIQUIDATION tied to the same trade_id
+        even if the caller accidentally increments per fill.
+        """
+        try:
+            setattr(state, "active_trade_id", int(trade_id))
+        except Exception:
+            pass
+
+    def _get_active_trade_id(self, state: PortfolioState, fallback_trade_id: int) -> int:
+        try:
+            active_trade_id = getattr(state, "active_trade_id", None)
+            if active_trade_id is not None:
+                return int(active_trade_id)
+        except Exception:
+            pass
+        return int(fallback_trade_id)
+
+    def _clear_active_trade_id(self, state: PortfolioState) -> None:
+        try:
+            setattr(state, "active_trade_id", None)
+        except Exception:
+            pass
+
+    def _add_realized_pnl(self, state: PortfolioState, pnl: float) -> None:
+        """
+        Best-effort accumulation onto state.realized_pnl if the field exists.
+        """
+        try:
+            current = getattr(state, "realized_pnl", 0.0)
+            setattr(state, "realized_pnl", float(current) + float(pnl))
+        except Exception:
+            pass
+
+    def _estimate_entry_fee(self, entry_px: float, qty: float, market_type: str) -> float:
+        """
+        Reconstruct entry fee from current position info.
+
+        Spot entry logic currently does:
+            starting_cash -> pay entry fee first -> buy asset with remaining cash
+
+        So for spot:
+            qty * entry_px = notional_after_fee
+            entry_fee = notional_after_fee * fee_rate / (1 - fee_rate)
+
+        Futures entry logic currently does:
+            entry_fee = entry_notional * fee_rate = qty * entry_px * fee_rate
+        """
+        mt = (market_type or "spot").lower()
+        gross_cost_after_fee = float(abs(qty) * entry_px)
+
+        if gross_cost_after_fee <= 0 or self.fee_rate <= 0:
+            return 0.0
+
+        if mt == "spot":
+            if self.fee_rate >= 1.0:
+                return 0.0
+            return float(gross_cost_after_fee * self.fee_rate / (1.0 - self.fee_rate))
+
+        return float(gross_cost_after_fee * self.fee_rate)
+
     # ---------- Risk / liquidation ----------
 
     def compute_liquidation_price(self, state: PortfolioState, market_type: str, market_price: float, leverage: float) -> bool:
@@ -93,6 +158,8 @@ class ExecutionEngine:
         if buy_px <= 0 or not math.isfinite(buy_px):
             return state, None
 
+        entry_trade_id = int(trade_id)
+
         if mt == "spot":
             # Spend all cash
             notional = float(state.cash)
@@ -129,6 +196,8 @@ class ExecutionEngine:
             state.entry_price = float(buy_px)
             state.side = "long"
 
+        self._set_active_trade_id(state, entry_trade_id)
+
         eq_after = self.mark_equity(state, mt, close)
         fill = Fill(
             timestamp=ts_iso,
@@ -138,7 +207,7 @@ class ExecutionEngine:
             qty=float(state.position_qty),
             fee=float(fee),
             equity_after=float(eq_after),
-            trade_id=int(trade_id),
+            trade_id=entry_trade_id,
             entry_price=None,
             exit_price=None,
             pnl=None,
@@ -157,6 +226,7 @@ class ExecutionEngine:
         if state.position_qty <= 0.0:
             return state, None
 
+        exit_trade_id = self._get_active_trade_id(state, trade_id)
         sell_px = self.apply_slippage(close, is_buy=False)
 
         # PRICE SAFETY
@@ -165,25 +235,34 @@ class ExecutionEngine:
 
         exit_qty = float(state.position_qty)
         entry_px = float(state.entry_price) if state.entry_price is not None else float(sell_px)
+        entry_fee = self._estimate_entry_fee(entry_px, exit_qty, mt)
 
         if mt == "spot":
             notional = abs(exit_qty) * sell_px
             fee = notional * self.fee_rate
+
+            gross_pnl = float(exit_qty) * (float(sell_px) - entry_px)
+            net_pnl = float(gross_pnl - entry_fee - fee)
+
             state.cash = float(notional - fee)
 
         else:
             # Futures (linear): realize PnL into wallet, then pay exit fee
-            pnl = float(exit_qty) * (float(sell_px) - entry_px)
-            state.cash = float(state.cash) + pnl
+            gross_pnl = float(exit_qty) * (float(sell_px) - entry_px)
 
             notional = abs(exit_qty) * sell_px
             fee = notional * self.fee_rate
-            state.cash = float(state.cash) - float(fee)
+            net_pnl = float(gross_pnl - entry_fee - fee)
+
+            state.cash = float(state.cash) + gross_pnl - float(fee)
+
+        self._add_realized_pnl(state, net_pnl)
 
         # reset position before computing ending equity
         state.position_qty = 0.0
         state.entry_price = None
         state.side = None
+        self._clear_active_trade_id(state)
 
         eq_after = self.mark_equity(state, mt, close)
 
@@ -197,8 +276,8 @@ class ExecutionEngine:
             equity_after=float(eq_after),
             entry_price=float(entry_px),
             exit_price=float(sell_px),
-            trade_id=int(trade_id),
-            pnl=None,  # caller (BacktestService) sets realized pnl vs baseline if desired
+            trade_id=exit_trade_id,
+            pnl=float(net_pnl),
         )
 
         return state, fill
@@ -215,6 +294,9 @@ class ExecutionEngine:
         if state.position_qty == 0.0:
             return state, None
 
+        liquidation_trade_id = self._get_active_trade_id(state, trade_id)
+        position_side = state.side or "long"
+
         # For long liquidation, we SELL to close
         exit_px = self.apply_slippage(close, is_buy=False)
 
@@ -224,45 +306,54 @@ class ExecutionEngine:
             state.position_qty = 0.0
             state.entry_price = None
             state.side = None
+            self._clear_active_trade_id(state)
             return state, None
 
         exit_qty = float(state.position_qty)
         entry_px = float(state.entry_price) if state.entry_price is not None else float(exit_px)
+        entry_fee = self._estimate_entry_fee(entry_px, exit_qty, mt)
 
         notional = abs(exit_qty) * exit_px
         fee = notional * self.fee_rate
 
         if mt == "spot":
-            # Spot close position into cash
-            state.cash = float(state.cash + state.position_qty * exit_px - fee)
+            gross_pnl = float(exit_qty) * (float(exit_px) - entry_px)
+            net_pnl = float(gross_pnl - entry_fee - fee)
+
+            state.cash = float(notional - fee)
         else:
             # Futures linear: realize pnl and pay fee
-            pnl = float(exit_qty) * (float(exit_px) - entry_px)
-            state.cash = float(state.cash) + pnl - float(fee)
+            gross_pnl = float(exit_qty) * (float(exit_px) - entry_px)
+            net_pnl = float(gross_pnl - entry_fee - fee)
+
+            state.cash = float(state.cash) + gross_pnl - float(fee)
+
+        self._add_realized_pnl(state, net_pnl)
 
         # reset
         state.position_qty = 0.0
         state.entry_price = None
         state.side = None
+        self._clear_active_trade_id(state)
 
         eq_after = self.mark_equity(state, mt, close)
 
         fill = Fill(
             timestamp=ts_iso,
             type="LIQUIDATION",
-            side=state.side or "long",
+            side=position_side,
             price=float(exit_px),
             qty=float(exit_qty),
             fee=float(fee),
             equity_after=float(eq_after),
             entry_price=float(entry_px),
             exit_price=float(exit_px),
-            trade_id=int(trade_id),
-            pnl=None,
+            trade_id=liquidation_trade_id,
+            pnl=float(net_pnl),
         )
 
         return state, fill
-    
+
     def enter_short(self, *args, **kwargs):
         raise NotImplementedError("Short trading is not implemented yet.")
 

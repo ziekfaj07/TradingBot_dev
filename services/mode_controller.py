@@ -204,7 +204,7 @@ class ModeController:
             cfg = self._status.config
 
         try:
-            df = self.provider.get_ohlcv(
+            df = self.provider.load_ohlcv(
                 symbol=cfg.symbol,
                 interval=cfg.interval,
                 market_type=cfg.market_type,
@@ -235,10 +235,12 @@ class ModeController:
             state = PortfolioState(
                 cash=cfg.initial_balance,
                 position_qty=0.0,
-                entry_price=0.0,
+                entry_price=None,
+                side=None,
                 equity=cfg.initial_balance,
                 liquidation_price=None,
                 realized_pnl=0.0,
+                active_trade_id=None
             )
 
             output = run_signal_backed_loop(
@@ -329,10 +331,12 @@ class ModeController:
         self._state = PortfolioState(
             cash=cfg.initial_balance,
             position_qty=0.0,
-            entry_price=0.0,
+            entry_price=None,
+            side=None,
             equity=cfg.initial_balance,
             liquidation_price=None,
             realized_pnl=0.0,
+            active_trade_id=None
         )
 
     async def _run_loop(self) -> None:
@@ -376,6 +380,13 @@ class ModeController:
         self._last_processed_bar_ts = closed_bar["timestamp"]
         self._last_signal = signal
 
+        print(
+            f"[paper] closed_ts={closed_bar['timestamp']} "
+            f"close={closed_bar['close']} signal={signal} "
+            f"pos={self._state.position_qty if self._state else None} "
+            f"fills={len(self._fills)}"
+        )
+
         self._apply_signal(signal=signal, bar=closed_bar)
         self._mark_to_market(closed_bar["close"])
 
@@ -399,6 +410,7 @@ class ModeController:
         ts = confirmed_bar["timestamp"]
 
         if self._last_processed_bar_ts is None:
+            self._last_processed_bar_ts = ts
             return confirmed_bar
 
         if ts > self._last_processed_bar_ts:
@@ -423,71 +435,17 @@ class ModeController:
         signal = int(strat.iloc[-1]["signal"])
         return signal
 
-    # def _apply_signal(self, signal: int, bar: dict) -> None:
-    #     if self._engine is None or self._state is None:
-    #         return
-
-    #     price = float(bar["close"])
-    #     cfg = self._status.config
-
-    #     # 1 = bullish cross
-    #     if signal == 1:
-    #         if self._state.position_qty < 0:
-    #             self._trade_id += 1
-    #             self._engine.close_position(
-    #                 state=self._state,
-    #                 price=price,
-    #                 trade_id=self._trade_id,
-    #             )
-
-    #         if self._state.position_qty == 0:
-    #             qty = self._calculate_order_qty(price)
-    #             if qty > 0:
-    #                 self._trade_id += 1
-    #                 self._engine.enter_long(
-    #                     state=self._state,
-    #                     price=price,
-    #                     qty=qty,
-    #                     trade_id=self._trade_id,
-    #                     market_type=cfg.market_type,
-    #                     leverage=cfg.leverage,
-    #                 )
-
-    #     # -1 = bearish cross
-    #     elif signal == -1:
-    #         if self._state.position_qty > 0:
-    #             self._trade_id += 1
-    #             self._engine.exit_long(
-    #                 state=self._state,
-    #                 price=price,
-    #                 trade_id=self._trade_id,
-    #             )
-
-    #         if cfg.allow_short and self._state.position_qty == 0:
-    #             qty = self._calculate_order_qty(price)
-    #             if qty > 0:
-    #                 self._trade_id += 1
-    #                 self._engine.enter_short(
-    #                     state=self._state,
-    #                     price=price,
-    #                     qty=qty,
-    #                     trade_id=self._trade_id,
-    #                     market_type=cfg.market_type,
-    #                     leverage=cfg.leverage,
-    #                 )
-
     def _apply_signal(self, signal: int, bar: dict) -> None:
         if self._engine is None or self._state is None:
             return
 
         price = float(bar["close"])
-        ts_iso = str(bar["timestamp"])   # adjust key if needed
+        ts_iso = str(bar["timestamp"])
         cfg = self._status.config
 
         # 1 = bullish cross
         if signal == 1:
             if self._state.position_qty < 0:
-                self._trade_id += 1
                 self._state, fill = self._engine.liquidate(
                     ts_iso=ts_iso,
                     state=self._state,
@@ -514,7 +472,6 @@ class ModeController:
         # -1 = bearish cross
         elif signal == -1:
             if self._state.position_qty > 0:
-                self._trade_id += 1
                 self._state, fill = self._engine.exit_long(
                     ts_iso=ts_iso,
                     state=self._state,
@@ -525,8 +482,7 @@ class ModeController:
                 if fill:
                     self._fills.append(fill)
 
-            # shorts are not implemented yet in ExecutionEngine
-            # so do nothing here for now unless you add enter_short/open_short
+            # shorts not implemented yet
 
     def _calculate_order_qty(self, price: float) -> float:
         if self._state is None or price <= 0:
@@ -569,7 +525,6 @@ class ModeController:
             self._state.liquidation_price = None
 
             if is_liquidatable and self._state.position_qty != 0.0:
-                self._trade_id += 1
                 self._state, fill = self._engine.liquidate(
                     ts_iso=str(int(time.time())),
                     state=self._state,
