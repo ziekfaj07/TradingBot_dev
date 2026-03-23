@@ -36,3 +36,5 @@ data/
 *.parquet
 .csv
 *.csv
+.db
+*.db

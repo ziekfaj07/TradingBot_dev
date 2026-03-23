@@ -1,4 +1,3 @@
-# services/mode_controller.py
 from __future__ import annotations
 
 import asyncio
@@ -12,11 +11,23 @@ from typing import Optional
 import pandas as pd
 
 from core.binance_vision_provider import BinanceVisionProvider
-from core.execution_models import PortfolioState
+from core.database import (
+    count_runtime_fills,
+    delete_runtime_run,
+    export_runtime_fills_csv,
+    get_latest_paper_run,
+    init_runtime_db,
+    insert_runtime_fill,
+    load_runtime_fills,
+    save_runtime_snapshot,
+    update_run_state,
+    upsert_runtime_run,
+)
+from core.execution_models import Fill, PortfolioState
 from services.execution_engine import ExecutionEngine
+from services.market_data_service import CoinGeckoService, GateIOService
 from services.runner import run_signal_backed_loop
 from services.strategy_engine import StrategyEngine
-from services.market_data_service import GateIOService, CoinGeckoService
 
 
 class Mode(str, Enum):
@@ -35,16 +46,13 @@ class EngineState(str, Enum):
 
 @dataclass
 class RunConfig:
-    # market
     symbol: str = "BTCUSDT"
     interval: str = "1m"
-    market_type: str = "spot"   # "spot" | "futures"
+    market_type: str = "spot"
 
-    # backtest only
     start: str | None = None
     end: str | None = None
 
-    # portfolio/execution
     initial_balance: float = 1000.0
     fee_rate: float = 0.001
     slippage_bps: float = 2.0
@@ -52,22 +60,17 @@ class RunConfig:
     leverage: float = 1.0
     maintenance_margin: float = 0.005
 
-    # engine guards
     max_leverage: float = 50.0
     max_qty: float = 10.0
 
-    # output controls
     include_equity: bool = False
     equity_stride: int = 1
 
-    # paper/live loop cadence
     poll_seconds: float = 5.0
 
-    # EMA settings
     ema_short: int = 9
     ema_long: int = 21
 
-    # rolling candle memory
     candle_limit: int = 300
 
 
@@ -83,40 +86,30 @@ class RunStatus:
 
 
 class ModeController:
-    """
-    Single source of truth for:
-    - mode (BACKTEST / PAPER / LIVE)
-    - lifecycle (IDLE / STARTING / RUNNING / STOPPING / ERROR)
-    - config
-    """
-
     def __init__(self):
         self.provider = BinanceVisionProvider()
-        self.market_data = GateIOService()      # primary
-        self.fallback_data = CoinGeckoService() # fallback
+        self.market_data = GateIOService()
+        self.fallback_data = CoinGeckoService()
 
         self._lock = asyncio.Lock()
         self._status = RunStatus()
 
-        # runtime controls
         self._stop_event = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
 
-        # runtime objects
         self._engine: Optional[ExecutionEngine] = None
         self._state: Optional[PortfolioState] = None
         self._trade_id: int = 0
 
-        # paper/live memory
         self._latest_bar: dict | None = None
         self._bars: list[dict] = []
         self._last_processed_bar_ts: int | None = None
         self._last_signal: int = 0
-        self._fills: list = []
+        self._fills: list[Fill] = []
 
-    # -----------------------
-    # Public API
-    # -----------------------
+        init_runtime_db()
+        self._restore_paper_session()
+
     async def set_mode(self, mode: Mode) -> dict:
         async with self._lock:
             if self._status.state in (
@@ -128,6 +121,7 @@ class ModeController:
 
             self._status.mode = mode
             self._status.last_error = None
+            self._persist_status()
             return self.status()
 
     async def configure(self, **kwargs) -> dict:
@@ -141,6 +135,8 @@ class ModeController:
                     setattr(self._status.config, key, value)
 
             self._status.last_error = None
+            self._persist_status()
+            self._persist_snapshot()
             return self.status()
 
     async def start(self) -> dict:
@@ -152,18 +148,26 @@ class ModeController:
                 raise RuntimeError("Use run_backtest() for backtest mode.")
 
             self._status.state = EngineState.STARTING
-            self._status.run_id = str(uuid.uuid4())
-            self._status.started_at = time.time()
-            self._status.stopped_at = None
-            self._status.last_error = None
+
+            if self._status.mode == Mode.PAPER and self._status.run_id:
+                if self._engine is None:
+                    self._build_runtime_objects_from_existing_or_new()
+            else:
+                self._status.run_id = str(uuid.uuid4())
+                self._status.started_at = time.time()
+                self._status.stopped_at = None
+                self._status.last_error = None
+                self._reset_runtime_memory()
+                self._build_runtime_objects()
 
             self._stop_event = asyncio.Event()
-            self._reset_runtime_memory()
-            self._build_runtime_objects()
+            self._persist_status()
+            self._persist_snapshot()
 
             self._task = asyncio.create_task(self._run_loop())
 
             self._status.state = EngineState.RUNNING
+            self._persist_status()
             return self.status()
 
     async def stop(self) -> dict:
@@ -172,6 +176,7 @@ class ModeController:
                 raise RuntimeError("Engine is not running.")
 
             self._status.state = EngineState.STOPPING
+            self._persist_status()
             self._stop_event.set()
             task = self._task
 
@@ -185,12 +190,11 @@ class ModeController:
             self._task = None
             self._status.state = EngineState.IDLE
             self._status.stopped_at = time.time()
+            self._persist_status()
+            self._persist_snapshot()
             return self.status()
 
     async def run_backtest(self) -> dict:
-        """
-        Keeps your backtest path separate from paper/live loop.
-        """
         async with self._lock:
             if self._status.state != EngineState.IDLE:
                 raise RuntimeError("Engine must be idle before running backtest.")
@@ -220,8 +224,6 @@ class ModeController:
                 short=cfg.ema_short,
                 long=cfg.ema_long,
             )
-
-            # shift by 1 bar to avoid lookahead
             df["signal"] = df["signal"].shift(1).fillna(0).astype(int)
 
             engine = ExecutionEngine(
@@ -240,7 +242,7 @@ class ModeController:
                 equity=cfg.initial_balance,
                 liquidation_price=None,
                 realized_pnl=0.0,
-                active_trade_id=None
+                active_trade_id=None,
             )
 
             output = run_signal_backed_loop(
@@ -306,9 +308,154 @@ class ModeController:
             return None
         return self._latest_bar
 
-    # -----------------------
-    # Runtime internals
-    # -----------------------
+    def get_paper_fills(self, limit: int = 200, offset: int = 0) -> dict:
+        if not self._status.run_id:
+            return {
+                "run_id": None,
+                "total": 0,
+                "limit": limit,
+                "offset": offset,
+                "fills": [],
+            }
+
+        rows = load_runtime_fills(
+            run_id=self._status.run_id,
+            limit=max(1, min(limit, 5000)),
+            offset=max(0, offset),
+        )
+        total = count_runtime_fills(self._status.run_id)
+
+        return {
+            "run_id": self._status.run_id,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "fills": rows,
+        }
+
+    async def reset_paper(self) -> dict:
+        async with self._lock:
+            if self._status.state in (
+                EngineState.STARTING,
+                EngineState.RUNNING,
+                EngineState.STOPPING,
+            ):
+                raise RuntimeError("Stop paper trading before resetting it.")
+
+            if self._status.mode != Mode.PAPER and self._status.run_id is None:
+                self._status.mode = Mode.PAPER
+
+            old_run_id = self._status.run_id
+
+            self._status = RunStatus(mode=Mode.PAPER)
+            self._stop_event = asyncio.Event()
+            self._task = None
+            self._reset_runtime_memory()
+
+            if old_run_id:
+                delete_runtime_run(old_run_id)
+
+            return self.status()
+
+    def export_paper_fills_csv(self) -> str:
+        if not self._status.run_id:
+            return (
+                "id,timestamp,type,side,price,qty,fee,equity_after,"
+                "entry_price,exit_price,trade_id,pnl,created_at\n"
+            )
+        return export_runtime_fills_csv(self._status.run_id)
+
+    def _persist_status(self) -> None:
+        if not self._status.run_id:
+            return
+
+        upsert_runtime_run(
+            run_id=self._status.run_id,
+            mode=self._status.mode.value,
+            state=self._status.state.value,
+            started_at=self._status.started_at,
+            stopped_at=self._status.stopped_at,
+            last_error=self._status.last_error,
+            config=asdict(self._status.config),
+        )
+
+    def _persist_snapshot(self) -> None:
+        if not self._status.run_id:
+            return
+
+        save_runtime_snapshot(
+            run_id=self._status.run_id,
+            state_dict=self._state.to_dict() if self._state else None,
+            latest_bar=self._latest_bar,
+            bars=self._bars[-self._status.config.candle_limit:] if self._bars else [],
+            last_processed_bar_ts=self._last_processed_bar_ts,
+            last_signal=self._last_signal,
+            trade_id=self._trade_id,
+        )
+
+    def _persist_fill(self, fill: Fill) -> None:
+        if not self._status.run_id:
+            return
+        insert_runtime_fill(self._status.run_id, fill.to_dict())
+
+    def _restore_paper_session(self) -> None:
+        restored = get_latest_paper_run()
+        if not restored:
+            return
+
+        self._status.mode = Mode(restored["mode"])
+        self._status.run_id = restored["run_id"]
+        self._status.started_at = restored.get("started_at")
+        self._status.stopped_at = restored.get("stopped_at")
+        self._status.last_error = restored.get("last_error")
+
+        cfg_data = restored.get("config") or {}
+        for key, value in cfg_data.items():
+            if hasattr(self._status.config, key) and value is not None:
+                setattr(self._status.config, key, value)
+
+        snapshot = restored.get("snapshot") or {}
+        self._latest_bar = snapshot.get("latest_bar")
+        self._bars = snapshot.get("bars") or []
+        self._last_processed_bar_ts = snapshot.get("last_processed_bar_ts")
+        self._last_signal = int(snapshot.get("last_signal") or 0)
+        self._trade_id = int(snapshot.get("trade_id") or 0)
+
+        restored_state = PortfolioState.from_dict(snapshot.get("state"))
+        self._state = restored_state
+        self._engine = ExecutionEngine(
+            fee_rate=self._status.config.fee_rate,
+            slippage_bps=self._status.config.slippage_bps,
+            maintenance_margin=self._status.config.maintenance_margin,
+            max_leverage=self._status.config.max_leverage,
+            max_qty=self._status.config.max_qty,
+        ) if restored_state else None
+
+        self._fills = []
+        for item in restored.get("fills", []):
+            fill = Fill.from_dict(item)
+            if fill:
+                self._fills.append(fill)
+
+        restored_state_value = restored.get("state", EngineState.IDLE.value)
+        if restored_state_value in {
+            EngineState.RUNNING.value,
+            EngineState.STARTING.value,
+            EngineState.STOPPING.value,
+        }:
+            self._status.state = EngineState.IDLE
+            self._status.last_error = (
+                self._status.last_error or "Recovered paper session after restart."
+            )
+            update_run_state(
+                run_id=self._status.run_id,
+                state=EngineState.IDLE.value,
+                stopped_at=time.time(),
+                last_error=self._status.last_error,
+            )
+        else:
+            self._status.state = EngineState(restored_state_value)
+
     def _reset_runtime_memory(self) -> None:
         self._latest_bar = None
         self._bars = []
@@ -316,6 +463,8 @@ class ModeController:
         self._last_signal = 0
         self._trade_id = 0
         self._fills = []
+        self._state = None
+        self._engine = None
 
     def _build_runtime_objects(self) -> None:
         cfg = self._status.config
@@ -336,8 +485,36 @@ class ModeController:
             equity=cfg.initial_balance,
             liquidation_price=None,
             realized_pnl=0.0,
-            active_trade_id=None
+            active_trade_id=None,
         )
+
+    def _build_runtime_objects_from_existing_or_new(self) -> None:
+        if self._engine is None:
+            cfg = self._status.config
+            self._engine = ExecutionEngine(
+                fee_rate=cfg.fee_rate,
+                slippage_bps=cfg.slippage_bps,
+                maintenance_margin=cfg.maintenance_margin,
+                max_leverage=cfg.max_leverage,
+                max_qty=cfg.max_qty,
+            )
+
+        if self._state is None:
+            self._state = PortfolioState(
+                cash=self._status.config.initial_balance,
+                position_qty=0.0,
+                entry_price=None,
+                side=None,
+                equity=self._status.config.initial_balance,
+                liquidation_price=None,
+                realized_pnl=0.0,
+                active_trade_id=None,
+            )
+
+        if self._status.started_at is None:
+            self._status.started_at = time.time()
+        self._status.stopped_at = None
+        self._status.last_error = None
 
     async def _run_loop(self) -> None:
         try:
@@ -352,6 +529,8 @@ class ModeController:
                 self._status.state = EngineState.ERROR
                 self._status.last_error = str(e)
                 self._status.stopped_at = time.time()
+                self._persist_status()
+                self._persist_snapshot()
             return
 
     async def _paper_step(self) -> None:
@@ -373,6 +552,7 @@ class ModeController:
         closed_bar = self._get_newly_closed_bar(self._bars)
         if closed_bar is None:
             self._mark_to_market(self._latest_bar["close"])
+            self._persist_snapshot()
             return
 
         signal = self._compute_signal_from_closed_bars(self._bars)
@@ -389,6 +569,7 @@ class ModeController:
 
         self._apply_signal(signal=signal, bar=closed_bar)
         self._mark_to_market(closed_bar["close"])
+        self._persist_snapshot()
 
     def _fetch_recent_bars(self, symbol: str, interval: str, limit: int) -> list[dict]:
         try:
@@ -398,11 +579,6 @@ class ModeController:
             return []
 
     def _get_newly_closed_bar(self, bars: list[dict]) -> dict | None:
-        """
-        We use the SECOND TO LAST bar as the confirmed bar.
-        Why?
-        Because the very last bar may still be forming.
-        """
         if len(bars) < 2:
             return None
 
@@ -422,7 +598,6 @@ class ModeController:
         if len(bars) < max(self._status.config.ema_short, self._status.config.ema_long) + 2:
             return 0
 
-        # use only fully closed bars -> exclude the newest still-forming bar
         closed = bars[:-1]
         df = pd.DataFrame(closed)
 
@@ -432,8 +607,7 @@ class ModeController:
             long=self._status.config.ema_long,
         )
 
-        signal = int(strat.iloc[-1]["signal"])
-        return signal
+        return int(strat.iloc[-1]["signal"])
 
     def _apply_signal(self, signal: int, bar: dict) -> None:
         if self._engine is None or self._state is None:
@@ -443,7 +617,6 @@ class ModeController:
         ts_iso = str(bar["timestamp"])
         cfg = self._status.config
 
-        # 1 = bullish cross
         if signal == 1:
             if self._state.position_qty < 0:
                 self._state, fill = self._engine.liquidate(
@@ -454,7 +627,7 @@ class ModeController:
                     trade_id=self._trade_id,
                 )
                 if fill:
-                    self._fills.append(fill)
+                    self._append_fill(fill)
 
             if self._state.position_qty == 0:
                 self._trade_id += 1
@@ -467,9 +640,8 @@ class ModeController:
                     trade_id=self._trade_id,
                 )
                 if fill:
-                    self._fills.append(fill)
+                    self._append_fill(fill)
 
-        # -1 = bearish cross
         elif signal == -1:
             if self._state.position_qty > 0:
                 self._state, fill = self._engine.exit_long(
@@ -480,23 +652,26 @@ class ModeController:
                     trade_id=self._trade_id,
                 )
                 if fill:
-                    self._fills.append(fill)
+                    self._append_fill(fill)
 
-            # shorts not implemented yet
+    def _append_fill(self, fill) -> None:
+        normalized = fill if isinstance(fill, Fill) else Fill.from_dict(getattr(fill, "__dict__", fill))
+        if normalized is None:
+            return
+
+        self._fills.append(normalized)
+        self._persist_fill(normalized)
+        self._persist_snapshot()
 
     def _calculate_order_qty(self, price: float) -> float:
         if self._state is None or price <= 0:
             return 0.0
 
-        # simple sizing:
-        # use nearly all available paper cash
         notional = self._state.cash * 0.95
-
         if self._status.config.market_type == "futures":
             notional *= self._status.config.leverage
 
-        qty = notional / price
-        qty = min(qty, self._status.config.max_qty)
+        qty = min(notional / price, self._status.config.max_qty)
 
         if not math.isfinite(qty) or qty <= 0:
             return 0.0
@@ -513,8 +688,6 @@ class ModeController:
             market_type=self._status.config.market_type,
         )
 
-        # Current engine method returns a bool liquidation condition, not a price.
-        # So do not store it as liquidation_price.
         if self._status.config.market_type == "futures":
             is_liquidatable = self._engine.compute_liquidation_price(
                 state=self._state,
@@ -533,7 +706,7 @@ class ModeController:
                     trade_id=self._trade_id,
                 )
                 if fill:
-                    self._fills.append(fill)
+                    self._append_fill(fill)
 
     def _serialize_state(self) -> dict | None:
         if self._state is None:
@@ -543,7 +716,13 @@ class ModeController:
             "cash": self._state.cash,
             "position_qty": self._state.position_qty,
             "entry_price": self._state.entry_price,
+            "side": self._state.side,
             "equity": self._state.equity,
             "liquidation_price": self._state.liquidation_price,
             "realized_pnl": self._state.realized_pnl,
+            "active_trade_id": self._state.active_trade_id,
+            "margin": self._state.margin,
+            "borrowed": self._state.borrowed,
         }
+
+mode_controller = ModeController()

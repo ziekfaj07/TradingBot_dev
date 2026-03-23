@@ -9,6 +9,8 @@ from routers.backtest_router import router as backtest_router
 from routers.export_router import router as export_router
 from routers.run_router import router as run_router
 from routers.ws_router import router as ws_router
+from routers.paper_router import router as paper_router
+
 from services.exchange_service import connect_exchange
 
 app = FastAPI()
@@ -26,6 +28,7 @@ app.include_router(backtest_router)
 app.include_router(export_router)
 app.include_router(run_router)
 app.include_router(ws_router)
+app.include_router(paper_router)
 
 BASE_DIR = Path(__file__).resolve().parent
 FRONTEND_DIR = BASE_DIR / "templates"
