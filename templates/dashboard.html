@@ -104,7 +104,20 @@
     }
 
     button:hover {
-      opacity: 0.92;
+      opacity: 0.70;
+    }
+
+    .action-btn {
+      width: 130px;
+      height: 35px;
+      padding: 0 12px;
+      font-size: 14px;
+      font-weight: 600;
+      border-radius: 10px;
+      box-sizing: border-box;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
     }
 
     .btn-primary { background: #2563eb; }
@@ -242,23 +255,25 @@
           <div class="field">
             <label>Mode</label>
             <select id="mode">
-              <option value="paper" selected>paper</option>
-              <option value="backtest">backtest</option>
-              <option value="live">live</option>
+              <option value="live">Live</option>
+              <option value="paper" selected>Paper</option>
+              <option value="backtest">Backtest</option>
             </select>
           </div>
 
           <div class="field">
             <label>Symbol</label>
-            <input id="symbol" value="SOLUSDT" />
+            <input id="symbol" value="BTCUSDT" />
           </div>
 
           <div class="field">
             <label>Interval</label>
             <select id="interval">
               <option value="1m" selected>1m</option>
+              <option value="3m">3m</option>
               <option value="5m">5m</option>
               <option value="15m">15m</option>
+              <option value="30m">30m</option>
               <option value="1h">1h</option>
               <option value="4h">4h</option>
               <option value="1d">1d</option>
@@ -268,8 +283,8 @@
           <div class="field">
             <label>Market Type</label>
             <select id="market_type">
-              <option value="spot" selected>spot</option>
-              <option value="futures">futures</option>
+              <option value="spot" selected>Spot</option>
+              <option value="futures">Futures</option>
             </select>
           </div>
         </div>
@@ -322,8 +337,8 @@
           <div class="field">
             <label>Allow Short</label>
             <select id="allow_short">
-              <option value="false" selected>false</option>
-              <option value="true">true</option>
+              <option value="false" selected>False</option>
+              <option value="true">True</option>
             </select>
           </div>
 
@@ -333,7 +348,7 @@
           </div>
 
           <div class="field">
-            <label>Max Qty</label>
+            <label>Max Quantity</label>
             <input id="max_qty" type="number" step="0.0001" value="100000" />
           </div>
 
@@ -347,8 +362,8 @@
           <div class="field">
             <label>Include Equity</label>
             <select id="include_equity">
-              <option value="true" selected>true</option>
-              <option value="false">false</option>
+              <option value="true" selected>True</option>
+              <option value="false">False</option>
             </select>
           </div>
 
@@ -359,20 +374,20 @@
 
           <div class="field">
             <label>Start</label>
-            <input id="start" placeholder="optional" />
+            <input id="start" placeholder="Optional" />
           </div>
 
           <div class="field">
             <label>End</label>
-            <input id="end" placeholder="optional" />
+            <input id="end" placeholder="Optional" />
           </div>
         </div>
 
         <div class="row" style="margin-top: 16px;">
-          <button class="btn-primary" id="configureBtn">Configure</button>
-          <button class="btn-green" id="startBtn">Start</button>
-          <button class="btn-red" id="stopBtn">Stop</button>
-          <button class="btn-gray" id="refreshBtn">Refresh Status</button>
+          <button class="btn-primary action-btn" id="configureBtn">Configure</button>
+          <button class="btn-green action-btn" id="startBtn">Start</button>
+          <button class="btn-red action-btn" id="stopBtn">Stop</button>
+          <button class="btn-gray action-btn" id="refreshBtn">Refresh Status</button>
 
           <label class="row tiny" style="margin-left: 8px;">
             <input id="autoRefresh" type="checkbox" />
@@ -389,7 +404,7 @@
         <div class="row" style="margin-bottom: 12px;">
           <div>
             <div class="tiny muted">Bot State</div>
-            <div id="botStatePill" class="status-pill pill-stopped">unknown</div>
+            <div id="botStatePill" class="status-pill pill-stopped">Unknown</div>
           </div>
           <div>
             <div class="tiny muted">Last Signal</div>
@@ -418,7 +433,7 @@
             <div class="value" id="metricCash">-</div>
           </div>
           <div class="metric">
-            <div class="label">Position Qty</div>
+            <div class="label">Position Quantity</div>
             <div class="value" id="metricPositionQty">-</div>
           </div>
           <div class="metric">
@@ -482,7 +497,10 @@
     </div>
 
     <div class="card" style="margin-top: 16px;">
-      <h3>Recent Fills</h3>
+      <div class="row" style="justify-content: space-between; margin-bottom: 12px;">
+        <h3 style="margin-bottom: 3;">Recent Fills</h3>
+        <button class="btn-gray action-btn" id="exportFillsBtn">Export to CSV</button>
+      </div>
       <div class="scroll">
         <table>
           <thead>
@@ -491,7 +509,7 @@
               <th>Type</th>
               <th>Side</th>
               <th>Price</th>
-              <th>Qty</th>
+              <th>Quantity</th>
               <th>Fee</th>
               <th>Trade ID</th>
               <th>PnL</th>
@@ -517,6 +535,7 @@
     let refreshTimer = null;
     let equityPoints = [];
     let lastSeenFillCount = 0;
+    let latestFills = [];
 
     function num(v, digits = 6) {
       if (v === null || v === undefined || Number.isNaN(Number(v))) return "-";
@@ -534,6 +553,36 @@
         minimumFractionDigits: 2,
         maximumFractionDigits: 2
       });
+    }
+
+    function formatTimestamp(value) {
+      if (value === null || value === undefined || value === "") return "-";
+
+      let date;
+
+      if (typeof value === "number") {
+        date = new Date(value < 1e12 ? value * 1000 : value);
+      } else if (!isNaN(Number(value)) && String(value).trim() !== "") {
+        const numValue = Number(value);
+        date = new Date(numValue < 1e12 ? numValue * 1000 : numValue);
+      } else {
+        date = new Date(value);
+      }
+
+      if (isNaN(date.getTime())) return String(value);
+
+      const yyyy = date.getFullYear();
+      const mm = String(date.getMonth() + 1).padStart(2, "0");
+      const dd = String(date.getDate()).padStart(2, "0");
+      const hh = String(date.getHours()).padStart(2, "0");
+      const mi = String(date.getMinutes()).padStart(2, "0");
+      const ss = String(date.getSeconds()).padStart(2, "0");
+
+      return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`;
+    }
+
+    function formatTradeId(value) {
+      return value ?? "-";
     }
 
     function boolValue(id) {
@@ -657,14 +706,14 @@
 
     function appendMessage(text) {
       const el = document.getElementById("messages");
-      const ts = new Date().toLocaleTimeString();
+      const ts = formatTimestamp(Date.now());
       el.textContent = `[${ts}] ${text}\n` + el.textContent;
     }
 
     function setStatePill(state) {
       const el = document.getElementById("botStatePill");
-      el.textContent = state || "unknown";
-      el.className = "status-pill " + (state === "running" ? "pill-running" : "pill-stopped");
+      el.textContent = state || "Unknown";
+      el.className = "status-pill " + (state === "Running" ? "pill-running" : "pill-stopped");
     }
 
     function setSignalPill(signal) {
@@ -737,28 +786,84 @@
 
     function renderFills(fills) {
       const tbody = document.getElementById("fillsBody");
+      latestFills = Array.isArray(fills) ? fills.slice() : [];
 
-      if (!fills || !fills.length) {
+      if (!latestFills.length) {
         tbody.innerHTML = `<tr><td colspan="9" class="muted">No fills yet.</td></tr>`;
         return;
       }
 
-      tbody.innerHTML = fills.slice().reverse().map(fill => {
+      tbody.innerHTML = latestFills.slice().reverse().map(fill => {
         const pnlClass = fill.pnl == null ? "muted" : (Number(fill.pnl) >= 0 ? "good" : "bad");
         return `
           <tr>
-            <td class="mono">${fill.timestamp ?? "-"}</td>
+            <td class="mono">${formatTimestamp(fill.timestamp)}</td>
             <td>${fill.type ?? "-"}</td>
             <td>${fill.side ?? "-"}</td>
             <td>${num(fill.price, 6)}</td>
             <td>${num(fill.qty, 6)}</td>
             <td>${num(fill.fee, 6)}</td>
-            <td>${fill.trade_id ?? "-"}</td>
+            <td>${formatTradeId(fill.trade_id)}</td>
             <td class="${pnlClass}">${fill.pnl == null ? "-" : num(fill.pnl, 6)}</td>
             <td>${num(fill.equity_after, 6)}</td>
           </tr>
         `;
       }).join("");
+    }
+
+    function csvEscape(value) {
+      const str = value === null || value === undefined ? "" : String(value);
+      return `"${str.replace(/"/g, '""')}"`;
+    }
+
+    function exportRecentFillsToCSV() {
+      if (!latestFills.length) {
+        appendMessage("No fills available to export.");
+        return;
+      }
+
+      const headers = [
+        "timestamp",
+        "type",
+        "side",
+        "price",
+        "qty",
+        "fee",
+        "trade_id",
+        "pnl",
+        "equity_after"
+      ];
+
+      const rows = latestFills.map(fill => [
+        formatTimestamp(fill.timestamp),
+        fill.type ?? "",
+        fill.side ?? "",
+        fill.price ?? "",
+        fill.qty ?? "",
+        fill.fee ?? "",
+        fill.trade_id ?? "",
+        fill.pnl ?? "",
+        fill.equity_after ?? ""
+      ]);
+
+      const csv = [
+        headers.map(csvEscape).join(","),
+        ...rows.map(row => row.map(csvEscape).join(","))
+      ].join("\n");
+
+      const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+      const url = URL.createObjectURL(blob);
+
+      const link = document.createElement("a");
+      const stamp = formatTimestamp(Date.now()).replace(/[: ]/g, "-");
+      link.href = url;
+      link.download = `recent_fills_${stamp}.csv`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+
+      URL.revokeObjectURL(url);
+      appendMessage("Recent fills exported to CSV.");
     }
 
     function updateFormFromStatus(status) {
@@ -815,8 +920,8 @@
       document.getElementById("metricLiquidationPrice").textContent = num(ps.liquidation_price, 6);
 
       document.getElementById("metricLatestClose").textContent = num(latestBar.close, 6);
-      document.getElementById("metricLatestBarTs").textContent = latestBar.timestamp ?? "-";
-      document.getElementById("metricProcessedTs").textContent = status.runtime?.last_processed_bar_ts ?? "-";
+      document.getElementById("metricLatestBarTs").textContent = formatTimestamp(latestBar.timestamp);
+      document.getElementById("metricProcessedTs").textContent = formatTimestamp(status.runtime?.last_processed_bar_ts);
       document.getElementById("metricBarCount").textContent = status.runtime?.bar_count ?? "-";
 
       renderFills(status.runtime?.fills ?? []);
@@ -931,6 +1036,7 @@
     document.getElementById("startBtn").addEventListener("click", doStart);
     document.getElementById("stopBtn").addEventListener("click", doStop);
     document.getElementById("refreshBtn").addEventListener("click", refreshStatus);
+    document.getElementById("exportFillsBtn").addEventListener("click", exportRecentFillsToCSV);
 
     [
       "symbol","interval","market_type","initial_balance","fee_rate","slippage_bps","leverage",

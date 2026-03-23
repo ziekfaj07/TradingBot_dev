@@ -34,3 +34,5 @@ data/
 # data files
 .parquet
 *.parquet
+.csv
+*.csv

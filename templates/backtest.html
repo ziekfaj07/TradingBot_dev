@@ -66,6 +66,10 @@
       cursor: pointer;
     }
 
+    button:hover {
+      opacity: 0.75;
+    }
+
     pre {
       white-space: pre-wrap;
       overflow: auto;
@@ -107,7 +111,7 @@
         <div class="muted">Run one-shot strategy tests with config aligned to the live engine.</div>
       </div>
       <div>
-        <a href="/dashboard.html">Go to Dashboard</a>
+        <a href="/dashboard">Go to Dashboard</a>
       </div>
     </div>
 
@@ -122,8 +126,10 @@
           <label>Interval</label>
           <select id="interval">
             <option value="1m">1m</option>
+            <option value="3m">3m</option>
             <option value="5m">5m</option>
             <option value="15m">15m</option>
+            <option value="30m">30m</option>
             <option value="1h" selected>1h</option>
             <option value="4h">4h</option>
             <option value="1d">1d</option>
@@ -133,8 +139,8 @@
         <div class="field">
           <label>Market Type</label>
           <select id="market_type">
-            <option value="spot" selected>spot</option>
-            <option value="futures">futures</option>
+            <option value="spot" selected>Spot</option>
+            <option value="futures">Futures</option>
           </select>
         </div>
 
@@ -175,12 +181,12 @@
 
         <div class="field">
           <label>Start</label>
-          <input id="start" placeholder="optional" />
+          <input id="start" placeholder="Optional" />
         </div>
 
         <div class="field">
           <label>End</label>
-          <input id="end" placeholder="optional" />
+          <input id="end" placeholder="Optional" />
         </div>
       </div>
 
