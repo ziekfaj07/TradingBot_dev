@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 
+from core.run_naming import csv_filename_from_run_id
 from services.mode_controller import mode_controller
 
 router = APIRouter(prefix="/paper", tags=["paper"])
@@ -29,11 +30,14 @@ async def reset_paper():
 async def export_paper_fills_csv():
     try:
         csv_text = mode_controller.export_paper_fills_csv()
+        run_id = mode_controller.status().get("run_id") or "paper_run"
+        filename = csv_filename_from_run_id(run_id)
+
         return PlainTextResponse(
             content=csv_text,
             media_type="text/csv",
             headers={
-                "Content-Disposition": 'attachment; filename="paper_fills.csv"'
+                "Content-Disposition": f'attachment; filename="{filename}"'
             },
         )
     except Exception as e:

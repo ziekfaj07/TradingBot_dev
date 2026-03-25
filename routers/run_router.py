@@ -45,6 +45,12 @@ class ConfigureBody(BaseModel):
 async def status():
     return mode_controller.status()
 
+@router.get("/paper/fills")
+async def paper_fills(limit: int = 200, offset: int = 0):
+    try:
+        return mode_controller.get_paper_fills(limit=limit, offset=offset)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 @router.post("/mode")
 async def set_mode(body: SetModeBody):
