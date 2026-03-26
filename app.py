@@ -24,11 +24,9 @@ app.add_middleware(
 )
 
 app.include_router(dashboard_router)
-app.include_router(backtest_router)
 app.include_router(export_router)
 app.include_router(run_router)
 app.include_router(ws_router)
-app.include_router(paper_router)
 
 BASE_DIR = Path(__file__).resolve().parent
 FRONTEND_DIR = BASE_DIR / "templates"

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import PlainTextResponse
+
 from pydantic import BaseModel
 
+from core.run_naming import csv_filename_from_run_id
 from services.mode_controller import Mode
 from services.controller_singleton import mode_controller
 
@@ -49,6 +52,32 @@ class DevActionBody(BaseModel):
 async def status():
     return mode_controller.status()
 
+
+@router.get("/paper/chart")
+async def paper_chart(limit: int = 300):
+    try:
+        return mode_controller.get_chart_snapshot(limit=limit)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/paper/fills/export.csv")
+async def export_paper_fills_csv():
+    try:
+        csv_text = mode_controller.export_paper_fills_csv()
+        run_id = mode_controller.status().get("run_id") or "paper_run"
+        filename = csv_filename_from_run_id(run_id)
+
+        return PlainTextResponse(
+            content=csv_text,
+            media_type="text/csv",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"'
+            },
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    
 
 @router.get("/paper/fills")
 async def paper_fills(limit: int = 200, offset: int = 0):

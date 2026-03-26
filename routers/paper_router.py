@@ -17,6 +17,14 @@ async def get_paper_fills(
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+@router.get("/chart")
+async def get_paper_chart(
+    limit: int = Query(default=300, ge=10, le=5000),
+):
+    try:
+        return mode_controller.get_chart_snapshot(limit=limit)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 @router.post("/reset")
 async def reset_paper():

@@ -287,6 +287,33 @@
       font-size: 12px;
     }
 
+    .live-chart-wrap {
+      width: 100%;
+      height: 420px;
+      border: 1px solid #24314d;
+      border-radius: 12px;
+      overflow: hidden;
+      background: #0f1726;
+    }
+
+    #liveCandleChart {
+      width: 100%;
+      height: 100%;
+    }
+
+    .chart-meta {
+      display: flex;
+      gap: 14px;
+      flex-wrap: wrap;
+      margin-bottom: 10px;
+      color: #9fb0d1;
+      font-size: 13px;
+    }
+
+    .chart-meta strong {
+      color: #e8edf7;
+    }
+
     @media (max-width: 1100px) {
       .grid,
       .two-col {
@@ -523,6 +550,21 @@
 
     <div class="two-col">
       <section class="card">
+        <h2>Live Candlestick Chart</h2>
+        <div class="chart-meta">
+          <div>Symbol: <strong id="chartSymbolView">-</strong></div>
+          <div>Interval: <strong id="chartIntervalView">-</strong></div>
+          <div>Bars: <strong id="chartBarsView">0</strong></div>
+        </div>
+        <div class="muted" style="margin-bottom: 10px;">
+          Recent candles for the active paper config. Loads history first, then updates the latest candle live over WebSocket.
+        </div>
+        <div class="live-chart-wrap">
+          <div id="liveCandleChart"></div>
+        </div>
+      </section>
+
+      <section class="card">
         <h2>Equity Monitor</h2>
         <div class="muted" style="margin-bottom: 10px;">
           Live equity chart from polled status snapshots. Useful for spotting drift, churn, and execution issues.
@@ -585,7 +627,7 @@
       <pre id="rawStatus">Waiting for status...</pre>
     </section>
   </div>
-
+  <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
   <script>
     const equityHistory = [];
     const traceEntries = [];
@@ -594,6 +636,11 @@
     let ws = null;
     let wsReconnectTimer = null;
     let lastFillsReloadAt = 0;
+    let chart = null;
+    let candleSeries = null;
+    let chartResizeObserver = null;
+    let lastChartKey = null;
+    let chartInitialized = false;
 
     function qs(id) {
       return document.getElementById(id);
@@ -870,6 +917,145 @@
       setActionMessage("Flatten action completed.", "warn");
     }
 
+    function chartKey(symbol, interval) {
+      return `${symbol || ""}__${interval || ""}`;
+    }
+
+    function currentChartKeyFromStatus(status) {
+      const runtime = status?.runtime || {};
+      const symbol = runtime.chart_symbol || status?.config?.symbol || "";
+      const interval = runtime.chart_interval || status?.config?.interval || "";
+      return chartKey(symbol, interval);
+    }
+
+    function ensureChart() {
+      const container = qs("liveCandleChart");
+      if (!container) return;
+
+      if (chart) return;
+
+      chart = LightweightCharts.createChart(container, {
+        autoSize: true,
+        layout: {
+          background: { color: "#0f1726" },
+          textColor: "#c7d2e5",
+        },
+        grid: {
+          vertLines: { color: "#1d2940" },
+          horzLines: { color: "#1d2940" },
+        },
+        rightPriceScale: {
+          borderColor: "#2a3a58",
+        },
+        timeScale: {
+          borderColor: "#2a3a58",
+          timeVisible: true,
+          secondsVisible: false,
+        },
+        crosshair: {
+          mode: LightweightCharts.CrosshairMode.Normal,
+        },
+      });
+
+      candleSeries = chart.addCandlestickSeries({
+        upColor: "#26a69a",
+        borderUpColor: "#26a69a",
+        wickUpColor: "#26a69a",
+        downColor: "#ef5350",
+        borderDownColor: "#ef5350",
+        wickDownColor: "#ef5350",
+      });
+
+      chartInitialized = true;
+
+      if (!chartResizeObserver) {
+        chartResizeObserver = new ResizeObserver(() => {
+          if (!chart || !container) return;
+          const rect = container.getBoundingClientRect();
+          chart.applyOptions({
+            width: Math.max(300, Math.floor(rect.width)),
+            height: Math.max(300, Math.floor(rect.height)),
+          });
+        });
+        chartResizeObserver.observe(container);
+      }
+    }
+
+    function resetChart() {
+      if (candleSeries) {
+        candleSeries.setData([]);
+      }
+      qs("chartBarsView").textContent = "0";
+    }
+
+    function setChartMeta(symbol, interval, barsCount) {
+      qs("chartSymbolView").textContent = symbol || "-";
+      qs("chartIntervalView").textContent = interval || "-";
+      qs("chartBarsView").textContent = String(barsCount ?? 0);
+    }
+
+    async function loadChartBootstrap(force = false) {
+      if (!latestStatus) return;
+
+      const nextKey = currentChartKeyFromStatus(latestStatus);
+      if (!force && lastChartKey === nextKey && chartInitialized) {
+        return;
+      }
+
+      ensureChart();
+
+      const symbol = latestStatus?.runtime?.chart_symbol || latestStatus?.config?.symbol || "";
+      const interval = latestStatus?.runtime?.chart_interval || latestStatus?.config?.interval || "";
+
+      const data = await api("/api/run/paper/chart?limit=300");
+      const candles = Array.isArray(data.candles) ? data.candles.slice() : [];
+
+      candleSeries.setData(candles);
+      chart.timeScale().fitContent();
+
+      setChartMeta(
+        data.symbol || symbol,
+        data.interval || interval,
+        candles.length
+      );
+
+      lastChartKey = chartKey(data.symbol || symbol, data.interval || interval);
+    }
+
+    function applyLiveCandleUpdate(msg) {
+      if (!msg?.candle) return;
+      if (!latestStatus) return;
+
+      const activeKey = currentChartKeyFromStatus(latestStatus);
+      const incomingKey = chartKey(msg.symbol, msg.interval);
+
+      if (activeKey !== incomingKey) {
+        return;
+      }
+
+      ensureChart();
+      candleSeries.update(msg.candle);
+
+      const existingCount = Number(qs("chartBarsView").textContent || "0");
+      const currentTs = latestStatus?.runtime?.latest_bar?.timestamp;
+      if (msg.candle.time !== currentTs) {
+        qs("chartBarsView").textContent = String(existingCount + 1);
+      }
+
+      latestStatus.runtime = latestStatus.runtime || {};
+      latestStatus.runtime.latest_bar = {
+        ...(latestStatus.runtime.latest_bar || {}),
+        timestamp: msg.candle.time,
+        open: msg.candle.open,
+        high: msg.candle.high,
+        low: msg.candle.low,
+        close: msg.candle.close,
+        volume: msg.candle.volume,
+      };
+
+      setChartMeta(msg.symbol, msg.interval, qs("chartBarsView").textContent);
+    }
+
     function connectWebSocket() {
       if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
         return;
@@ -920,6 +1106,11 @@
               latestStatus.runtime.paper_state.equity = msg.equity;
               renderStatus(latestStatus);
             }
+            return;
+          }
+
+          if (msg.type === "candle") {
+            applyLiveCandleUpdate(msg);
             return;
           }
 
@@ -1013,6 +1204,11 @@
 
       qs("liveNotes").textContent = notes.join("\n");
 
+      qs("chartSymbolView").textContent =
+        runtime.chart_symbol || data?.config?.symbol || "-";
+      qs("chartIntervalView").textContent =
+        runtime.chart_interval || data?.config?.interval || "-";
+
       if (paperState.equity !== null && paperState.equity !== undefined) {
         const nextEquity = Number(paperState.equity);
         const lastPoint = equityHistory.length ? equityHistory[equityHistory.length - 1] : null;
@@ -1027,6 +1223,14 @@
             equityHistory.shift();
           }
         }
+      }
+
+      const nextChartKey = currentChartKeyFromStatus(data);
+      if (nextChartKey && nextChartKey !== lastChartKey) {
+        loadChartBootstrap(true).catch((err) => {
+          console.error("Chart bootstrap failed:", err);
+          setActionMessage(`Chart bootstrap failed: ${err.message}`, "bad");
+        });
       }
 
       drawEquityChart();
@@ -1098,11 +1302,12 @@
       renderStatus(data);
       applyConfigToForm(data.config || {});
       await loadFills();
+      await loadChartBootstrap(true);
     }
 
     async function loadFills() {
       const limit = Number(qs("fillsLimit")?.value || 50);
-      const data = await api(`api/run/paper/fills?limit=${limit}&offset=0`);
+      const data = await api(`/api/run/paper/fills?limit=${limit}&offset=0`);
       const rows = Array.isArray(data.fills) ? data.fills.slice() : [];
 
       const body = qs("fillsBody");
@@ -1154,6 +1359,7 @@
       });
 
       renderStatus(data);
+      await loadChartBootstrap(true);
       setActionMessage("Configuration saved.", "good");
     }
 
@@ -1165,6 +1371,7 @@
       startAutoRefresh();
 
       renderStatus(data);
+      await loadChartBootstrap(true);
       setActionMessage("Bot started.", "good");
     }
 
@@ -1199,13 +1406,14 @@
       qs("mode").value = data.mode || "paper";
 
       renderStatus(data);
+      await loadChartBootstrap(true);
       await loadFills();
 
       setActionMessage("Paper account reset.", "warn");
     }
 
     function exportCsv() {
-      window.location.href = "/paper/fills/export.csv";
+      window.location.href = "/api/run/paper/fills/export.csv";
       setActionMessage("CSV export started.", "good");
     }
 

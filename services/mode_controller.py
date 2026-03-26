@@ -324,9 +324,9 @@ class ModeController:
             "last_signal": self._last_signal,
             "fill_count": len(self._fills),
             "fills": [getattr(f, "__dict__", f) for f in reversed(self._fills[-10:])],
-            "trace_count": len(self._trace),
-            "recent_trace": list(reversed(self._trace[-20:])),
             "paper_state": self._serialize_state(),
+            "chart_symbol": cfg.get("symbol"),
+            "chart_interval": cfg.get("interval"),
         }
 
         return {
@@ -346,6 +346,49 @@ class ModeController:
         if symbol and symbol.upper() != cfg_symbol:
             return None
         return self._latest_bar
+
+    def _serialize_chart_bar(self, bar: dict | None) -> dict | None:
+        if not bar:
+            return None
+
+        try:
+            return {
+                "time": int(bar["timestamp"]),   # lightweight-charts wants UNIX seconds
+                "open": float(bar["open"]),
+                "high": float(bar["high"]),
+                "low": float(bar["low"]),
+                "close": float(bar["close"]),
+                "volume": float(bar.get("volume", 0.0)),
+            }
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def get_chart_snapshot(self, limit: int | None = None) -> dict:
+        cfg = self._status.config
+        effective_limit = max(10, int(limit or cfg.candle_limit or 300))
+
+        # Prefer in-memory bars when available so chart matches current paper session exactly.
+        bars = self._bars[-effective_limit:] if self._bars else []
+
+        # If engine is idle or bars are empty, bootstrap from market data using current config.
+        if not bars:
+            bars = self._fetch_recent_bars(
+                symbol=cfg.symbol,
+                interval=cfg.interval,
+                limit=effective_limit,
+            )
+
+        candles = []
+        for bar in bars[-effective_limit:]:
+            normalized = self._serialize_chart_bar(bar)
+            if normalized:
+                candles.append(normalized)
+
+        return {
+            "symbol": cfg.symbol,
+            "interval": cfg.interval,
+            "candles": candles,
+        }
 
     def get_paper_fills(self, limit: int = 200, offset: int = 0) -> dict:
         safe_limit = max(1, min(limit, 5000))
@@ -846,8 +889,11 @@ class ModeController:
 
     async def _broadcast_runtime_update(self) -> None:
         latest_price = None
+        latest_candle = None
+
         if self._latest_bar:
             latest_price = self._latest_bar.get("close")
+            latest_candle = self._serialize_chart_bar(self._latest_bar)
 
         position_qty = None
         entry_price = None
@@ -878,6 +924,14 @@ class ModeController:
             "type": "equity",
             "equity": equity,
         })
+
+        if latest_candle:
+            await ws_manager.broadcast({
+                "type": "candle",
+                "symbol": self._status.config.symbol,
+                "interval": self._status.config.interval,
+                "candle": latest_candle,
+            })
 
     async def _paper_step(self) -> None:
         async with self._lock:
