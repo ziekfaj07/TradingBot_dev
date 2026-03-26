@@ -109,6 +109,7 @@ class ModeController:
         self._last_processed_bar_ts: int | None = None
         self._last_signal: int = 0
         self._fills: list[Fill] = []
+        self._trace: list[dict] = []
 
         init_runtime_db()
         self._restore_paper_session()
@@ -153,7 +154,7 @@ class ModeController:
             self._status.state = EngineState.STARTING
 
             if self._status.mode == Mode.PAPER and self._status.run_id:
-                if self._engine is None or self._state in None:
+                if self._engine is None or self._state is None:
                     self._build_runtime_objects_from_existing_or_new()
                 self._status.stopped_at = None
                 self._status.last_error = None
@@ -179,6 +180,17 @@ class ModeController:
 
             self._status.state = EngineState.RUNNING
             self._persist_status()
+
+            if self._status.mode == Mode.PAPER:
+                await self._broadcast_trace_event(
+                    "paper_started",
+                    data={
+                        "run_id": self._status.run_id,
+                        "symbol": self._status.config.symbol,
+                        "interval": self._status.config.interval,
+                    },
+                )
+
             return self.status()
 
     async def stop(self) -> dict:
@@ -203,6 +215,13 @@ class ModeController:
             self._status.stopped_at = time.time()
             self._persist_status()
             self._persist_snapshot()
+
+            if self._status.mode == Mode.PAPER:
+                await self._broadcast_trace_event(
+                    "paper_stopped",
+                    data={"run_id": self._status.run_id},
+                )
+
             return self.status()
 
     async def run_backtest(self) -> dict:
@@ -305,6 +324,8 @@ class ModeController:
             "last_signal": self._last_signal,
             "fill_count": len(self._fills),
             "fills": [getattr(f, "__dict__", f) for f in reversed(self._fills[-10:])],
+            "trace_count": len(self._trace),
+            "recent_trace": list(reversed(self._trace[-20:])),
             "paper_state": self._serialize_state(),
         }
 
@@ -361,6 +382,245 @@ class ModeController:
             "fills": rows,
         }
 
+    def get_trace(self, limit: int = 200, offset: int = 0) -> dict:
+        safe_limit = max(1, min(limit, 1000))
+        safe_offset = max(0, offset)
+
+        rows = list(reversed(self._trace))
+        sliced = rows[safe_offset:safe_offset + safe_limit]
+
+        return {
+            "run_id": self._status.run_id,
+            "total": len(rows),
+            "limit": limit,
+            "offset": offset,
+            "events": sliced,
+        }
+
+    async def force_buy(self, price: float | None = None, note: str | None = None) -> dict:
+        async with self._lock:
+            self._ensure_manual_paper_runtime_locked()
+
+            if self._state is None or self._engine is None:
+                raise RuntimeError("Paper runtime is not initialized.")
+
+            if self._state.position_qty > 0:
+                raise RuntimeError("Already in a long position.")
+
+            resolved_price = await self._resolve_reference_price_locked(price)
+
+            if self._state.position_qty < 0:
+                self._state, fill = self._engine.liquidate(
+                    ts_iso=str(int(time.time())),
+                    state=self._state,
+                    close=resolved_price,
+                    market_type=self._status.config.market_type,
+                    trade_id=self._trade_id,
+                )
+                if fill:
+                    await self._append_fill(fill)
+
+            self._trade_id += 1
+            self._state, fill = self._engine.enter_long(
+                ts_iso=str(int(time.time())),
+                state=self._state,
+                close=resolved_price,
+                market_type=self._status.config.market_type,
+                leverage=self._status.config.leverage,
+                trade_id=self._trade_id,
+            )
+
+            if not fill:
+                raise RuntimeError("Force buy did not produce a fill.")
+
+            await self._append_fill(fill)
+            await self._mark_to_market(resolved_price)
+            self._persist_status()
+            self._persist_snapshot()
+
+            await self._broadcast_trace_event(
+                "force_buy",
+                note=note or "Manual paper buy executed.",
+                data={
+                    "price": resolved_price,
+                    "trade_id": self._trade_id,
+                    "position_qty": self._state.position_qty,
+                },
+            )
+            return self.status()
+
+    async def force_sell(self, price: float | None = None, note: str | None = None) -> dict:
+        async with self._lock:
+            self._ensure_manual_paper_runtime_locked()
+
+            if self._state is None or self._engine is None:
+                raise RuntimeError("Paper runtime is not initialized.")
+
+            if self._state.position_qty <= 0:
+                raise RuntimeError("No long position to sell.")
+
+            resolved_price = await self._resolve_reference_price_locked(price)
+
+            self._state, fill = self._engine.exit_long(
+                ts_iso=str(int(time.time())),
+                state=self._state,
+                close=resolved_price,
+                market_type=self._status.config.market_type,
+                trade_id=self._trade_id,
+            )
+
+            if not fill:
+                raise RuntimeError("Force sell did not produce a fill.")
+
+            await self._append_fill(fill)
+            await self._mark_to_market(resolved_price)
+            self._persist_status()
+            self._persist_snapshot()
+
+            await self._broadcast_trace_event(
+                "force_sell",
+                note=note or "Manual paper sell executed.",
+                data={
+                    "price": resolved_price,
+                    "trade_id": self._trade_id,
+                    "position_qty": self._state.position_qty,
+                },
+            )
+            return self.status()
+
+    async def flatten_position(self, price: float | None = None, note: str | None = None) -> dict:
+        async with self._lock:
+            self._ensure_manual_paper_runtime_locked()
+
+            if self._state is None or self._engine is None:
+                raise RuntimeError("Paper runtime is not initialized.")
+
+            resolved_price = await self._resolve_reference_price_locked(price)
+
+            if self._state.position_qty > 0:
+                self._state, fill = self._engine.exit_long(
+                    ts_iso=str(int(time.time())),
+                    state=self._state,
+                    close=resolved_price,
+                    market_type=self._status.config.market_type,
+                    trade_id=self._trade_id,
+                )
+                if fill:
+                    await self._append_fill(fill)
+
+            elif self._state.position_qty < 0:
+                self._state, fill = self._engine.liquidate(
+                    ts_iso=str(int(time.time())),
+                    state=self._state,
+                    close=resolved_price,
+                    market_type=self._status.config.market_type,
+                    trade_id=self._trade_id,
+                )
+                if fill:
+                    await self._append_fill(fill)
+            else:
+                await self._broadcast_trace_event(
+                    "flatten_noop",
+                    note=note or "Flatten requested with no open position.",
+                    data={"price": resolved_price},
+                )
+                return self.status()
+
+            await self._mark_to_market(resolved_price)
+            self._persist_status()
+            self._persist_snapshot()
+
+            await self._broadcast_trace_event(
+                "flatten",
+                note=note or "Manual flatten executed.",
+                data={
+                    "price": resolved_price,
+                    "trade_id": self._trade_id,
+                    "position_qty": self._state.position_qty,
+                },
+            )
+            return self.status()
+
+    def _append_trace_event(
+        self,
+        event: str,
+        note: str | None = None,
+        data: dict | None = None,
+    ) -> dict:
+        entry = {
+            "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            "event": event,
+            "note": note,
+            "run_id": self._status.run_id,
+            "data": data or {},
+        }
+        self._trace.append(entry)
+
+        if len(self._trace) > 2000:
+            self._trace = self._trace[-2000:]
+
+        return entry
+
+    async def _broadcast_trace_event(
+        self,
+        event: str,
+        note: str | None = None,
+        data: dict | None = None,
+    ) -> dict:
+        entry = self._append_trace_event(event=event, note=note, data=data)
+        await ws_manager.broadcast({
+            "type": "trace",
+            "data": entry,
+        })
+        return entry
+
+    def _ensure_manual_paper_runtime_locked(self) -> None:
+        if self._status.mode != Mode.PAPER:
+            raise RuntimeError("Paper dev controls only work in paper mode.")
+
+        if self._status.state in (EngineState.STARTING, EngineState.STOPPING):
+            raise RuntimeError("Wait for the engine transition to finish first.")
+
+        if not self._status.run_id:
+            self._status.started_at = time.time()
+            self._status.run_id = make_run_id(
+                symbol=self._status.config.symbol,
+                market_type=self._status.config.market_type,
+                mode=self._status.mode.value,
+                allow_short=self._status.config.allow_short,
+                started_at=datetime.fromtimestamp(self._status.started_at),
+            )
+            self._status.stopped_at = None
+            self._status.last_error = None
+            self._reset_runtime_memory()
+            self._build_runtime_objects()
+
+        elif self._engine is None or self._state is None:
+            self._build_runtime_objects_from_existing_or_new()
+
+        self._persist_status()
+        self._persist_snapshot()
+
+    async def _resolve_reference_price_locked(self, override_price: float | None = None) -> float:
+        if override_price is not None:
+            return float(override_price)
+
+        if self._latest_bar and self._latest_bar.get("close") is not None:
+            return float(self._latest_bar["close"])
+
+        bars = await asyncio.to_thread(
+            self._fetch_recent_bars,
+            self._status.config.symbol,
+            self._status.config.interval,
+            2,
+        )
+
+        if not bars:
+            raise RuntimeError("No market price available for manual paper action.")
+
+        self._latest_bar = bars[-1]
+        return float(self._latest_bar["close"])
+
     async def reset_paper(self) -> dict:
         async with self._lock:
             if self._status.state in (
@@ -384,6 +644,17 @@ class ModeController:
             self._status.started_at = None
             self._status.stopped_at = None
             self._status.run_id = None
+
+            await ws_manager.broadcast({
+                "type": "trace",
+                "data": {
+                    "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                    "event": "trace_cleared",
+                    "note": "Paper reset cleared runtime trace.",
+                    "run_id": None,
+                    "data": {},
+                },
+            })
 
             return self.status()
 
@@ -493,6 +764,7 @@ class ModeController:
         self._last_signal = 0
         self._trade_id = 0
         self._fills = []
+        self._trace = []
         self._state = None
         self._engine = None
 
@@ -565,6 +837,11 @@ class ModeController:
                 self._status.stopped_at = time.time()
                 self._persist_status()
                 self._persist_snapshot()
+                await self._broadcast_trace_event(
+                    "runtime_error",
+                    note=str(e),
+                    data={"run_id": self._status.run_id},
+                )
             return
 
     async def _broadcast_runtime_update(self) -> None:
@@ -603,44 +880,56 @@ class ModeController:
         })
 
     async def _paper_step(self) -> None:
-        cfg = self._status.config
+        async with self._lock:
+            cfg = self._status.config
 
-        bars = await asyncio.to_thread(
-            self._fetch_recent_bars,
-            cfg.symbol,
-            cfg.interval,
-            cfg.candle_limit,
-        )
+            bars = await asyncio.to_thread(
+                self._fetch_recent_bars,
+                cfg.symbol,
+                cfg.interval,
+                cfg.candle_limit,
+            )
 
-        if not bars:
-            return
+            if not bars:
+                return
 
-        self._bars = bars[-cfg.candle_limit:]
-        self._latest_bar = self._bars[-1]
+            self._bars = bars[-cfg.candle_limit:]
+            self._latest_bar = self._bars[-1]
 
-        closed_bar = self._get_newly_closed_bar(self._bars)
-        if closed_bar is None:
-            await self._mark_to_market(self._latest_bar["close"])
+            closed_bar = self._get_newly_closed_bar(self._bars)
+            if closed_bar is None:
+                await self._mark_to_market(self._latest_bar["close"])
+                self._persist_snapshot()
+                await self._broadcast_runtime_update()
+                return
+
+            signal = self._compute_signal_from_closed_bars(self._bars)
+            previous_signal = self._last_signal
+
+            self._last_processed_bar_ts = closed_bar["timestamp"]
+            self._last_signal = signal
+
+            if signal != 0 and signal != previous_signal:
+                await self._broadcast_trace_event(
+                    "signal_changed",
+                    data={
+                        "signal": signal,
+                        "bar_ts": closed_bar["timestamp"],
+                        "price": closed_bar["close"],
+                    },
+                )
+
+            print(
+                f"[paper] closed_ts={closed_bar['timestamp']} "
+                f"close={closed_bar['close']} signal={signal} "
+                f"pos={self._state.position_qty if self._state else None} "
+                f"fills={len(self._fills)}"
+            )
+
+            await self._apply_signal(signal=signal, bar=closed_bar)
+            await self._mark_to_market(closed_bar["close"])
             self._persist_snapshot()
             await self._broadcast_runtime_update()
-            return
-
-        signal = self._compute_signal_from_closed_bars(self._bars)
-
-        self._last_processed_bar_ts = closed_bar["timestamp"]
-        self._last_signal = signal
-
-        print(
-            f"[paper] closed_ts={closed_bar['timestamp']} "
-            f"close={closed_bar['close']} signal={signal} "
-            f"pos={self._state.position_qty if self._state else None} "
-            f"fills={len(self._fills)}"
-        )
-
-        await self._apply_signal(signal=signal, bar=closed_bar)
-        await self._mark_to_market(closed_bar["close"])
-        self._persist_snapshot()
-        await self._broadcast_runtime_update()
 
     def _fetch_recent_bars(self, symbol: str, interval: str, limit: int) -> list[dict]:
         try:
@@ -737,6 +1026,19 @@ class ModeController:
 
         self._persist_fill(normalized)
         self._persist_snapshot()
+
+        await self._broadcast_trace_event(
+            "fill_recorded",
+            data={
+                "type": normalized.type,
+                "side": normalized.side,
+                "price": normalized.price,
+                "qty": normalized.qty,
+                "fee": normalized.fee,
+                "trade_id": normalized.trade_id,
+                "pnl": normalized.pnl,
+            },
+        )
 
         await ws_manager.broadcast({
             "type": "fills"

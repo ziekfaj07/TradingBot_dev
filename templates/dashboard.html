@@ -493,6 +493,35 @@
     </div>
 
     <div class="two-col">
+      <section class="card" id="paperDevCard">
+        <h2>Paper Dev Controls</h2>
+        <div class="muted" style="margin-bottom: 10px;">
+          Manual execution harness for validating fill creation, position updates, realized PnL, and websocket refresh behavior.
+        </div>
+
+        <div class="controls-grid" style="grid-template-columns: repeat(3, minmax(160px, 1fr));">
+          <button id="forceBuyBtn" class="uniform-btn btn-success">Force Buy</button>
+          <button id="forceSellBtn" class="uniform-btn btn-danger">Force Sell</button>
+          <button id="flattenBtn" class="uniform-btn btn-warn">Flatten</button>
+        </div>
+
+        <div class="footer-row">
+          Enabled only in Paper mode.
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Execution Trace</h2>
+        <div class="fills-toolbar">
+          <div class="fills-toolbar-left">
+            <button id="reloadTraceBtn" class="btn-neutral">Reload Trace</button>
+          </div>
+        </div>
+        <pre id="traceLog">No trace events yet.</pre>
+      </section>
+    </div>
+
+    <div class="two-col">
       <section class="card">
         <h2>Equity Monitor</h2>
         <div class="muted" style="margin-bottom: 10px;">
@@ -559,6 +588,7 @@
 
   <script>
     const equityHistory = [];
+    const traceEntries = [];
     let latestStatus = null;
     let refreshTimer = null;
     let ws = null;
@@ -748,6 +778,98 @@
       }
     }
 
+    function updateDevControls(status) {
+      const isPaper = (status?.mode || "").toLowerCase() === "paper";
+      const disabled = !isPaper;
+
+      ["forceBuyBtn", "forceSellBtn", "flattenBtn"].forEach((id) => {
+        const el = qs(id);
+        if (el) el.disabled = disabled;
+      });
+
+      const card = qs("paperDevCard");
+      if (card) {
+        card.style.opacity = disabled ? "0.65" : "1";
+      }
+    }
+
+    function formatTraceEntry(entry) {
+      const ts = formatTs(entry?.timestamp);
+      const event = entry?.event || "event";
+      const note = entry?.note ? ` | ${entry.note}` : "";
+      const data = entry?.data && Object.keys(entry.data).length
+        ? ` | ${JSON.stringify(entry.data)}`
+        : "";
+      return `[${ts}] ${event}${note}${data}`;
+    }
+
+    function renderTrace(entries = []) {
+      traceEntries.length = 0;
+      traceEntries.push(...entries);
+
+      const el = qs("traceLog");
+      if (!traceEntries.length) {
+        el.textContent = "No trace events yet.";
+        return;
+      }
+
+      el.textContent = traceEntries.map(formatTraceEntry).join("\n");
+    }
+
+    function prependTraceEntry(entry) {
+      if (!entry) return;
+
+      const sig = JSON.stringify(entry);
+      const existing = traceEntries.some((x) => JSON.stringify(x) === sig);
+      if (existing) return;
+
+      traceEntries.unshift(entry);
+
+      if (traceEntries.length > 200) {
+        traceEntries.length = 200;
+      }
+
+      renderTrace(traceEntries);
+    }
+
+    async function loadTrace() {
+      const data = await api("/api/run/paper/dev/trace?limit=100&offset=0");
+      renderTrace(Array.isArray(data.events) ? data.events : []);
+    }
+
+    async function forceBuy() {
+      const data = await api("/api/run/paper/dev/force-buy", {
+        method: "POST",
+        body: JSON.stringify({})
+      });
+      renderStatus(data);
+      await loadFills();
+      await loadTrace();
+      setActionMessage("Manual buy executed.", "good");
+    }
+
+    async function forceSell() {
+      const data = await api("/api/run/paper/dev/force-sell", {
+        method: "POST",
+        body: JSON.stringify({})
+      });
+      renderStatus(data);
+      await loadFills();
+      await loadTrace();
+      setActionMessage("Manual sell executed.", "warn");
+    }
+
+    async function flattenPosition() {
+      const data = await api("/api/run/paper/dev/flatten", {
+        method: "POST",
+        body: JSON.stringify({})
+      });
+      renderStatus(data);
+      await loadFills();
+      await loadTrace();
+      setActionMessage("Flatten action completed.", "warn");
+    }
+
     function connectWebSocket() {
       if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
         return;
@@ -805,6 +927,17 @@
             await maybeReloadFillsFromStream(true);
             return;
           }
+
+          if (msg.type === "trace" && msg.data) {
+            if (msg.data.event === "trace_cleared") {
+              renderTrace([]);
+              return;
+            }
+
+            prependTraceEntry(msg.data);
+            return;
+          }
+          
         } catch (err) {
           console.error("WS message handling failed:", err);
         }
@@ -837,6 +970,8 @@
 
     function renderStatus(data) {
       latestStatus = data;
+
+      updateDevControls(data);
 
       const runtime = data.runtime || {};
       const paperState = runtime.paper_state || {};
@@ -966,33 +1101,21 @@
     }
 
     async function loadFills() {
-      const limit = Number(qs("fillsLimit").value || 50);
-      const data = await api(`/paper/fills?limit=${limit}&offset=0`);
+      const limit = Number(qs("fillsLimit")?.value || 50);
+      const data = await api(`api/run/paper/fills?limit=${limit}&offset=0`);
       const rows = Array.isArray(data.fills) ? data.fills.slice() : [];
 
       const body = qs("fillsBody");
       body.innerHTML = "";
 
-      let filteredRows = rows;
-      const currentRunId = latestStatus?.run_id || null;
-      const currentOnly = qs("showOnlyPaperFills").checked;
+      rows.reverse();
 
-      if (currentOnly && currentRunId) {
-        filteredRows = rows.filter(r => !r.run_id || r.run_id === currentRunId);
-      }
-
-      filteredRows.sort((a, b) => {
-        const ta = new Date(String(a.timestamp ?? "").replace(" ", "T")).getTime();
-        const tb = new Date(String(b.timestamp ?? "").replace(" ", "T")).getTime();
-        return tb - ta;
-      });
-
-      if (!filteredRows.length) {
+      if (!rows.length) {
         body.innerHTML = `<tr><td colspan="9" class="muted">No fills yet.</td></tr>`;
         return;
       }
 
-      for (const row of filteredRows) {
+      for (const row of rows) {
         const tr = document.createElement("tr");
         const pnlValue = Number(row.pnl);
         const pnlClass = pnlValue > 0 ? "good" : pnlValue < 0 ? "bad" : "";
@@ -1064,9 +1187,10 @@
       const ok = window.confirm("This will delete the persisted paper session, fills, and snapshot for the current paper run. Continue?");
       if (!ok) return;
 
-      const data = await api("/paper/reset", { method: "POST" });
+      const data = await api("/api/run/paper/reset", { method: "POST" });
 
       equityHistory.length = 0;
+      renderTrace([]);
       latestStatus = data;
 
       qs("fillsBody").innerHTML = `<tr><td colspan="9" class="muted">No fills yet.</td></tr>`;
@@ -1131,6 +1255,7 @@
       });
 
       qs("exportCsvBtn").addEventListener("click", exportCsv);
+
       qs("resetPaperBtn").addEventListener("click", async () => {
         try {
           await resetPaper();
@@ -1157,6 +1282,39 @@
 
       qs("autoRefresh").addEventListener("change", () => {
         startAutoRefresh();
+      });
+
+      qs("forceBuyBtn").addEventListener("click", async () => {
+        try {
+          await forceBuy();
+        } catch (err) {
+          setActionMessage(`Force buy failed: ${err.message}`, "bad");
+        }
+      });
+
+      qs("forceSellBtn").addEventListener("click", async () => {
+        try {
+          await forceSell();
+        } catch (err) {
+          setActionMessage(`Force sell failed: ${err.message}`, "bad");
+        }
+      });
+
+      qs("flattenBtn").addEventListener("click", async () => {
+        try {
+          await flattenPosition();
+        } catch (err) {
+          setActionMessage(`Flatten failed: ${err.message}`, "bad");
+        }
+      });
+
+      qs("reloadTraceBtn").addEventListener("click", async () => {
+        try {
+          await loadTrace();
+          setActionMessage("Trace reloaded.", "good");
+        } catch (err) {
+          setActionMessage(`Reload trace failed: ${err.message}`, "bad");
+        }
       });
 
       window.addEventListener("beforeunload", () => {
@@ -1194,6 +1352,7 @@
 
       try {
         await loadStatus();
+        await loadTrace();
         setActionMessage("Dashboard connected.", "good");
       } catch (err) {
         setActionMessage(`Initial load failed: ${err.message}`, "bad");

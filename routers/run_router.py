@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from services.mode_controller import Mode, ModeController
+from services.mode_controller import Mode
 from services.controller_singleton import mode_controller
 
 router = APIRouter(prefix="/api/run", tags=["run"])
@@ -16,7 +16,6 @@ class SetModeBody(BaseModel):
 
 
 class ConfigureBody(BaseModel):
-    # Only provided fields will be updated
     symbol: str | None = None
     interval: str | None = None
     market_type: str | None = None
@@ -41,9 +40,15 @@ class ConfigureBody(BaseModel):
     candle_limit: int | None = None
 
 
+class DevActionBody(BaseModel):
+    price: float | None = None
+    note: str | None = None
+
+
 @router.get("/status")
 async def status():
     return mode_controller.status()
+
 
 @router.get("/paper/fills")
 async def paper_fills(limit: int = 200, offset: int = 0):
@@ -51,6 +56,47 @@ async def paper_fills(limit: int = 200, offset: int = 0):
         return mode_controller.get_paper_fills(limit=limit, offset=offset)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/paper/dev/trace")
+async def paper_trace(limit: int = 200, offset: int = 0):
+    try:
+        return mode_controller.get_trace(limit=limit, offset=offset)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/paper/dev/force-buy")
+async def force_buy(body: DevActionBody = DevActionBody()):
+    try:
+        return await mode_controller.force_buy(price=body.price, note=body.note)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/paper/dev/force-sell")
+async def force_sell(body: DevActionBody = DevActionBody()):
+    try:
+        return await mode_controller.force_sell(price=body.price, note=body.note)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/paper/dev/flatten")
+async def flatten(body: DevActionBody = DevActionBody()):
+    try:
+        return await mode_controller.flatten_position(price=body.price, note=body.note)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/paper/reset")
+async def reset_paper():
+    try:
+        return await mode_controller.reset_paper()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
 
 @router.post("/mode")
 async def set_mode(body: SetModeBody):
@@ -87,9 +133,6 @@ async def stop():
 
 @router.post("/backtest")
 async def run_backtest(body: ConfigureBody):
-    """
-    One-shot backtest endpoint that reuses the same controller.
-    """
     try:
         overrides = {k: v for k, v in body.model_dump().items() if v is not None}
         return await mode_controller.run_backtest(**overrides)
