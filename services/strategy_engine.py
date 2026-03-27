@@ -1,23 +1,39 @@
+from __future__ import annotations
+
+from typing import Any
+
 import pandas as pd
+
+from services.strategies.ema_crossover import EmaCrossoverStrategy
 
 
 class StrategyEngine:
+    _registry = {
+        "ema_crossover": EmaCrossoverStrategy,
+    }
+
+    @classmethod
+    def available_strategies(cls) -> list[str]:
+        return sorted(cls._registry.keys())
+
+    @classmethod
+    def build(cls, name: str = "ema_crossover", **kwargs: Any):
+        strategy_cls = cls._registry.get(name)
+        if strategy_cls is None:
+            raise ValueError(
+                f"Unknown strategy '{name}'. Available: {', '.join(cls.available_strategies())}"
+            )
+        return strategy_cls(**kwargs)
+
+    @classmethod
+    def run(cls, df: pd.DataFrame, name: str = "ema_crossover", **kwargs: Any) -> pd.DataFrame:
+        strategy = cls.build(name=name, **kwargs)
+        return strategy.apply(df)
+
     @staticmethod
     def ema_crossover(df: pd.DataFrame, short: int = 9, long: int = 21) -> pd.DataFrame:
-        d = df.copy()
-        d["ema_short"] = d["close"].ewm(span=short, adjust=False).mean()
-        d["ema_long"] = d["close"].ewm(span=long, adjust=False).mean()
-
-        # signal: +1 enter long, -1 exit long (or enter short later)
-        d["signal"] = 0
-
-        # crossover detection
-        prev = d["ema_short"].shift(1) - d["ema_long"].shift(1)
-        curr = d["ema_short"] - d["ema_long"]
-
-        # cross up
-        d.loc[(prev <= 0) & (curr > 0), "signal"] = 1
-        # cross down
-        d.loc[(prev >= 0) & (curr < 0), "signal"] = -1
-
-        return d
+        """
+        Backward-compatible shim so existing callers keep working
+        during the v0.4.5 transition.
+        """
+        return EmaCrossoverStrategy(short=short, long=long).apply(df)
