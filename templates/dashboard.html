@@ -1,304 +1,183 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta charset="utf-8" />
   <title>Trading Bot Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="https://unpkg.com/lightweight-charts@5.0.8/dist/lightweight-charts.standalone.production.js"></script>
   <style>
     :root {
       --bg: #0b1220;
-      --panel: #111a2b;
-      --panel-2: #162238;
-      --border: #253554;
-      --text: #e8eefc;
+      --card: #121a2b;
+      --border: #24314d;
+      --text: #e8edf7;
       --muted: #9fb0d1;
-      --good: #22c55e;
-      --bad: #ef4444;
-      --warn: #f59e0b;
-      --accent: #60a5fa;
-      --accent-2: #38bdf8;
+      --good: #2ecc71;
+      --bad: #ff6b6b;
+      --warn: #f5b041;
+      --accent: #5dade2;
     }
 
-    * {
-      box-sizing: border-box;
-    }
-
+    * { box-sizing: border-box; }
     body {
       margin: 0;
-      font-family: Arial, Helvetica, sans-serif;
-      background: linear-gradient(180deg, #09101d 0%, #0b1220 100%);
+      padding: 20px;
+      background: var(--bg);
       color: var(--text);
-    }
-
-    .container {
-      max-width: 1400px;
-      margin: 0 auto;
-      padding: 24px;
+      font-family: Arial, sans-serif;
     }
 
     h1, h2, h3 {
       margin-top: 0;
     }
 
-    .muted {
-      color: var(--muted);
-    }
-
-    .topbar {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 16px;
-      margin-bottom: 20px;
-      flex-wrap: wrap;
-    }
-
-    .topbar a {
-      color: var(--accent-2);
+    a {
+      color: var(--accent);
       text-decoration: none;
-      font-weight: 700;
+    }
+
+    .container {
+      max-width: 1400px;
+      margin: 0 auto;
     }
 
     .grid {
       display: grid;
-      grid-template-columns: 1.2fr 1fr;
-      gap: 20px;
+      gap: 16px;
+    }
+
+    .grid-2 {
+      grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
     }
 
     .card {
-      background: rgba(17, 26, 43, 0.95);
+      background: var(--card);
       border: 1px solid var(--border);
-      border-radius: 16px;
-      padding: 18px;
-      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+      border-radius: 14px;
+      padding: 16px;
     }
 
-    .controls-grid {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(180px, 1fr));
-      gap: 12px;
-      margin-top: 8px;
-      margin-bottom: 16px;
+    .muted {
+      color: var(--muted);
+      font-size: 13px;
     }
 
     .form-grid {
       display: grid;
-      grid-template-columns: repeat(4, minmax(180px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
       gap: 12px;
     }
 
-    .field {
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-    }
-
     label {
-      font-size: 13px;
+      display: block;
+      font-size: 12px;
       color: var(--muted);
-      font-weight: 700;
+      margin-bottom: 6px;
     }
 
     input, select, button, textarea {
+      width: 100%;
       border-radius: 10px;
       border: 1px solid var(--border);
-      background: var(--panel-2);
+      background: #0f1726;
       color: var(--text);
       padding: 10px 12px;
       font-size: 14px;
     }
 
-    button {
-      cursor: pointer;
-      font-weight: 700;
-      transition: transform 0.05s ease, opacity 0.2s ease;
+    textarea {
+      min-height: 80px;
+      resize: vertical;
     }
 
-    button:hover {
-      opacity: 0.75;
-    }
-
-    button:active {
-      transform: translateY(1px);
-    }
-
-    .btn-primary { background: #1d4ed8; }
-    .btn-success { background: #15803d; }
-    .btn-danger  { background: #b91c1c; }
-    .btn-neutral { background: #334155; }
-    .btn-warn    { background: #a16207; }
-
-    .uniform-btn {
-      width: 100%;
-      min-height: 44px;
-    }
-
-    .minor-btn {
-      width: 170px;
-      min-height: 20px;
-    }
-
-    .status-grid {
+    .actions {
       display: grid;
-      grid-template-columns: repeat(4, minmax(160px, 1fr));
-      gap: 12px;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 10px;
+      margin-top: 14px;
     }
 
-    .stat {
-      background: var(--panel-2);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 12px;
-    }
-
-    .stat .k {
-      font-size: 12px;
-      color: var(--muted);
-      margin-bottom: 6px;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-    }
-
-    .stat .v {
-      font-size: 15px;
-      font-weight: 700;
-      word-break: break-word;
+    .actions button {
+      min-height: 42px;
+      font-weight: 600;
+      cursor: pointer;
     }
 
     .pill {
       display: inline-block;
-      padding: 5px 10px;
+      padding: 4px 10px;
       border-radius: 999px;
-      font-weight: 700;
       font-size: 12px;
-    }
-
-    .pill-running { background: rgba(34,197,94,.15); color: #86efac; }
-    .pill-idle    { background: rgba(148,163,184,.15); color: #cbd5e1; }
-    .pill-error   { background: rgba(239,68,68,.15); color: #fca5a5; }
-    .pill-warn    { background: rgba(245,158,11,.15); color: #fcd34d; }
-
-    .two-col {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 20px;
-      margin-top: 20px;
-    }
-
-    .chart-wrap {
-      height: 240px;
-      background: var(--panel-2);
       border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 12px;
-    }
-
-    canvas {
-      width: 100%;
-      height: 100%;
-      display: block;
-    }
-
-    .notes {
-      min-height: 240px;
-      white-space: pre-wrap;
-      line-height: 1.5;
+      background: #0f1726;
       color: var(--muted);
-      background: var(--panel-2);
+    }
+
+    .status-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+    }
+
+    .stat {
+      background: #0f1726;
       border: 1px solid var(--border);
       border-radius: 12px;
       padding: 12px;
     }
 
-    .fills-toolbar {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 12px;
-      margin-bottom: 12px;
-      flex-wrap: wrap;
+    .stat-label {
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 6px;
     }
 
-    .fills-toolbar-left,
-    .fills-toolbar-right {
-      display: flex;
-      gap: 8px;
-      align-items: center;
-      flex-wrap: wrap;
+    .stat-value {
+      font-size: 16px;
+      font-weight: 700;
+      word-break: break-word;
     }
 
-    .table-wrap {
-      overflow: auto;
-      border: 1px solid var(--border);
-      border-radius: 12px;
-    }
-
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      min-width: 900px;
-      background: var(--panel-2);
-    }
-
-    th, td {
-      padding: 10px 12px;
-      border-bottom: 1px solid var(--border);
-      text-align: left;
+    .action-message {
+      margin-top: 10px;
       font-size: 13px;
-    }
-
-    th {
-      position: sticky;
-      top: 0;
-      background: #13203a;
-      z-index: 1;
+      color: var(--muted);
     }
 
     .good { color: var(--good); }
     .bad { color: var(--bad); }
     .warn { color: var(--warn); }
 
-    pre {
-      margin: 0;
-      white-space: pre-wrap;
-      word-break: break-word;
-      font-size: 12px;
-      line-height: 1.5;
-      color: #d7e3ff;
-      background: var(--panel-2);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 12px;
-      max-height: 380px;
-      overflow: auto;
-    }
-
-    .toggle-row {
-      display: flex;
-      gap: 10px;
-      align-items: center;
-      flex-wrap: wrap;
-      margin-top: 8px;
-    }
-
-    .footer-row {
+    table {
+      width: 100%;
+      border-collapse: collapse;
       margin-top: 10px;
-      color: var(--muted);
-      font-size: 12px;
+      font-size: 13px;
+    }
+
+    th, td {
+      text-align: left;
+      padding: 8px;
+      border-bottom: 1px solid var(--border);
     }
 
     .live-chart-wrap {
       width: 100%;
       height: 420px;
+      min-height: 420px;
       border: 1px solid #24314d;
       border-radius: 12px;
       overflow: hidden;
       background: #0f1726;
+      position: relative;
     }
 
     #liveCandleChart {
+      display: block;
       width: 100%;
-      height: 100%;
+      height: 420px;
+      min-height: 420px;
+      outline: 1px dashed #5dade2;
     }
 
     .chart-meta {
@@ -306,480 +185,260 @@
       gap: 14px;
       flex-wrap: wrap;
       margin-bottom: 10px;
-      color: #9fb0d1;
+      color: var(--muted);
       font-size: 13px;
     }
 
     .chart-meta strong {
-      color: #e8edf7;
+      color: var(--text);
     }
 
-    @media (max-width: 1100px) {
-      .grid,
-      .two-col {
-        grid-template-columns: 1fr;
-      }
-
-      .form-grid,
-      .controls-grid,
-      .status-grid {
-        grid-template-columns: repeat(2, minmax(160px, 1fr));
-      }
+    .row-inline {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
     }
 
-    @media (max-width: 700px) {
-      .form-grid,
-      .controls-grid,
-      .status-grid {
-        grid-template-columns: 1fr;
-      }
+    canvas {
+      width: 100%;
+      background: #0f1726;
+      border: 1px solid var(--border);
+      border-radius: 12px;
     }
   </style>
 </head>
 <body>
   <div class="container">
-    <div class="topbar">
-      <div>
-        <h1>Trading Bot Dashboard</h1>
-        <div class="muted">Run the bot from the browser, observe trades live, and validate runtime behavior quickly.</div>
-      </div>
-      <div>
-        <a href="/backtest">Backtest Page</a>
-      </div>
+    <div class="row-inline" style="justify-content: space-between; margin-bottom: 16px;">
+      <h1 style="margin:0;">Trading Bot Dashboard</h1>
+      <a href="/backtest">Backtest Page</a>
     </div>
 
-    <div class="grid">
-      <section class="card">
-        <h2>Bot Control Panel</h2>
-
-        <div class="form-grid">
-          <div class="field">
-            <label for="mode">Mode</label>
-            <select id="mode">
-              <option value="live">Live</option>
-              <option value="paper" selected>Paper</option>
-              <option value="backtest">Backtest</option>
-            </select>
-          </div>
-
-          <div class="field">
-            <label for="symbol">Symbol</label>
-            <input id="symbol" value="BTCUSDT" />
-          </div>
-
-          <div class="field">
-            <label for="interval">Interval</label>
-            <select id="interval">
-              <option>1m</option>
-              <option>3m</option>
-              <option>5m</option>
-              <option>15m</option>
-              <option>30m</option>
-              <option>1h</option>
-              <option>4h</option>
-              <option>1d</option>
-            </select>
-          </div>
-
-          <div class="field">
-            <label for="market_type">Market Type</label>
-            <select id="market_type">
-              <option value="spot">Spot</option>
-              <option value="futures">Futures</option>
-            </select>
-          </div>
-
-          <div class="field">
-            <label for="initial_balance">Initial Balance</label>
-            <input id="initial_balance" type="number" step="any" value="1000" />
-          </div>
-
-          <div class="field">
-            <label for="fee_rate">Fee Rate</label>
-            <input id="fee_rate" type="number" step="any" value="0.001" />
-          </div>
-
-          <div class="field">
-            <label for="slippage_bps">Slippage (bps)</label>
-            <input id="slippage_bps" type="number" step="any" value="2" />
-          </div>
-
-          <div class="field">
-            <label for="leverage">Leverage</label>
-            <input id="leverage" type="number" step="any" value="1" />
-          </div>
-
-          <div class="field">
-            <label for="ema_short">EMA Short</label>
-            <input id="ema_short" type="number" value="9" />
-          </div>
-
-          <div class="field">
-            <label for="ema_long">EMA Long</label>
-            <input id="ema_long" type="number" value="21" />
-          </div>
-
-          <div class="field">
-            <label for="candle_limit">Candle Limit</label>
-            <input id="candle_limit" type="number" value="300" />
-          </div>
-
-          <div class="field">
-            <label for="poll_seconds">Poll Seconds</label>
-            <input id="poll_seconds" type="number" step="any" value="5" />
-          </div>
-
-          <div class="field">
-            <label for="allow_short">Allow Short</label>
-            <select id="allow_short">
-              <option value="false" selected>False</option>
-              <option value="true">True</option>
-            </select>
-          </div>
-
-          <div class="field">
-            <label for="max_leverage">Max Leverage</label>
-            <input id="max_leverage" type="number" step="any" value="50" />
-          </div>
-
-          <div class="field">
-            <label for="max_qty">Max Quantity</label>
-            <input id="max_qty" type="number" step="any" value="10" />
-          </div>
-
-          <div class="field">
-            <label for="maintenance_margin">Maintenance Margin</label>
-            <input id="maintenance_margin" type="number" step="any" value="0.005" />
-          </div>
-
-          <div class="field">
-            <label for="include_equity">Include Equity</label>
-            <select id="include_equity">
-              <option value="true">True</option>
-              <option value="false" selected>False</option>
-            </select>
-          </div>
-
-          <div class="field">
-            <label for="equity_stride">Equity Stride</label>
-            <input id="equity_stride" type="number" value="1" />
-          </div>
-
-          <div class="field">
-            <label for="start">Start</label>
-            <input id="start" type="text" placeholder="YYYY-MM-DD" />
-          </div>
-
-          <div class="field">
-            <label for="end">End</label>
-            <input id="end" type="text" placeholder="YYYY-MM-DD" />
-          </div>
-        </div>
-
-        <div class="controls-grid">
-          <button id="configureBtn" class="uniform-btn btn-primary">Configure</button>
-          <button id="startBtn" class="uniform-btn btn-success">Start</button>
-          <button id="stopBtn" class="uniform-btn btn-danger">Stop</button>
-        </div>
-
-        <div class="toggle-row">
-          <label><input type="checkbox" id="autoRefresh"/> Auto-refresh</label>
-          <button id="refreshBtn" class="minor-btn btn-neutral">Refresh Status</button>
-          <label><input type="checkbox" id="showOnlyPaperFills" checked /> Show current run fills</label>
-          <button id="resetPaperBtn" class="minor-btn btn-neutral">Reset Paper Account</button>
-        </div>
-
-        <div class="footer-row" id="actionMessage">Ready.</div>
-      </section>
-
-      <section class="card">
-        <h2>Runtime Summary</h2>
-
-        <div class="status-grid">
-          <div class="stat"><div class="k">Bot State</div><div class="v" id="botState">Unknown</div></div>
-          <div class="stat"><div class="k">Last Signal</div><div class="v" id="lastSignal">WAIT</div></div>
-          <div class="stat"><div class="k">Mode</div><div class="v" id="modeView">-</div></div>
-          <div class="stat"><div class="k">Run ID</div><div class="v" id="runId">-</div></div>
-
-          <div class="stat"><div class="k">Fill Count</div><div class="v" id="fillCount">0</div></div>
-          <div class="stat"><div class="k">Cash</div><div class="v" id="cash">-</div></div>
-          <div class="stat"><div class="k">Position Quantity</div><div class="v" id="positionQty">-</div></div>
-          <div class="stat"><div class="k">Entry Price</div><div class="v" id="entryPrice">-</div></div>
-
-          <div class="stat"><div class="k">Equity</div><div class="v" id="equity">-</div></div>
-          <div class="stat"><div class="k">Realized PnL</div><div class="v" id="realizedPnl">-</div></div>
-          <div class="stat"><div class="k">Liquidation Price</div><div class="v" id="liquidationPrice">-</div></div>
-          <div class="stat"><div class="k">Latest Close</div><div class="v" id="latestClose">-</div></div>
-
-          <div class="stat"><div class="k">Latest Bar TS</div><div class="v" id="latestBarTs">-</div></div>
-          <div class="stat"><div class="k">Last Processed TS</div><div class="v" id="lastProcessedTs">-</div></div>
-          <div class="stat"><div class="k">Bar Count</div><div class="v" id="barCount">-</div></div>
-          <div class="stat"><div class="k">Started At</div><div class="v" id="startedAt">-</div></div>
-        </div>
-      </section>
-    </div>
-
-    <div class="two-col">
-      <section class="card" id="paperDevCard">
-        <h2>Paper Dev Controls</h2>
-        <div class="muted" style="margin-bottom: 10px;">
-          Manual execution harness for validating fill creation, position updates, realized PnL, and websocket refresh behavior.
-        </div>
-
-        <div class="controls-grid" style="grid-template-columns: repeat(3, minmax(160px, 1fr));">
-          <button id="forceBuyBtn" class="uniform-btn btn-success">Force Buy</button>
-          <button id="forceSellBtn" class="uniform-btn btn-danger">Force Sell</button>
-          <button id="flattenBtn" class="uniform-btn btn-warn">Flatten</button>
-        </div>
-
-        <div class="footer-row">
-          Enabled only in Paper mode.
-        </div>
-      </section>
-
-      <section class="card">
-        <h2>Execution Trace</h2>
-        <div class="fills-toolbar">
-          <div class="fills-toolbar-left">
-            <button id="reloadTraceBtn" class="btn-neutral">Reload Trace</button>
-          </div>
-        </div>
-        <pre id="traceLog">No trace events yet.</pre>
-      </section>
-    </div>
-
-    <div class="two-col">
-      <section class="card">
-        <h2>Live Candlestick Chart</h2>
-        <div class="chart-meta">
-          <div>Symbol: <strong id="chartSymbolView">-</strong></div>
-          <div>Interval: <strong id="chartIntervalView">-</strong></div>
-          <div>Bars: <strong id="chartBarsView">0</strong></div>
-        </div>
-        <div class="muted" style="margin-bottom: 10px;">
-          Recent candles for the active paper config. Loads history first, then updates the latest candle live over WebSocket.
-        </div>
-        <div class="live-chart-wrap">
-          <div id="liveCandleChart"></div>
-        </div>
-      </section>
-
-      <section class="card">
-        <h2>Equity Monitor</h2>
-        <div class="muted" style="margin-bottom: 10px;">
-          Live equity chart from polled status snapshots. Useful for spotting drift, churn, and execution issues.
-        </div>
-        <div class="chart-wrap">
-          <canvas id="equityCanvas"></canvas>
-        </div>
-      </section>
-
-      <section class="card">
-        <h2>Live Notes</h2>
-        <div class="notes" id="liveNotes">Waiting for status...</div>
-      </section>
-    </div>
-
-    <section class="card" style="margin-top: 20px;">
-      <h2>Recent Fills</h2>
-
-      <div class="fills-toolbar">
-        <div class="fills-toolbar-left">
-          <button id="exportCsvBtn" class="btn-primary">Export to CSV</button>
-          <button id="reloadFillsBtn" class="btn-neutral">Reload Fills</button>
-        </div>
-
-        <div class="fills-toolbar-right">
-          <label for="fillsLimit">Rows</label>
-          <select id="fillsLimit">
-            <option value="25" selected>25</option>
-            <option value="50">50</option>
-            <option value="100">100</option>
-            <option value="200">200</option>
+    <section class="card">
+      <h2>Bot Control Panel</h2>
+      <div class="form-grid">
+        <div>
+          <label for="mode">Mode</label>
+          <select id="mode">
+            <option value="live">Live</option>
+            <option value="paper">Paper</option>
+            <option value="backtest">Backtest</option>
           </select>
         </div>
+        <div>
+          <label for="symbol">Symbol</label>
+          <input id="symbol" value="SOLUSDT" />
+        </div>
+        <div>
+          <label for="interval">Interval</label>
+          <select id="interval">
+            <option>1m</option>
+            <option>3m</option>
+            <option>5m</option>
+            <option>15m</option>
+            <option>30m</option>
+            <option>1h</option>
+            <option>4h</option>
+            <option>1d</option>
+          </select>
+        </div>
+        <div>
+          <label for="market_type">Market Type</label>
+          <select id="market_type">
+            <option value="spot">Spot</option>
+            <option value="futures">Futures</option>
+          </select>
+        </div>
+        <div>
+          <label for="initial_balance">Initial Balance</label>
+          <input id="initial_balance" type="number" value="1000" />
+        </div>
+        <div>
+          <label for="fee_rate">Fee Rate</label>
+          <input id="fee_rate" type="number" step="0.0001" value="0.001" />
+        </div>
+        <div>
+          <label for="slippage_bps">Slippage (bps)</label>
+          <input id="slippage_bps" type="number" value="2" />
+        </div>
+        <div>
+          <label for="leverage">Leverage</label>
+          <input id="leverage" type="number" step="0.1" value="1" />
+        </div>
+        <div>
+          <label for="ema_short">EMA Short</label>
+          <input id="ema_short" type="number" value="9" />
+        </div>
+        <div>
+          <label for="ema_long">EMA Long</label>
+          <input id="ema_long" type="number" value="21" />
+        </div>
+        <div>
+          <label for="candle_limit">Candle Limit</label>
+          <input id="candle_limit" type="number" value="300" />
+        </div>
+        <div>
+          <label for="poll_seconds">Poll Seconds</label>
+          <input id="poll_seconds" type="number" step="0.1" value="2" />
+        </div>
+        <div>
+          <label for="allow_short">Allow Short</label>
+          <select id="allow_short">
+            <option value="false">False</option>
+            <option value="true">True</option>
+          </select>
+        </div>
+        <div>
+          <label for="max_leverage">Max Leverage</label>
+          <input id="max_leverage" type="number" step="0.1" value="50" />
+        </div>
+        <div>
+          <label for="max_qty">Max Quantity</label>
+          <input id="max_qty" type="number" step="0.0001" value="10" />
+        </div>
+        <div>
+          <label for="maintenance_margin">Maintenance Margin</label>
+          <input id="maintenance_margin" type="number" step="0.0001" value="0.005" />
+        </div>
+        <div>
+          <label for="include_equity">Include Equity</label>
+          <select id="include_equity">
+            <option value="true">True</option>
+            <option value="false">False</option>
+          </select>
+        </div>
+        <div>
+          <label for="equity_stride">Equity Stride</label>
+          <input id="equity_stride" type="number" value="1" />
+        </div>
+        <div>
+          <label for="start">Start</label>
+          <input id="start" />
+        </div>
+        <div>
+          <label for="end">End</label>
+          <input id="end" />
+        </div>
       </div>
 
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Timestamp</th>
-              <th>Type</th>
-              <th>Side</th>
-              <th>Price</th>
-              <th>Quantity</th>
-              <th>Fee</th>
-              <th>Trade ID</th>
-              <th>PnL</th>
-              <th>Equity After</th>
-            </tr>
-          </thead>
-          <tbody id="fillsBody">
-            <tr><td colspan="9" class="muted">No fills yet.</td></tr>
-          </tbody>
-        </table>
+      <div class="actions">
+        <button onclick="configureBot()">Configure</button>
+        <button onclick="startBot()">Start</button>
+        <button onclick="stopBot()">Stop</button>
+        <button onclick="loadStatus()">Refresh Status</button>
+        <button onclick="loadFills()">Show current run fills</button>
+        <button onclick="resetPaper()">Reset Paper Account</button>
+        <button onclick="exportCsv()">Export Fills CSV</button>
+      </div>
+
+      <div id="actionMessage" class="action-message">Ready.</div>
+    </section>
+
+    <section class="card" style="margin-top:16px;">
+      <h2>Runtime Summary</h2>
+      <div class="status-grid">
+        <div class="stat"><div class="stat-label">Bot State</div><div id="botState" class="stat-value">Unknown</div></div>
+        <div class="stat"><div class="stat-label">Last Signal</div><div id="lastSignal" class="stat-value">WAIT</div></div>
+        <div class="stat"><div class="stat-label">Mode</div><div id="modeView" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Run ID</div><div id="runId" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Fill Count</div><div id="fillCount" class="stat-value">0</div></div>
+        <div class="stat"><div class="stat-label">Cash</div><div id="cash" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Position Quantity</div><div id="positionQty" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Entry Price</div><div id="entryPrice" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Equity</div><div id="equity" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Realized PnL</div><div id="realizedPnl" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Liquidation Price</div><div id="liqPrice" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Latest Close</div><div id="latestClose" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Latest Bar TS</div><div id="latestBarTs" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Last Processed TS</div><div id="lastProcessedTs" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Bar Count</div><div id="barCount" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Started At</div><div id="startedAt" class="stat-value">-</div></div>
       </div>
     </section>
 
-    <section class="card" style="margin-top: 20px;">
-      <h2>Raw Status</h2>
-      <pre id="rawStatus">Waiting for status...</pre>
+    <section class="card" style="margin-top:16px;">
+      <h2>Live Candlestick Chart</h2>
+      <div class="chart-meta">
+        <div>Symbol: <strong id="chartSymbolView">-</strong></div>
+        <div>Interval: <strong id="chartIntervalView">-</strong></div>
+        <div>Bars: <strong id="chartBarsView">0</strong></div>
+      </div>
+      <div class="muted" style="margin-bottom: 10px;">
+        Recent candles for the active paper config. Loads history first, then updates the latest candle live over WebSocket.
+      </div>
+      <div class="live-chart-wrap">
+        <div id="liveCandleChart"></div>
+      </div>
+    </section>
+
+    <section class="card" style="margin-top:16px;">
+      <h2>Equity Monitor</h2>
+      <canvas id="equityCanvas" height="120"></canvas>
+    </section>
+
+    <section class="card" style="margin-top:16px;">
+      <h2>Recent Fills</h2>
+      <div class="muted">Newest fills first.</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Side</th>
+            <th>Qty</th>
+            <th>Price</th>
+            <th>Fee</th>
+            <th>Realized PnL</th>
+          </tr>
+        </thead>
+        <tbody id="fillsTableBody"></tbody>
+      </table>
     </section>
   </div>
-  <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+
   <script>
-    const equityHistory = [];
-    const traceEntries = [];
-    let latestStatus = null;
-    let refreshTimer = null;
+    const qs = (id) => document.getElementById(id);
+
     let ws = null;
-    let wsReconnectTimer = null;
-    let lastFillsReloadAt = 0;
+    let latestStatus = null;
+    let autoRefreshTimer = null;
+    const equityHistory = [];
+
     let chart = null;
     let candleSeries = null;
-    let chartResizeObserver = null;
     let lastChartKey = null;
-    let chartInitialized = false;
+    let lastCandleTime = null;
 
-    function qs(id) {
-      return document.getElementById(id);
+    function fmtNum(v, digits = 4) {
+      if (v === null || v === undefined || v === "") return "-";
+      const n = Number(v);
+      if (Number.isNaN(n)) return String(v);
+      return n.toLocaleString(undefined, { maximumFractionDigits: digits });
     }
 
-    function setActionMessage(msg, tone = "muted") {
+    function fmtTs(v) {
+      if (v === null || v === undefined || v === "") return "-";
+      const n = Number(v);
+      if (Number.isNaN(n)) return String(v);
+      const d = new Date(n * 1000);
+      return d.toLocaleString();
+    }
+
+    function setActionMessage(text, klass = "") {
       const el = qs("actionMessage");
-      el.textContent = msg;
-      el.className = `footer-row ${tone}`;
+      el.textContent = text;
+      el.className = `action-message ${klass}`.trim();
     }
 
-    function num(value, digits = 6) {
-      if (value === null || value === undefined || value === "") return "-";
-      const n = Number(value);
-      if (!Number.isFinite(n)) return String(value);
-      return n.toLocaleString(undefined, {
-        minimumFractionDigits: 0,
-        maximumFractionDigits: digits
-      });
-    }
-
-    function formatTs(value) {
-      if (value === null || value === undefined || value === "") return "-";
-
-      let d = null;
-
-      if (typeof value === "number") {
-        d = value > 1e12 ? new Date(value) : new Date(value * 1000);
-      } else if (/^\d+$/.test(String(value))) {
-        const n = Number(value);
-        d = String(value).length >= 13 ? new Date(n) : new Date(n * 1000);
-      } else {
-        d = new Date(value);
-      }
-
-      if (!(d instanceof Date) || isNaN(d.getTime())) return String(value);
-
-      const yyyy = d.getFullYear();
-      const mm = String(d.getMonth() + 1).padStart(2, "0");
-      const dd = String(d.getDate()).padStart(2, "0");
-      const hh = String(d.getHours()).padStart(2, "0");
-      const mi = String(d.getMinutes()).padStart(2, "0");
-      const ss = String(d.getSeconds()).padStart(2, "0");
-
-      return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`;
-    }
-
-    function signalText(signal) {
-      if (signal === 1) return "LONG";
-      if (signal === -1) return "SHORT";
-      return "WAIT";
-    }
-
-    function signalClass(signal) {
-      if (signal === 1) return "good";
-      if (signal === -1) return "bad";
-      return "warn";
-    }
-
-    function stateBadge(state) {
-      const s = (state || "").toLowerCase();
-      if (s === "running") return `<span class="pill pill-running">${s.toUpperCase()}</span>`;
-      if (s === "error") return `<span class="pill pill-error">${s.toUpperCase()}</span>`;
-      if (s === "starting" || s === "stopping") return `<span class="pill pill-warn">${s.toUpperCase()}</span>`;
-      return `<span class="pill pill-idle">${(s || "unknown").toUpperCase()}</span>`;
-    }
-
-    function formValue(id, type = "string") {
-      const value = qs(id).value;
-
-      if (type === "number") {
-        if (value === "") return null;
-        const n = Number(value);
-        return Number.isFinite(n) ? n : null;
-      }
-
-      if (type === "boolean") {
-        return value === "true";
-      }
-
-      return value === "" ? null : value;
-    }
-
-    function collectConfig() {
-      return {
-        symbol: formValue("symbol"),
-        interval: formValue("interval"),
-        market_type: formValue("market_type"),
-        start: formValue("start"),
-        end: formValue("end"),
-        initial_balance: formValue("initial_balance", "number"),
-        fee_rate: formValue("fee_rate", "number"),
-        slippage_bps: formValue("slippage_bps", "number"),
-        allow_short: formValue("allow_short", "boolean"),
-        leverage: formValue("leverage", "number"),
-        maintenance_margin: formValue("maintenance_margin", "number"),
-        max_leverage: formValue("max_leverage", "number"),
-        max_qty: formValue("max_qty", "number"),
-        include_equity: formValue("include_equity", "boolean"),
-        equity_stride: formValue("equity_stride", "number"),
-        poll_seconds: formValue("poll_seconds", "number"),
-        ema_short: formValue("ema_short", "number"),
-        ema_long: formValue("ema_long", "number"),
-        candle_limit: formValue("candle_limit", "number")
-      };
-    }
-
-    function applyConfigToForm(config = {}) {
-      if (!config) return;
-
-      const map = [
-        "symbol", "interval", "market_type", "start", "end",
-        "initial_balance", "fee_rate", "slippage_bps", "allow_short",
-        "leverage", "maintenance_margin", "max_leverage", "max_qty",
-        "include_equity", "equity_stride", "poll_seconds",
-        "ema_short", "ema_long", "candle_limit"
-      ];
-
-      for (const key of map) {
-        if (config[key] === undefined || config[key] === null) continue;
-        const el = qs(key);
-        if (!el) continue;
-        el.value = String(config[key]);
-      }
-    }
-
-    async function api(url, options = {}) {
-      const res = await fetch(url, {
+    async function api(path, options = {}) {
+      const res = await fetch(path, {
         headers: { "Content-Type": "application/json" },
-        ...options
+        ...options,
       });
 
       if (!res.ok) {
-        let detail = `${res.status} ${res.statusText}`;
-        try {
-          const data = await res.json();
-          detail = data.detail || JSON.stringify(data);
-        } catch (_) {}
-        throw new Error(detail);
+        const text = await res.text();
+        throw new Error(text || `HTTP ${res.status}`);
       }
 
       const ct = res.headers.get("content-type") || "";
@@ -787,134 +446,6 @@
         return await res.json();
       }
       return await res.text();
-    }
-
-    function wsBaseUrl() {
-      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      return `${protocol}//${window.location.host}/ws`;
-    }
-
-    function clearWsReconnectTimer() {
-      if (wsReconnectTimer) {
-        clearTimeout(wsReconnectTimer);
-        wsReconnectTimer = null;
-      }
-    }
-
-    function scheduleWsReconnect() {
-      clearWsReconnectTimer();
-
-      wsReconnectTimer = setTimeout(() => {
-        connectWebSocket();
-      }, 2000);
-    }
-
-    async function maybeReloadFillsFromStream(force = false) {
-      const now = Date.now();
-
-      if (!force && now - lastFillsReloadAt < 1500) {
-        return;
-      }
-
-      lastFillsReloadAt = now;
-
-      try {
-        await loadFills();
-      } catch (err) {
-        setActionMessage(`Live fills reload failed: ${err.message}`, "bad");
-      }
-    }
-
-    function updateDevControls(status) {
-      const isPaper = (status?.mode || "").toLowerCase() === "paper";
-      const disabled = !isPaper;
-
-      ["forceBuyBtn", "forceSellBtn", "flattenBtn"].forEach((id) => {
-        const el = qs(id);
-        if (el) el.disabled = disabled;
-      });
-
-      const card = qs("paperDevCard");
-      if (card) {
-        card.style.opacity = disabled ? "0.65" : "1";
-      }
-    }
-
-    function formatTraceEntry(entry) {
-      const ts = formatTs(entry?.timestamp);
-      const event = entry?.event || "event";
-      const note = entry?.note ? ` | ${entry.note}` : "";
-      const data = entry?.data && Object.keys(entry.data).length
-        ? ` | ${JSON.stringify(entry.data)}`
-        : "";
-      return `[${ts}] ${event}${note}${data}`;
-    }
-
-    function renderTrace(entries = []) {
-      traceEntries.length = 0;
-      traceEntries.push(...entries);
-
-      const el = qs("traceLog");
-      if (!traceEntries.length) {
-        el.textContent = "No trace events yet.";
-        return;
-      }
-
-      el.textContent = traceEntries.map(formatTraceEntry).join("\n");
-    }
-
-    function prependTraceEntry(entry) {
-      if (!entry) return;
-
-      const sig = JSON.stringify(entry);
-      const existing = traceEntries.some((x) => JSON.stringify(x) === sig);
-      if (existing) return;
-
-      traceEntries.unshift(entry);
-
-      if (traceEntries.length > 200) {
-        traceEntries.length = 200;
-      }
-
-      renderTrace(traceEntries);
-    }
-
-    async function loadTrace() {
-      const data = await api("/api/run/paper/dev/trace?limit=100&offset=0");
-      renderTrace(Array.isArray(data.events) ? data.events : []);
-    }
-
-    async function forceBuy() {
-      const data = await api("/api/run/paper/dev/force-buy", {
-        method: "POST",
-        body: JSON.stringify({})
-      });
-      renderStatus(data);
-      await loadFills();
-      await loadTrace();
-      setActionMessage("Manual buy executed.", "good");
-    }
-
-    async function forceSell() {
-      const data = await api("/api/run/paper/dev/force-sell", {
-        method: "POST",
-        body: JSON.stringify({})
-      });
-      renderStatus(data);
-      await loadFills();
-      await loadTrace();
-      setActionMessage("Manual sell executed.", "warn");
-    }
-
-    async function flattenPosition() {
-      const data = await api("/api/run/paper/dev/flatten", {
-        method: "POST",
-        body: JSON.stringify({})
-      });
-      renderStatus(data);
-      await loadFills();
-      await loadTrace();
-      setActionMessage("Flatten action completed.", "warn");
     }
 
     function chartKey(symbol, interval) {
@@ -928,57 +459,65 @@
       return chartKey(symbol, interval);
     }
 
-    function ensureChart() {
+    function ensureChart(forceRecreate = false) {
       const container = qs("liveCandleChart");
-      if (!container) return;
-
-      if (chart) return;
-
-      chart = LightweightCharts.createChart(container, {
-        autoSize: true,
-        layout: {
-          background: { color: "#0f1726" },
-          textColor: "#c7d2e5",
-        },
-        grid: {
-          vertLines: { color: "#1d2940" },
-          horzLines: { color: "#1d2940" },
-        },
-        rightPriceScale: {
-          borderColor: "#2a3a58",
-        },
-        timeScale: {
-          borderColor: "#2a3a58",
-          timeVisible: true,
-          secondsVisible: false,
-        },
-        crosshair: {
-          mode: LightweightCharts.CrosshairMode.Normal,
-        },
-      });
-
-      candleSeries = chart.addCandlestickSeries({
-        upColor: "#26a69a",
-        borderUpColor: "#26a69a",
-        wickUpColor: "#26a69a",
-        downColor: "#ef5350",
-        borderDownColor: "#ef5350",
-        wickDownColor: "#ef5350",
-      });
-
-      chartInitialized = true;
-
-      if (!chartResizeObserver) {
-        chartResizeObserver = new ResizeObserver(() => {
-          if (!chart || !container) return;
-          const rect = container.getBoundingClientRect();
-          chart.applyOptions({
-            width: Math.max(300, Math.floor(rect.width)),
-            height: Math.max(300, Math.floor(rect.height)),
-          });
-        });
-        chartResizeObserver.observe(container);
+      if (!container) {
+        throw new Error("Chart container not found");
       }
+
+      if (forceRecreate && chart) {
+        try {
+          chart.remove();
+        } catch (_) {}
+        chart = null;
+        candleSeries = null;
+        lastCandleTime = null;
+      }
+
+      const width = Math.max(600, Math.floor(container.clientWidth || 900));
+      const height = Math.max(420, Math.floor(container.clientHeight || 420));
+
+      if (!chart) {
+        chart = LightweightCharts.createChart(container, {
+          width,
+          height,
+          layout: {
+            textColor: "#c7d2e5",
+            background: {
+              type: "solid",
+              color: "#0f1726",
+            },
+          },
+          grid: {
+            vertLines: { color: "#1d2940" },
+            horzLines: { color: "#1d2940" },
+          },
+          rightPriceScale: {
+            borderColor: "#2a3a58",
+          },
+          timeScale: {
+            borderColor: "#2a3a58",
+            timeVisible: true,
+            secondsVisible: false,
+            rightOffset: 8,
+            barSpacing: 8,
+          },
+        });
+      } else {
+        chart.applyOptions({ width, height });
+      }
+
+      if (!candleSeries) {
+        candleSeries = chart.addSeries(LightweightCharts.CandlestickSeries, {
+          upColor: "#26a69a",
+          downColor: "#ef5350",
+          borderVisible: false,
+          wickUpColor: "#26a69a",
+          wickDownColor: "#ef5350",
+        });
+      }
+
+      return { chart, candleSeries };
     }
 
     function resetChart() {
@@ -986,6 +525,8 @@
         candleSeries.setData([]);
       }
       qs("chartBarsView").textContent = "0";
+      lastCandleTime = null;
+      lastChartKey = null;
     }
 
     function setChartMeta(symbol, interval, barsCount) {
@@ -998,113 +539,281 @@
       if (!latestStatus) return;
 
       const nextKey = currentChartKeyFromStatus(latestStatus);
-      if (!force && lastChartKey === nextKey && chartInitialized) {
-        return;
-      }
+      if (!force && lastChartKey === nextKey) return;
 
-      ensureChart();
-
-      const symbol = latestStatus?.runtime?.chart_symbol || latestStatus?.config?.symbol || "";
-      const interval = latestStatus?.runtime?.chart_interval || latestStatus?.config?.interval || "";
+      const refs = ensureChart(force);
 
       const data = await api("/api/run/paper/chart?limit=300");
-      const candles = Array.isArray(data.candles) ? data.candles.slice() : [];
+      const candles = Array.isArray(data?.candles) ? data.candles : [];
 
-      candleSeries.setData(candles);
-      chart.timeScale().fitContent();
+      console.log("[chart] candles received:", candles.length);
+      console.log("[chart] first candle:", candles[0]);
+      console.log("[chart] last candle:", candles[candles.length - 1]);
 
-      setChartMeta(
-        data.symbol || symbol,
-        data.interval || interval,
-        candles.length
-      );
+      refs.candleSeries.setData(candles);
+      refs.chart.timeScale().fitContent();
 
-      lastChartKey = chartKey(data.symbol || symbol, data.interval || interval);
+      lastCandleTime = candles.length ? candles[candles.length - 1].time : null;
+      lastChartKey = chartKey(data.symbol, data.interval);
+
+      setChartMeta(data.symbol, data.interval, candles.length);
+
+      if (candles.length === 0) {
+        setActionMessage("Chart loaded but no candles were returned.", "warn");
+      } else {
+        setActionMessage(`Chart loaded: ${candles.length} candles.`, "good");
+      }
     }
 
     function applyLiveCandleUpdate(msg) {
-      if (!msg?.candle) return;
-      if (!latestStatus) return;
+      if (!msg?.candle || !latestStatus) return;
 
       const activeKey = currentChartKeyFromStatus(latestStatus);
       const incomingKey = chartKey(msg.symbol, msg.interval);
 
-      if (activeKey !== incomingKey) {
-        return;
+      if (activeKey !== incomingKey) return;
+
+      const refs = ensureChart(false);
+      refs.candleSeries.update(msg.candle);
+
+      let bars = Number(qs("chartBarsView").textContent || "0");
+      if (lastCandleTime === null) {
+        bars = Math.max(1, bars);
+      } else if (msg.candle.time !== lastCandleTime) {
+        bars += 1;
       }
 
-      ensureChart();
-      candleSeries.update(msg.candle);
+      lastCandleTime = msg.candle.time;
+      setChartMeta(msg.symbol, msg.interval, bars);
+    }
 
-      const existingCount = Number(qs("chartBarsView").textContent || "0");
-      const currentTs = latestStatus?.runtime?.latest_bar?.timestamp;
-      if (msg.candle.time !== currentTs) {
-        qs("chartBarsView").textContent = String(existingCount + 1);
+    function drawEquity() {
+      const canvas = qs("equityCanvas");
+      const ctx = canvas.getContext("2d");
+      const width = canvas.width = canvas.clientWidth;
+      const height = canvas.height = canvas.clientHeight;
+
+      ctx.clearRect(0, 0, width, height);
+      if (equityHistory.length < 2) return;
+
+      const values = equityHistory.map(x => Number(x));
+      const min = Math.min(...values);
+      const max = Math.max(...values);
+      const span = Math.max(1, max - min);
+
+      ctx.beginPath();
+      values.forEach((v, i) => {
+        const x = (i / (values.length - 1)) * (width - 20) + 10;
+        const y = height - 10 - ((v - min) / span) * (height - 20);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.strokeStyle = "#5dade2";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+
+    function renderStatus(data) {
+      latestStatus = data;
+
+      const runtime = data?.runtime || {};
+      const paper = runtime.paper_state || {};
+      const latestBar = runtime.latest_bar || {};
+
+      qs("botState").textContent = data?.state || "unknown";
+      qs("lastSignal").textContent = String(runtime.last_signal ?? "WAIT");
+      qs("modeView").textContent = data?.mode || "-";
+      qs("runId").textContent = data?.run_id || "-";
+      qs("fillCount").textContent = fmtNum(runtime.fill_count ?? 0, 0);
+      qs("cash").textContent = fmtNum(paper.cash);
+      qs("positionQty").textContent = fmtNum(paper.position_qty);
+      qs("entryPrice").textContent = fmtNum(paper.entry_price);
+      qs("equity").textContent = fmtNum(paper.equity);
+      qs("realizedPnl").textContent = fmtNum(paper.realized_pnl);
+      qs("liqPrice").textContent = fmtNum(paper.liquidation_price);
+      qs("latestClose").textContent = fmtNum(latestBar.close);
+      qs("latestBarTs").textContent = fmtTs(latestBar.timestamp);
+      qs("lastProcessedTs").textContent = fmtTs(runtime.last_processed_bar_ts);
+      qs("barCount").textContent = fmtNum(runtime.bar_count ?? 0, 0);
+      qs("startedAt").textContent = fmtTs(data?.started_at);
+
+      qs("chartSymbolView").textContent =
+        runtime.chart_symbol || data?.config?.symbol || "-";
+      qs("chartIntervalView").textContent =
+        runtime.chart_interval || data?.config?.interval || "-";
+
+      if (paper.equity !== null && paper.equity !== undefined) {
+        equityHistory.push(Number(paper.equity));
+        if (equityHistory.length > 200) equityHistory.shift();
+        drawEquity();
       }
 
-      latestStatus.runtime = latestStatus.runtime || {};
-      latestStatus.runtime.latest_bar = {
-        ...(latestStatus.runtime.latest_bar || {}),
-        timestamp: msg.candle.time,
-        open: msg.candle.open,
-        high: msg.candle.high,
-        low: msg.candle.low,
-        close: msg.candle.close,
-        volume: msg.candle.volume,
+      const nextChartKey = currentChartKeyFromStatus(data);
+      if (nextChartKey && nextChartKey !== lastChartKey) {
+        loadChartBootstrap(true).catch((err) => {
+          console.error("Chart bootstrap failed:", err);
+          setActionMessage(`Chart bootstrap failed: ${err.message}`, "bad");
+        });
+      }
+    }
+
+    function fillRowHtml(fill) {
+      return `
+        <tr>
+          <td>${fmtTs(fill.timestamp)}</td>
+          <td>${fill.side ?? "-"}</td>
+          <td>${fmtNum(fill.qty)}</td>
+          <td>${fmtNum(fill.price)}</td>
+          <td>${fmtNum(fill.fee)}</td>
+          <td>${fmtNum(fill.realized_pnl)}</td>
+        </tr>
+      `;
+    }
+
+    async function loadFills(limit = 25) {
+      const data = await api(`/api/run/paper/fills?limit=${limit}&offset=0`);
+      const items = Array.isArray(data?.fills) ? data.fills : [];
+      qs("fillsTableBody").innerHTML = items.map(fillRowHtml).join("");
+    }
+
+    function applyConfigToForm(cfg = {}) {
+      const fields = [
+        "symbol", "interval", "market_type", "start", "end",
+        "initial_balance", "fee_rate", "slippage_bps", "allow_short",
+        "leverage", "maintenance_margin", "max_leverage", "max_qty",
+        "include_equity", "equity_stride", "poll_seconds",
+        "ema_short", "ema_long", "candle_limit"
+      ];
+
+      for (const key of fields) {
+        const el = qs(key);
+        if (!el || cfg[key] === undefined || cfg[key] === null) continue;
+        el.value = String(cfg[key]);
+      }
+    }
+
+    function readConfigForm() {
+      return {
+        symbol: qs("symbol").value,
+        interval: qs("interval").value,
+        market_type: qs("market_type").value,
+        start: qs("start").value || null,
+        end: qs("end").value || null,
+        initial_balance: Number(qs("initial_balance").value),
+        fee_rate: Number(qs("fee_rate").value),
+        slippage_bps: Number(qs("slippage_bps").value),
+        allow_short: qs("allow_short").value === "true",
+        leverage: Number(qs("leverage").value),
+        maintenance_margin: Number(qs("maintenance_margin").value),
+        max_leverage: Number(qs("max_leverage").value),
+        max_qty: Number(qs("max_qty").value),
+        include_equity: qs("include_equity").value === "true",
+        equity_stride: Number(qs("equity_stride").value),
+        poll_seconds: Number(qs("poll_seconds").value),
+        ema_short: Number(qs("ema_short").value),
+        ema_long: Number(qs("ema_long").value),
+        candle_limit: Number(qs("candle_limit").value),
       };
+    }
 
-      setChartMeta(msg.symbol, msg.interval, qs("chartBarsView").textContent);
+    async function configureBot() {
+      try {
+        const payload = readConfigForm();
+        await api("/api/run/configure", {
+          method: "POST",
+          body: JSON.stringify(payload),
+        });
+        const data = await api("/api/run/status");
+        renderStatus(data);
+        await loadChartBootstrap(true);
+        setActionMessage("Configuration updated.", "good");
+      } catch (err) {
+        console.error(err);
+        setActionMessage(`Configure failed: ${err.message}`, "bad");
+      }
+    }
+
+    async function startBot() {
+      try {
+        await api("/api/run/mode", {
+          method: "POST",
+          body: JSON.stringify({ mode: qs("mode").value }),
+        });
+        const data = await api("/api/run/start", { method: "POST" });
+        renderStatus(data);
+        await loadChartBootstrap(true);
+        setActionMessage("Bot started.", "good");
+      } catch (err) {
+        console.error(err);
+        setActionMessage(`Start failed: ${err.message}`, "bad");
+      }
+    }
+
+    async function stopBot() {
+      try {
+        const data = await api("/api/run/stop", { method: "POST" });
+        renderStatus(data);
+        setActionMessage("Bot stopped.", "warn");
+      } catch (err) {
+        console.error(err);
+        setActionMessage(`Stop failed: ${err.message}`, "bad");
+      }
+    }
+
+    async function resetPaper() {
+      const ok = window.confirm("This will delete the persisted paper session, fills, and snapshot for the current paper run. Continue?");
+      if (!ok) return;
+
+      try {
+        const data = await api("/api/run/paper/reset", { method: "POST" });
+        latestStatus = data;
+        renderStatus(data);
+        equityHistory.length = 0;
+        resetChart();
+        await loadFills();
+        await loadChartBootstrap(true);
+        setActionMessage("Paper account reset.", "warn");
+      } catch (err) {
+        console.error(err);
+        setActionMessage(`Reset failed: ${err.message}`, "bad");
+      }
+    }
+
+    function exportCsv() {
+      window.location.href = "/api/run/paper/fills/export.csv";
     }
 
     function connectWebSocket() {
-      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-        return;
-      }
-
-      clearWsReconnectTimer();
-
-      ws = new WebSocket(wsBaseUrl());
+      const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+      ws = new WebSocket(`${protocol}://${window.location.host}/ws`);
 
       ws.onopen = () => {
-        setActionMessage("Live stream connected.", "good");
+        setActionMessage("WebSocket connected.", "good");
       };
 
-      ws.onmessage = async (event) => {
+      ws.onclose = () => {
+        setActionMessage("WebSocket disconnected. Reconnecting...", "warn");
+        setTimeout(connectWebSocket, 1500);
+      };
+
+      ws.onerror = (err) => {
+        console.error("WS error:", err);
+      };
+
+      ws.onmessage = (event) => {
         try {
           const msg = JSON.parse(event.data);
 
-          if (msg.type === "status" && msg.data) {
+          if (msg.type === "status") {
             renderStatus(msg.data);
             return;
           }
 
-          if (msg.type === "tick") {
-            if (latestStatus) {
-              latestStatus.runtime = latestStatus.runtime || {};
-              latestStatus.runtime.latest_bar = latestStatus.runtime.latest_bar || {};
-              latestStatus.runtime.latest_bar.close = msg.price;
-              renderStatus(latestStatus);
-            }
-            return;
-          }
-
-          if (msg.type === "position") {
-            if (latestStatus) {
-              latestStatus.runtime = latestStatus.runtime || {};
-              latestStatus.runtime.paper_state = latestStatus.runtime.paper_state || {};
-              latestStatus.runtime.paper_state.position_qty = msg.qty;
-              latestStatus.runtime.paper_state.entry_price = msg.entry_price;
-              renderStatus(latestStatus);
-            }
-            return;
-          }
-
           if (msg.type === "equity") {
-            if (latestStatus) {
-              latestStatus.runtime = latestStatus.runtime || {};
-              latestStatus.runtime.paper_state = latestStatus.runtime.paper_state || {};
-              latestStatus.runtime.paper_state.equity = msg.equity;
-              renderStatus(latestStatus);
+            if (msg.equity !== null && msg.equity !== undefined) {
+              equityHistory.push(Number(msg.equity));
+              if (equityHistory.length > 200) equityHistory.shift();
+              drawEquity();
             }
             return;
           }
@@ -1115,462 +824,45 @@
           }
 
           if (msg.type === "fills") {
-            await maybeReloadFillsFromStream(true);
+            loadFills().catch(console.error);
             return;
           }
-
-          if (msg.type === "trace" && msg.data) {
-            if (msg.data.event === "trace_cleared") {
-              renderTrace([]);
-              return;
-            }
-
-            prependTraceEntry(msg.data);
-            return;
-          }
-          
         } catch (err) {
-          console.error("WS message handling failed:", err);
+          console.error("Bad WS message:", err, event.data);
         }
       };
-
-      ws.onclose = () => {
-        ws = null;
-        setActionMessage("Live stream disconnected. Reconnecting...", "warn");
-        scheduleWsReconnect();
-      };
-
-      ws.onerror = () => {
-        if (ws) {
-          ws.close();
-        }
-      };
-    }
-
-    function disconnectWebSocket() {
-      clearWsReconnectTimer();
-
-      if (ws) {
-        try {
-          ws.onclose = null;
-          ws.close();
-        } catch (_) {}
-        ws = null;
-      }
-    }
-
-    function renderStatus(data) {
-      latestStatus = data;
-
-      updateDevControls(data);
-
-      const runtime = data.runtime || {};
-      const paperState = runtime.paper_state || {};
-      const latestBar = runtime.latest_bar || {};
-
-      qs("botState").innerHTML = stateBadge(data.state);
-      qs("lastSignal").innerHTML = `<span class="${signalClass(runtime.last_signal)}">${signalText(runtime.last_signal)}</span>`;
-      qs("modeView").textContent = data.mode || "-";
-      qs("runId").textContent = data.run_id || "-";
-      qs("fillCount").textContent = runtime.fill_count ?? 0;
-
-      qs("cash").textContent = num(paperState.cash);
-      qs("positionQty").textContent = num(paperState.position_qty);
-      qs("entryPrice").textContent = num(paperState.entry_price);
-      qs("equity").textContent = num(paperState.equity);
-      qs("realizedPnl").textContent = num(paperState.realized_pnl);
-      qs("liquidationPrice").textContent = num(paperState.liquidation_price);
-      qs("latestClose").textContent = num(latestBar.close);
-      qs("latestBarTs").textContent = formatTs(latestBar.timestamp);
-      qs("lastProcessedTs").textContent = formatTs(runtime.last_processed_bar_ts);
-      qs("barCount").textContent = runtime.bar_count ?? "-";
-      qs("startedAt").textContent = formatTs(data.started_at);
-
-      qs("rawStatus").textContent = JSON.stringify(data, null, 2);
-
-      const notes = [];
-      notes.push(`Mode: ${data.mode || "-"}`);
-      notes.push(`State: ${data.state || "-"}`);
-      notes.push(`Run ID: ${data.run_id || "-"}`);
-      notes.push(`Last signal: ${signalText(runtime.last_signal)}`);
-      notes.push(`Latest close: ${num(latestBar.close)}`);
-      notes.push(`Latest bar time: ${formatTs(latestBar.timestamp)}`);
-      notes.push(`Last processed bar: ${formatTs(runtime.last_processed_bar_ts)}`);
-      notes.push(`Position qty: ${num(paperState.position_qty)}`);
-      notes.push(`Entry price: ${num(paperState.entry_price)}`);
-      notes.push(`Equity: ${num(paperState.equity)}`);
-      notes.push(`Realized PnL: ${num(paperState.realized_pnl)}`);
-      notes.push(`Last error: ${data.last_error || "-"}`);
-
-      qs("liveNotes").textContent = notes.join("\n");
-
-      qs("chartSymbolView").textContent =
-        runtime.chart_symbol || data?.config?.symbol || "-";
-      qs("chartIntervalView").textContent =
-        runtime.chart_interval || data?.config?.interval || "-";
-
-      if (paperState.equity !== null && paperState.equity !== undefined) {
-        const nextEquity = Number(paperState.equity);
-        const lastPoint = equityHistory.length ? equityHistory[equityHistory.length - 1] : null;
-
-        if (!lastPoint || lastPoint.value !== nextEquity) {
-          equityHistory.push({
-            ts: Date.now(),
-            value: nextEquity
-          });
-
-          if (equityHistory.length > 120) {
-            equityHistory.shift();
-          }
-        }
-      }
-
-      const nextChartKey = currentChartKeyFromStatus(data);
-      if (nextChartKey && nextChartKey !== lastChartKey) {
-        loadChartBootstrap(true).catch((err) => {
-          console.error("Chart bootstrap failed:", err);
-          setActionMessage(`Chart bootstrap failed: ${err.message}`, "bad");
-        });
-      }
-
-      drawEquityChart();
-    }
-
-    function drawEquityChart() {
-      const canvas = qs("equityCanvas");
-      const rect = canvas.getBoundingClientRect();
-      canvas.width = Math.max(300, rect.width * window.devicePixelRatio);
-      canvas.height = Math.max(160, rect.height * window.devicePixelRatio);
-
-      const ctx = canvas.getContext("2d");
-      ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
-
-      const w = rect.width;
-      const h = rect.height;
-      const pad = 24;
-
-      ctx.clearRect(0, 0, w, h);
-      ctx.fillStyle = "#162238";
-      ctx.fillRect(0, 0, w, h);
-
-      if (equityHistory.length < 2) {
-        ctx.fillStyle = "#9fb0d1";
-        ctx.font = "14px Arial";
-        ctx.fillText("Waiting for equity data...", 16, 24);
-        return;
-      }
-
-      const values = equityHistory.map(x => x.value).filter(Number.isFinite);
-      if (values.length < 2) return;
-
-      const min = Math.min(...values);
-      const max = Math.max(...values);
-      const span = Math.max(max - min, 1e-9);
-
-      ctx.strokeStyle = "#253554";
-      ctx.lineWidth = 1;
-
-      for (let i = 0; i < 4; i++) {
-        const y = pad + ((h - pad * 2) * i / 3);
-        ctx.beginPath();
-        ctx.moveTo(pad, y);
-        ctx.lineTo(w - pad, y);
-        ctx.stroke();
-      }
-
-      ctx.strokeStyle = "#60a5fa";
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-
-      equityHistory.forEach((point, i) => {
-        const x = pad + ((w - pad * 2) * i / (equityHistory.length - 1));
-        const y = h - pad - ((point.value - min) / span) * (h - pad * 2);
-        if (i === 0) ctx.moveTo(x, y);
-        else ctx.lineTo(x, y);
-      });
-
-      ctx.stroke();
-
-      ctx.fillStyle = "#9fb0d1";
-      ctx.font = "12px Arial";
-      ctx.fillText(`Min: ${num(min, 4)}`, pad, h - 6);
-      ctx.fillText(`Max: ${num(max, 4)}`, w - 110, h - 6);
     }
 
     async function loadStatus() {
-      const data = await api("/api/run/status");
-      renderStatus(data);
-      applyConfigToForm(data.config || {});
-      await loadFills();
-      await loadChartBootstrap(true);
-    }
-
-    async function loadFills() {
-      const limit = Number(qs("fillsLimit")?.value || 50);
-      const data = await api(`/api/run/paper/fills?limit=${limit}&offset=0`);
-      const rows = Array.isArray(data.fills) ? data.fills.slice() : [];
-
-      const body = qs("fillsBody");
-      body.innerHTML = "";
-
-      rows.reverse();
-
-      if (!rows.length) {
-        body.innerHTML = `<tr><td colspan="9" class="muted">No fills yet.</td></tr>`;
-        return;
-      }
-
-      for (const row of rows) {
-        const tr = document.createElement("tr");
-        const pnlValue = Number(row.pnl);
-        const pnlClass = pnlValue > 0 ? "good" : pnlValue < 0 ? "bad" : "";
-
-        tr.innerHTML = `
-          <td>${formatTs(row.timestamp)}</td>
-          <td>${row.type ?? "-"}</td>
-          <td>${row.side ?? "-"}</td>
-          <td>${num(row.price)}</td>
-          <td>${num(row.qty)}</td>
-          <td>${num(row.fee)}</td>
-          <td>${row.trade_id ?? "-"}</td>
-          <td class="${pnlClass}">${row.pnl === null || row.pnl === undefined ? "-" : num(row.pnl)}</td>
-          <td>${num(row.equity_after)}</td>
-        `;
-
-        body.appendChild(tr);
-      }
-    }
-
-    async function setMode() {
-      const mode = qs("mode").value;
-      await api("/api/run/mode", {
-        method: "POST",
-        body: JSON.stringify({ mode })
-      });
-    }
-
-    async function configureBot() {
-      await setMode();
-
-      const payload = collectConfig();
-      const data = await api("/api/run/configure", {
-        method: "POST",
-        body: JSON.stringify(payload)
-      });
-
-      renderStatus(data);
-      await loadChartBootstrap(true);
-      setActionMessage("Configuration saved.", "good");
-    }
-
-    async function startBot() {
-      await setMode();
-      const data = await api("/api/run/start", { method: "POST" });
-
-      qs("autoRefresh").checked = true;
-      startAutoRefresh();
-
-      renderStatus(data);
-      await loadChartBootstrap(true);
-      setActionMessage("Bot started.", "good");
-    }
-
-    async function stopBot() {
-      const data = await api("/api/run/stop", { method: "POST" });
-
-      if (refreshTimer) {
-        clearInterval(refreshTimer);
-        refreshTimer = null;
-      }
-
-      qs("autoRefresh").checked = false;
-
-      renderStatus(data);
-      await loadFills();
-      setActionMessage("Bot stopped. Auto-refresh paused", "warn");
-    }
-
-    async function resetPaper() {
-      const ok = window.confirm("This will delete the persisted paper session, fills, and snapshot for the current paper run. Continue?");
-      if (!ok) return;
-
-      const data = await api("/api/run/paper/reset", { method: "POST" });
-
-      equityHistory.length = 0;
-      renderTrace([]);
-      latestStatus = data;
-
-      qs("fillsBody").innerHTML = `<tr><td colspan="9" class="muted">No fills yet.</td></tr>`;
-
-      applyConfigToForm(data.config || {});
-      qs("mode").value = data.mode || "paper";
-
-      renderStatus(data);
-      await loadChartBootstrap(true);
-      await loadFills();
-
-      setActionMessage("Paper account reset.", "warn");
-    }
-
-    function exportCsv() {
-      window.location.href = "/api/run/paper/fills/export.csv";
-      setActionMessage("CSV export started.", "good");
-    }
-
-    function bindEvents() {
-      qs("configureBtn").addEventListener("click", async () => {
-        try {
-          await configureBot();
-          await loadFills();
-        } catch (err) {
-          setActionMessage(`Configure failed: ${err.message}`, "bad");
-        }
-      });
-
-      qs("startBtn").addEventListener("click", async () => {
-        try {
-          await startBot();
-          await loadFills();
-        } catch (err) {
-          setActionMessage(`Start failed: ${err.message}`, "bad");
-        }
-      });
-
-      qs("stopBtn").addEventListener("click", async () => {
-        try {
-          await stopBot();
-        } catch (err) {
-          setActionMessage(`Stop failed: ${err.message}`, "bad");
-        }
-      });
-
-      qs("refreshBtn").addEventListener("click", async () => {
-        try {
-          await loadStatus();
-          setActionMessage("Status refreshed.", "good");
-        } catch (err) {
-          setActionMessage(`Refresh failed: ${err.message}`, "bad");
-        }
-      });
-
-      qs("reloadFillsBtn").addEventListener("click", async () => {
-        try {
-          await loadFills();
-          setActionMessage("Fills reloaded.", "good");
-        } catch (err) {
-          setActionMessage(`Reload fills failed: ${err.message}`, "bad");
-        }
-      });
-
-      qs("exportCsvBtn").addEventListener("click", exportCsv);
-
-      qs("resetPaperBtn").addEventListener("click", async () => {
-        try {
-          await resetPaper();
-        } catch (err) {
-          setActionMessage(`Reset failed: ${err.message}`, "bad");
-        }
-      });
-
-      qs("fillsLimit").addEventListener("change", async () => {
-        try {
-          await loadFills();
-        } catch (err) {
-          setActionMessage(`Reload fills failed: ${err.message}`, "bad");
-        }
-      });
-
-      qs("showOnlyPaperFills").addEventListener("change", async () => {
-        try {
-          await loadFills();
-        } catch (err) {
-          setActionMessage(`Reload fills failed: ${err.message}`, "bad");
-        }
-      });
-
-      qs("autoRefresh").addEventListener("change", () => {
-        startAutoRefresh();
-      });
-
-      qs("forceBuyBtn").addEventListener("click", async () => {
-        try {
-          await forceBuy();
-        } catch (err) {
-          setActionMessage(`Force buy failed: ${err.message}`, "bad");
-        }
-      });
-
-      qs("forceSellBtn").addEventListener("click", async () => {
-        try {
-          await forceSell();
-        } catch (err) {
-          setActionMessage(`Force sell failed: ${err.message}`, "bad");
-        }
-      });
-
-      qs("flattenBtn").addEventListener("click", async () => {
-        try {
-          await flattenPosition();
-        } catch (err) {
-          setActionMessage(`Flatten failed: ${err.message}`, "bad");
-        }
-      });
-
-      qs("reloadTraceBtn").addEventListener("click", async () => {
-        try {
-          await loadTrace();
-          setActionMessage("Trace reloaded.", "good");
-        } catch (err) {
-          setActionMessage(`Reload trace failed: ${err.message}`, "bad");
-        }
-      });
-
-      window.addEventListener("beforeunload", () => {
-        disconnectWebSocket();
-      });
-
-      window.addEventListener("resize", drawEquityChart);
-    }
-
-    function startAutoRefresh() {
-      if (refreshTimer) {
-        clearInterval(refreshTimer);
-        refreshTimer = null;
-      }
-
-      if (!qs("autoRefresh").checked) return;
-
-      refreshTimer = setInterval(async () => {
-        const wsOpen = ws && ws.readyState === WebSocket.OPEN;
-
-        if (wsOpen) {
-          return;
-        }
-
-        try {
-          await loadStatus();
-        } catch (err) {
-          setActionMessage(`Auto-refresh failed: ${err.message}`, "bad");
-        }
-      }, 3000);
-    }
-
-    async function init() {
-      bindEvents();
-
       try {
-        await loadStatus();
-        await loadTrace();
-        setActionMessage("Dashboard connected.", "good");
+        const data = await api("/api/run/status");
+        renderStatus(data);
+        applyConfigToForm(data.config || {});
+        await loadFills();
+        await loadChartBootstrap(true);
       } catch (err) {
-        setActionMessage(`Initial load failed: ${err.message}`, "bad");
+        console.error(err);
+        setActionMessage(`Status load failed: ${err.message}`, "bad");
       }
-
-      connectWebSocket();
-      startAutoRefresh();
     }
 
-    init();
+    window.addEventListener("resize", () => {
+      drawEquity();
+      if (chart) {
+        const container = qs("liveCandleChart");
+        if (container) {
+          chart.applyOptions({
+            width: Math.max(300, Math.floor(container.clientWidth || 900)),
+            height: 420,
+          });
+        }
+      }
+    });
+
+    window.addEventListener("load", async () => {
+      await loadStatus();
+      connectWebSocket();
+    });
   </script>
 </body>
 </html>
