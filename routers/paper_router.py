@@ -5,8 +5,8 @@ from core.run_naming import csv_filename_from_run_id
 from services.controller_singleton import mode_controller
 
 # Legacy compatibility router.
-# Do NOT mount this together with any future duplicate paper API family
-# unless you intentionally want both /paper/* and /api/run/paper/* aliases.
+# Keep this UNMOUNTED unless you intentionally want /paper/* aliases
+# in addition to the canonical /api/run/paper/* endpoints.
 router = APIRouter(prefix="/paper", tags=["paper-legacy"])
 
 
