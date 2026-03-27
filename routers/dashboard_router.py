@@ -1,17 +1,24 @@
-from fastapi import APIRouter, Request
-from fastapi.templating import Jinja2Templates
-from fastapi.responses import HTMLResponse
+from pathlib import Path
+
+from fastapi import APIRouter
+from fastapi.responses import FileResponse
 
 router = APIRouter()
-templates = Jinja2Templates(directory="templates")
 
-@router.get("/", response_class=HTMLResponse)
-def dashboard(request: Request):
-    return templates.TemplateResponse("dashboard.html", {
-        "request": request,
-        "title": "Trading Dashboard"
-    })
+BASE_DIR = Path(__file__).resolve().parent.parent
+TEMPLATES_DIR = BASE_DIR / "templates"
+
+
+@router.get("/")
+def dashboard_root():
+    return FileResponse(TEMPLATES_DIR / "dashboard.html")
+
+
+@router.get("/dashboard")
+def dashboard_page():
+    return FileResponse(TEMPLATES_DIR / "dashboard.html")
+
 
 @router.get("/backtest")
-def backtest_page(request: Request):
-    return templates.TemplateResponse("backtest.html", {"request": request})
+def backtest_page():
+    return FileResponse(TEMPLATES_DIR / "backtest.html")

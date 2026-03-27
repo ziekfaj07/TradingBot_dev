@@ -2,9 +2,12 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 
 from core.run_naming import csv_filename_from_run_id
-from services.mode_controller import mode_controller
+from services.controller_singleton import mode_controller
 
-router = APIRouter(prefix="/paper", tags=["paper"])
+# Legacy compatibility router.
+# Do NOT mount this together with any future duplicate paper API family
+# unless you intentionally want both /paper/* and /api/run/paper/* aliases.
+router = APIRouter(prefix="/paper", tags=["paper-legacy"])
 
 
 @router.get("/fills")
@@ -17,6 +20,7 @@ async def get_paper_fills(
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+
 @router.get("/chart")
 async def get_paper_chart(
     limit: int = Query(default=300, ge=10, le=5000),
@@ -25,6 +29,7 @@ async def get_paper_chart(
         return mode_controller.get_chart_snapshot(limit=limit)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
 
 @router.post("/reset")
 async def reset_paper():
@@ -40,13 +45,10 @@ async def export_paper_fills_csv():
         csv_text = mode_controller.export_paper_fills_csv()
         run_id = mode_controller.status().get("run_id") or "paper_run"
         filename = csv_filename_from_run_id(run_id)
-
         return PlainTextResponse(
             content=csv_text,
             media_type="text/csv",
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"'
-            },
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
