@@ -562,7 +562,7 @@ class ModeController:
         safe_offset = max(0, offset)
 
         if not self._status.run_id:
-            rows = list(reversed(self._equity_points))
+            rows = list(reversed(self._normalize_equity_points(self._equity_points)))
             sliced = rows[safe_offset:safe_offset + safe_limit]
             return {
                 "run_id": None,
@@ -578,10 +578,11 @@ class ModeController:
             offset=safe_offset,
             ascending=False,
         )
+        rows_desc = self._normalize_equity_points(rows_desc)
         total = count_runtime_equity_snapshots(self._status.run_id)
 
         if not rows_desc and self._equity_points:
-            mem_rows = list(reversed(self._equity_points))
+            mem_rows = list(reversed(self._normalize_equity_points(self._equity_points)))
             rows_desc = mem_rows[safe_offset:safe_offset + safe_limit]
             total = len(mem_rows)
 
@@ -979,6 +980,88 @@ class ModeController:
             "drawdown_pct": float(max(drawdown_pct, 0.0)),
         }
 
+    def _normalize_equity_point(self, point: dict) -> dict:
+        """
+        Normalize equity point shape so both in-memory points and DB-loaded points
+        can be consumed by metrics/UI code safely.
+        """
+        if not point:
+            return {
+                "ts": int(time.time()),
+                "balance": 0.0,
+                "equity": 0.0,
+                "market_price": None,
+                "position_qty": 0.0,
+                "side": None,
+                "unrealized_pnl": 0.0,
+                "realized_pnl": 0.0,
+                "drawdown_pct": 0.0,
+            }
+
+        ts_value = point.get("ts", point.get("timestamp"))
+        try:
+            ts_value = int(ts_value) if ts_value is not None else int(time.time())
+        except Exception:
+            ts_value = int(time.time())
+
+        balance_value = point.get("balance", point.get("cash"))
+        try:
+            balance_value = float(balance_value) if balance_value is not None else 0.0
+        except Exception:
+            balance_value = 0.0
+
+        equity_value = point.get("equity")
+        try:
+            equity_value = float(equity_value) if equity_value is not None else balance_value
+        except Exception:
+            equity_value = balance_value
+
+        market_price_value = point.get("market_price", point.get("price"))
+        if market_price_value is not None:
+            try:
+                market_price_value = float(market_price_value)
+            except Exception:
+                market_price_value = None
+
+        position_qty_value = point.get("position_qty", 0.0)
+        try:
+            position_qty_value = float(position_qty_value)
+        except Exception:
+            position_qty_value = 0.0
+
+        unrealized_pnl_value = point.get("unrealized_pnl", 0.0)
+        try:
+            unrealized_pnl_value = float(unrealized_pnl_value)
+        except Exception:
+            unrealized_pnl_value = 0.0
+
+        realized_pnl_value = point.get("realized_pnl", 0.0)
+        try:
+            realized_pnl_value = float(realized_pnl_value)
+        except Exception:
+            realized_pnl_value = 0.0
+
+        drawdown_value = point.get("drawdown_pct", point.get("drawdown", 0.0))
+        try:
+            drawdown_value = float(drawdown_value) if drawdown_value is not None else 0.0
+        except Exception:
+            drawdown_value = 0.0
+
+        return {
+            "ts": ts_value,
+            "balance": balance_value,
+            "equity": equity_value,
+            "market_price": market_price_value,
+            "position_qty": position_qty_value,
+            "side": point.get("side"),
+            "unrealized_pnl": unrealized_pnl_value,
+            "realized_pnl": realized_pnl_value,
+            "drawdown_pct": drawdown_value,
+        }
+
+    def _normalize_equity_points(self, points: list[dict]) -> list[dict]:
+        return [self._normalize_equity_point(p) for p in points]
+
     def _record_equity_point(self) -> None:
         point = self._build_equity_point()
         if not point:
@@ -1018,18 +1101,19 @@ class ModeController:
         elif self._fills:
             raw_fills = list(self._fills)
 
-        points = []
+        raw_points = []
         if self._status.run_id:
-            points = load_runtime_equity_snapshots(
+            raw_points = load_runtime_equity_snapshots(
                 self._status.run_id,
                 limit=1_000_000,
                 offset=0,
                 ascending=True,
             )
         elif self._equity_points:
-            points = list(self._equity_points)
+            raw_points = list(self._equity_points)
 
-        # Normalize fills so downstream logic always works with dicts
+        points = self._normalize_equity_points(raw_points)
+
         fills: list[dict] = []
         for item in raw_fills:
             if isinstance(item, dict):
@@ -1040,9 +1124,9 @@ class ModeController:
         initial_balance = float(self._status.config.initial_balance)
 
         if points:
-            start_equity = float(points[0]["equity"])
-            latest_equity = float(points[-1]["equity"])
-            latest_balance = float(points[-1]["balance"])
+            start_equity = float(points[0].get("equity", initial_balance))
+            latest_equity = float(points[-1].get("equity", initial_balance))
+            latest_balance = float(points[-1].get("balance", initial_balance))
             max_drawdown_pct = max(float(p.get("drawdown_pct", 0.0)) for p in points)
         else:
             start_equity = initial_balance
@@ -1178,7 +1262,9 @@ class ModeController:
             if fill:
                 self._fills.append(fill)
 
-        self._equity_points = list(restored.get("equity_snapshots") or [])
+        self._equity_points = self._normalize_equity_points(
+            list(restored.get("equity_points") or restored.get("equity_snapshots") or [])
+        )
 
         restored_state_value = restored.get("state", EngineState.IDLE.value)
         if restored_state_value in {
