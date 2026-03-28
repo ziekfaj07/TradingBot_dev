@@ -52,27 +52,27 @@ class RunConfig:
     symbol: str = "BTCUSDT"
     interval: str = "1m"
     market_type: str = "spot"
-
     start: str | None = None
     end: str | None = None
-
     initial_balance: float = 1000.0
     fee_rate: float = 0.001
     slippage_bps: float = 2.0
     allow_short: bool = False
     leverage: float = 1.0
     maintenance_margin: float = 0.005
-
     max_leverage: float = 50.0
     max_qty: float = 10.0
-
     include_equity: bool = False
     equity_stride: int = 1
-
     poll_seconds: float = 5.0
 
+    # legacy EMA field kept for backward compatibility
     ema_short: int = 9
     ema_long: int = 21
+
+    #v0.4.5 generic strategy selection
+    strategy_name: str = "ema_crossover"
+    strategy_params: dict = field(default_factory=dict)
 
     candle_limit: int = 300
 
@@ -82,6 +82,7 @@ class RunStatus:
     mode: Mode = Mode.BACKTEST
     state: EngineState = EngineState.IDLE
     run_id: Optional[str] = None
+    run_label: Optional[str] = None
     started_at: Optional[float] = None
     stopped_at: Optional[float] = None
     last_error: Optional[str] = None
@@ -134,6 +135,67 @@ class ModeController:
                 raise RuntimeError("Can only configure while engine is idle.")
 
             config_dict = asdict(self._status.config)
+
+            # --- Resolve strategy name ---
+            strategy_name = (
+                kwargs.get("strategy_name")
+                or self._status.config.strategy_name
+                or "ema_crossover"
+            )
+            strategy_name = str(strategy_name).strip().lower()
+
+            # --- Incoming params ---
+            incoming = dict(kwargs.get("strategy_params", {}) or {})
+
+            # --- Remove Swagger junk ---
+            incoming.pop("additionalProp1", None)
+
+            # --- Normalize common typos ---
+            if "look_back" in incoming:
+                incoming["lookback"] = incoming.pop("look_back")
+
+            if "confirm_break_previous_extreme" in incoming:
+                incoming["confirm_break_prev_extreme"] = incoming.pop(
+                    "confirm_break_previous_extreme"
+                )
+
+            # --- Fold legacy EMA fields ---
+            if kwargs.get("ema_short") is not None:
+                incoming["short"] = int(kwargs["ema_short"])
+            if kwargs.get("ema_long") is not None:
+                incoming["long"] = int(kwargs["ema_long"])
+
+            # --- Strategy-specific cleaning ---
+            if strategy_name == "ema_crossover":
+                clean = {
+                    "short": int(incoming.get("short", 9)),
+                    "long": int(incoming.get("long", 21)),
+                }
+
+            elif strategy_name == "donchian_breakout":
+                clean = {
+                    "lookback": int(incoming.get("lookback", 20))
+                }
+
+            elif strategy_name == "three_candle_reversal":
+                clean = {
+                    "min_body_ratio": float(incoming.get("min_body_ratio", 0.55)),
+                    "require_full_range_engulf": bool(
+                        incoming.get("require_full_range_engulf", True)
+                    ),
+                    "confirm_break_prev_extreme": bool(
+                        incoming.get("confirm_break_prev_extreme", True)
+                    ),
+                }
+
+            else:
+                # fallback for future strategies
+                clean = incoming
+
+            # --- Apply updates ---
+            kwargs["strategy_name"] = strategy_name
+            kwargs["strategy_params"] = clean
+
             for key, value in kwargs.items():
                 if key in config_dict and value is not None:
                     setattr(self._status.config, key, value)
@@ -142,6 +204,66 @@ class ModeController:
             self._persist_status()
             self._persist_snapshot()
             return self.status()
+
+    def _refresh_run_identity(
+        self,
+        cfg: RunConfig | None = None,
+        *,
+        started_at: float | None = None,
+        mode: Mode | None = None,
+    ) -> None:
+        cfg = cfg or self._status.config
+        effective_mode = mode or self._status.mode
+        effective_started_at = started_at if started_at is not None else self._status.started_at
+
+        if effective_started_at is None:
+            effective_started_at = time.time()
+
+        run_id = make_run_id(
+            symbol=cfg.symbol,
+            market_type=cfg.market_type,
+            mode=effective_mode.value if hasattr(effective_mode, "value") else str(effective_mode),
+            allow_short=cfg.allow_short,
+            started_at=datetime.fromtimestamp(effective_started_at),
+        )
+
+        self._status.run_id = run_id
+        self._status.run_label = run_id
+
+    def _resolved_strategy_name_from_config(self, cfg: RunConfig) -> str:
+        return (getattr(cfg, "strategy_name", None) or "ema_crossover").strip().lower()
+
+    def _resolved_strategy_params_from_config(self, cfg: RunConfig) -> dict:
+        params = dict(getattr(cfg, "strategy_params", {}) or {})
+        strategy_name = self._resolved_strategy_name_from_config(cfg)
+
+        # backward compatibility for old EMA config fields
+        if strategy_name == "ema_crossover":
+            params.setdefault("short", int(getattr(cfg, "ema_short", 9)))
+            params.setdefault("long", int(getattr(cfg, "ema_long", 21)))
+
+        return params
+
+    def _apply_strategy_to_df(self, df: pd.DataFrame, cfg: RunConfig) -> pd.DataFrame:
+        return StrategyEngine.apply(
+            df=df,
+            strategy_name=self._resolved_strategy_name_from_config(cfg),
+            strategy_params=self._resolved_strategy_params_from_config(cfg),
+        )
+
+    def _latest_signal_from_bars(self, bars: list[dict], cfg: RunConfig) -> int:
+        if not bars:
+            return 0
+
+        df = pd.DataFrame(bars).copy()
+        if df.empty or "close" not in df.columns:
+            return 0
+
+        return StrategyEngine.latest_signal(
+            df=df,
+            strategy_name=self._resolved_strategy_name_from_config(cfg),
+            strategy_params=self._resolved_strategy_params_from_config(cfg),
+        )
 
     async def start(self) -> dict:
         async with self._lock:
@@ -152,25 +274,20 @@ class ModeController:
                 raise RuntimeError("Use run_backtest() for backtest mode.")
 
             self._status.state = EngineState.STARTING
+            self._status.started_at = time.time()
+            self._status.stopped_at = None
+            self._status.last_error = None
 
-            if self._status.mode == Mode.PAPER and self._status.run_id:
-                if self._engine is None or self._state is None:
-                    self._build_runtime_objects_from_existing_or_new()
-                self._status.stopped_at = None
-                self._status.last_error = None
-            else:
-                self._status.started_at = time.time()
-                self._status.run_id = make_run_id(
-                    symbol=self._status.config.symbol,
-                    market_type=self._status.config.market_type,
-                    mode=self._status.mode.value,
-                    allow_short=self._status.config.allow_short,
-                    started_at=datetime.fromtimestamp(self._status.started_at),
-                )
-                self._status.stopped_at = None
-                self._status.last_error = None
-                self._reset_runtime_memory()
-                self._build_runtime_objects()
+            # Always generate a fresh identity from the CURRENT config when starting.
+            self._refresh_run_identity(
+                self._status.config,
+                started_at=self._status.started_at,
+                mode=self._status.mode,
+            )
+
+            # Start a clean runtime for the current config/run identity.
+            self._reset_runtime_memory()
+            self._build_runtime_objects()
 
             self._stop_event = asyncio.Event()
             self._persist_status()
@@ -224,24 +341,30 @@ class ModeController:
 
             return self.status()
 
-    async def run_backtest(self) -> dict:
+    async def run_backtest(self, **overrides) -> dict:
         async with self._lock:
             if self._status.state != EngineState.IDLE:
                 raise RuntimeError("Engine must be idle before running backtest.")
 
+            cfg_dict = asdict(self._status.config)
+            for key, value in overrides.items():
+                if value is not None and key in cfg_dict:
+                    cfg_dict[key] = value
+            cfg = RunConfig(**cfg_dict)
+
             self._status.state = EngineState.STARTING
             self._status.started_at = time.time()
-            self._status.run_id = make_run_id(
-                symbol=self._status.config.symbol,
-                market_type=self._status.config.market_type,
-                mode=self._status.mode.value,
-                allow_short=self._status.config.allow_short,
-                started_at=datetime.fromtimestamp(self._status.started_at),
-            )
             self._status.stopped_at = None
             self._status.last_error = None
 
-            cfg = self._status.config
+            # Backtest response/status should reflect the EFFECTIVE backtest config.
+            self._refresh_run_identity(
+                cfg,
+                started_at=self._status.started_at,
+                mode=Mode.BACKTEST,
+            )
+
+            self._persist_status()
 
         try:
             df = self.provider.load_ohlcv(
@@ -255,11 +378,7 @@ class ModeController:
             if df.empty:
                 raise RuntimeError("No historical data returned for backtest.")
 
-            df = StrategyEngine.ema_crossover(
-                df,
-                short=cfg.ema_short,
-                long=cfg.ema_long,
-            )
+            df = self._apply_strategy_to_df(df, cfg)
             df["signal"] = df["signal"].shift(1).fillna(0).astype(int)
 
             engine = ExecutionEngine(
@@ -294,6 +413,7 @@ class ModeController:
             async with self._lock:
                 self._status.state = EngineState.IDLE
                 self._status.stopped_at = time.time()
+                self._persist_status()
 
             return {
                 "status": self.status(),
@@ -310,6 +430,7 @@ class ModeController:
                 self._status.state = EngineState.ERROR
                 self._status.last_error = str(e)
                 self._status.stopped_at = time.time()
+                self._persist_status()
             raise
 
     def status(self) -> dict:
@@ -327,13 +448,15 @@ class ModeController:
             "paper_state": self._serialize_state(),
             "chart_symbol": cfg.get("symbol"),
             "chart_interval": cfg.get("interval"),
+            "strategy_name": self._resolved_strategy_name_from_config(self._status.config),
+            "strategy_params": self._resolved_strategy_params_from_config(self._status.config),
         }
 
         return {
             "mode": self._status.mode.value,
             "state": self._status.state.value,
             "run_id": self._status.run_id,
-            "run_label": self._status.run_id,
+            "run_label": self._status.run_label,
             "started_at": self._status.started_at,
             "stopped_at": self._status.stopped_at,
             "last_error": self._status.last_error,
@@ -626,15 +749,13 @@ class ModeController:
 
         if not self._status.run_id:
             self._status.started_at = time.time()
-            self._status.run_id = make_run_id(
-                symbol=self._status.config.symbol,
-                market_type=self._status.config.market_type,
-                mode=self._status.mode.value,
-                allow_short=self._status.config.allow_short,
-                started_at=datetime.fromtimestamp(self._status.started_at),
-            )
             self._status.stopped_at = None
             self._status.last_error = None
+            self._refresh_run_identity(
+                self._status.config,
+                started_at=self._status.started_at,
+                mode=self._status.mode,
+            )
             self._reset_runtime_memory()
             self._build_runtime_objects()
 
@@ -749,6 +870,7 @@ class ModeController:
 
         self._status.mode = Mode(restored["mode"])
         self._status.run_id = restored["run_id"]
+        self._status.run_label = restored["run_id"]
         self._status.started_at = restored.get("started_at")
         self._status.stopped_at = restored.get("stopped_at")
         self._status.last_error = restored.get("last_error")
@@ -1009,19 +1131,11 @@ class ModeController:
         return None
 
     def _compute_signal_from_closed_bars(self, bars: list[dict]) -> int:
-        if len(bars) < max(self._status.config.ema_short, self._status.config.ema_long) + 2:
+        try:
+            return self._latest_signal_from_bars(bars, self._status.config)
+        except Exception as e:
+            self._status.last_error = str(e)
             return 0
-
-        closed = bars[:-1]
-        df = pd.DataFrame(closed)
-
-        strat = StrategyEngine.ema_crossover(
-            df,
-            short=self._status.config.ema_short,
-            long=self._status.config.ema_long,
-        )
-
-        return int(strat.iloc[-1]["signal"])
 
     async def _apply_signal(self, signal: int, bar: dict) -> None:
         if self._engine is None or self._state is None:

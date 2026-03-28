@@ -1,11 +1,10 @@
-# routers/run_router.py
-
 from __future__ import annotations
+
+from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import PlainTextResponse
-
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from core.run_naming import csv_filename_from_run_id
 from services.mode_controller import Mode
@@ -33,14 +32,18 @@ class ConfigureBody(BaseModel):
     maintenance_margin: float | None = None
     max_leverage: float | None = None
     max_qty: float | None = None
-
     include_equity: bool | None = None
     equity_stride: int | None = None
     poll_seconds: float | None = None
+    candle_limit: int | None = None
 
+    # legacy EMA knobs
     ema_short: int | None = None
     ema_long: int | None = None
-    candle_limit: int | None = None
+
+    # generic v0.4.5 strategy layer
+    strategy_name: str | None = None
+    strategy_params: dict[str, Any] | None = Field(default=None)
 
 
 class DevActionBody(BaseModel):
@@ -67,17 +70,14 @@ async def export_paper_fills_csv():
         csv_text = mode_controller.export_paper_fills_csv()
         run_id = mode_controller.status().get("run_id") or "paper_run"
         filename = csv_filename_from_run_id(run_id)
-
         return PlainTextResponse(
             content=csv_text,
             media_type="text/csv",
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"'
-            },
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-    
+
 
 @router.get("/paper/fills")
 async def paper_fills(limit: int = 200, offset: int = 0):

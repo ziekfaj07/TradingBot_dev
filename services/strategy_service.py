@@ -1,33 +1,30 @@
+from __future__ import annotations
+
 import pandas as pd
 
+from services.strategies.ema_crossover import EmaCrossoverStrategy
 
 class EMAStrategy:
 
     def __init__(self, short_period=9, long_period=21):
-        self.short_period = short_period
-        self.long_period = long_period
+        self.impl = EmaCrossoverStrategy(short=short_period, long=long_period)
 
     def generate_signal(self, prices):
+        if isinstance(prices, pd.DataFrame):
+            df = prices.copy()
+        else:
+            df = pd.DataFrame(prices)
 
-        if len(prices) < self.long_period:
-            return "NOT_ENOUGH_DATA"
+        if "close" not in df.columns:
+            if len(df.columns) == 1:
+                df.columns = ["close"]
+            else:
+                raise ValueError("EMA strategy requires a 'close' column.")
 
-        df = pd.DataFrame(prices, columns=["close"])
+        signal = self.impl.latest_signal(df)
 
-        df["ema_short"] = df["close"].ewm(span=self.short_period).mean()
-        df["ema_long"] = df["close"].ewm(span=self.long_period).mean()
-
-        latest = df.iloc[-1]
-        previous = df.iloc[-2]
-
-        # Golden cross
-        if previous["ema_short"] < previous["ema_long"] and \
-           latest["ema_short"] > latest["ema_long"]:
+        if signal > 0:
             return "BUY"
-
-        # Death cross
-        if previous["ema_short"] > previous["ema_long"] and \
-           latest["ema_short"] < latest["ema_long"]:
+        if signal < 0:
             return "SELL"
-
         return "HOLD"
