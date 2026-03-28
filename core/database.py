@@ -62,6 +62,21 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _coerce_limit(
+    value: Any,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    parsed = _safe_int(value, default)
+    return max(minimum, min(parsed, maximum))
+
+
+def _coerce_offset(value: Any, default: int = 0) -> int:
+    parsed = _safe_int(value, default)
+    return max(0, parsed)
+
+
 def _row_to_dict(row: Optional[sqlite3.Row]) -> Optional[dict]:
     if row is None:
         return None
@@ -587,7 +602,11 @@ def load_runtime_fills(
         ORDER BY id {order}
         LIMIT ? OFFSET ?
         """,
-        (run_id, int(limit), int(offset)),
+        (
+            run_id,
+            _coerce_limit(limit, default=500, minimum=1, maximum=1_000_000),
+            _coerce_offset(offset, default=0),
+        ),
     )
     rows = cur.fetchall()
     conn.close()
@@ -754,7 +773,11 @@ def load_runtime_equity_snapshots(
         ORDER BY id {order}
         LIMIT ? OFFSET ?
         """,
-        (run_id, int(limit), int(offset)),
+        (
+            run_id,
+            _coerce_limit(limit, default=5000, minimum=1, maximum=1_000_000),
+            _coerce_offset(offset, default=0),
+        ),        
     )
     rows = cur.fetchall()
     conn.close()
@@ -869,6 +892,363 @@ def get_latest_paper_run() -> Optional[dict]:
     run["fills"] = [dict(r) for r in fill_rows]
     run["equity_points"] = [dict(r) for r in equity_rows]
 
+    return run
+
+
+def load_persisted_fills(
+    run_id: str,
+    limit: int = 500,
+    offset: int = 0,
+    ascending: bool = False,
+) -> list[dict]:
+    order = "ASC" if ascending else "DESC"
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        f"""
+        SELECT
+            id,
+            run_id,
+            timestamp,
+            fill_type AS type,
+            side,
+            price,
+            qty,
+            fee,
+            equity_after,
+            entry_price,
+            exit_price,
+            trade_id,
+            pnl,
+            created_at
+        FROM fills
+        WHERE run_id = ?
+        ORDER BY id {order}
+        LIMIT ? OFFSET ?
+        """,
+        (
+            run_id,
+            _coerce_limit(limit, default=500, minimum=1, maximum=1_000_000),
+            _coerce_offset(offset, default=0),
+        ),        
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return _rows_to_dicts(rows)
+
+
+def load_persisted_equity_snapshots(
+    run_id: str,
+    limit: int = 5000,
+    offset: int = 0,
+    ascending: bool = True,
+) -> list[dict]:
+    order = "ASC" if ascending else "DESC"
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        f"""
+        SELECT
+            id,
+            run_id,
+            timestamp,
+            equity,
+            price,
+            cash,
+            position_qty,
+            drawdown,
+            meta_json,
+            created_at
+        FROM equity_snapshots
+        WHERE run_id = ?
+        ORDER BY id {order}
+        LIMIT ? OFFSET ?
+        """,
+        (
+            run_id,
+            _coerce_limit(limit, default=5000, minimum=1, maximum=1_000_000),
+            _coerce_offset(offset, default=0),
+        ),        
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    normalized: list[dict] = []
+
+    for row in rows:
+        raw = dict(row)
+        meta = _json_loads(raw.get("meta_json"), default={}) or {}
+        if not isinstance(meta, dict):
+            meta = {}
+
+        ts_raw = meta.get("ts", meta.get("timestamp", raw.get("timestamp")))
+        ts_value: Any = ts_raw
+        if ts_raw is not None:
+            try:
+                ts_value = int(ts_raw)
+            except (TypeError, ValueError):
+                ts_value = ts_raw        
+        try:
+            ts_value = int(ts_value)
+        except Exception:
+            pass
+
+        point = dict(meta)
+        point.update(
+            {
+                "id": raw.get("id"),
+                "run_id": raw.get("run_id"),
+                "timestamp": raw.get("timestamp"),
+                "ts": ts_value,
+                "balance": _safe_float(point.get("balance", raw.get("cash"))),
+                "equity": _safe_float(point.get("equity", raw.get("equity"))),
+                "market_price": (
+                    _safe_float(raw.get("price"))
+                    if raw.get("price") is not None
+                    else point.get("market_price")
+                ),
+                "position_qty": _safe_float(
+                    point.get("position_qty", raw.get("position_qty"))
+                ),
+                "drawdown_pct": _safe_float(
+                    point.get(
+                        "drawdown_pct",
+                        point.get("drawdown", raw.get("drawdown")),
+                    )
+                ),
+                "side": point.get("side"),
+                "unrealized_pnl": _safe_float(point.get("unrealized_pnl")),
+                "realized_pnl": _safe_float(point.get("realized_pnl")),
+                "created_at": raw.get("created_at"),
+            }
+        )
+        normalized.append(point)
+
+    return normalized
+
+
+def _hydrate_persisted_run_row(row: Optional[sqlite3.Row]) -> Optional[dict]:
+    if row is None:
+        return None
+
+    item = dict(row)
+    item["config"] = _json_loads(item.get("config_json"), default={}) or {}
+    item["strategy_params"] = (
+        _json_loads(item.get("strategy_params_json"), default={}) or {}
+    )
+    item["fill_count"] = _safe_int(item.get("fill_count"))
+    item["equity_point_count"] = _safe_int(item.get("equity_point_count"))
+
+    latest_equity = item.get("latest_equity")
+    if latest_equity is not None:
+        item["latest_equity"] = _safe_float(latest_equity)
+
+    return item
+
+
+def list_persisted_runs(
+    limit: int = 100,
+    offset: int = 0,
+    mode: Optional[str] = None,
+    symbol: Optional[str] = None,
+    state: Optional[str] = None,
+    strategy_name: Optional[str] = None,
+) -> dict:
+    safe_limit = _coerce_limit(limit, default=100, minimum=1, maximum=1000)
+    safe_offset = _coerce_offset(offset, default=0)
+
+    where = []
+    params: list = []
+
+    if mode:
+        where.append("r.mode = ?")
+        params.append(mode)
+
+    if symbol:
+        where.append("r.symbol = ?")
+        params.append(symbol)
+
+    if state:
+        where.append("r.state = ?")
+        params.append(state)
+
+    if strategy_name:
+        where.append("r.strategy_name = ?")
+        params.append(strategy_name)
+
+    where_sql = ""
+    if where:
+        where_sql = "WHERE " + " AND ".join(where)
+
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        f"""
+        SELECT COUNT(*) AS cnt
+        FROM runs r
+        {where_sql}
+        """,
+        params,
+    )
+    total_row = cur.fetchone()
+    total = _safe_int(total_row["cnt"]) if total_row else 0
+
+    cur.execute(
+        f"""
+        SELECT
+            r.run_id,
+            r.run_label,
+            r.mode,
+            r.state,
+            r.symbol,
+            r.interval,
+            r.market_type,
+            r.strategy_name,
+            r.strategy_params_json,
+            r.config_json,
+            r.started_at,
+            r.stopped_at,
+            r.last_error,
+            r.created_at,
+            r.updated_at,
+            (
+                SELECT COUNT(*)
+                FROM fills f
+                WHERE f.run_id = r.run_id
+            ) AS fill_count,
+            (
+                SELECT COUNT(*)
+                FROM equity_snapshots e
+                WHERE e.run_id = r.run_id
+            ) AS equity_point_count,
+            (
+                SELECT e.equity
+                FROM equity_snapshots e
+                WHERE e.run_id = r.run_id
+                ORDER BY e.id DESC
+                LIMIT 1
+            ) AS latest_equity,
+            (
+                SELECT e.timestamp
+                FROM equity_snapshots e
+                WHERE e.run_id = r.run_id
+                ORDER BY e.id DESC
+                LIMIT 1
+            ) AS latest_equity_timestamp
+        FROM runs r
+        {where_sql}
+        ORDER BY COALESCE(r.started_at, r.created_at) DESC, r.run_id DESC
+        LIMIT ? OFFSET ?
+        """,
+        [*params, safe_limit, safe_offset],
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    hydrated_runs: list[dict] = []
+    for row in rows:
+        hydrated = _hydrate_persisted_run_row(row)
+        if hydrated is not None:
+            hydrated_runs.append(hydrated)
+
+    return {
+        "total": total,
+        "limit": safe_limit,
+        "offset": safe_offset,
+        "runs": hydrated_runs,
+    }
+
+
+def get_persisted_run(
+    run_id: str,
+    fill_preview_limit: int = 50,
+    equity_preview_limit: int = 200,
+) -> Optional[dict]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT
+            r.run_id,
+            r.run_label,
+            r.mode,
+            r.state,
+            r.symbol,
+            r.interval,
+            r.market_type,
+            r.strategy_name,
+            r.strategy_params_json,
+            r.config_json,
+            r.started_at,
+            r.stopped_at,
+            r.last_error,
+            r.created_at,
+            r.updated_at,
+            (
+                SELECT COUNT(*)
+                FROM fills f
+                WHERE f.run_id = r.run_id
+            ) AS fill_count,
+            (
+                SELECT COUNT(*)
+                FROM equity_snapshots e
+                WHERE e.run_id = r.run_id
+            ) AS equity_point_count,
+            (
+                SELECT e.equity
+                FROM equity_snapshots e
+                WHERE e.run_id = r.run_id
+                ORDER BY e.id DESC
+                LIMIT 1
+            ) AS latest_equity,
+            (
+                SELECT e.timestamp
+                FROM equity_snapshots e
+                WHERE e.run_id = r.run_id
+                ORDER BY e.id DESC
+                LIMIT 1
+            ) AS latest_equity_timestamp
+        FROM runs r
+        WHERE r.run_id = ?
+        LIMIT 1
+        """,
+        (run_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+
+    run = _hydrate_persisted_run_row(row)
+    if run is None:
+        return None
+
+    safe_fill_preview_limit = _coerce_limit(
+        fill_preview_limit,
+        default=50,
+        minimum=1,
+        maximum=500,
+    )
+    safe_equity_preview_limit = _coerce_limit(
+        equity_preview_limit,
+        default=200,
+        minimum=1,
+        maximum=1000,
+    )
+
+    run["fills_preview"] = load_persisted_fills(
+        run_id=run_id,
+        limit=safe_fill_preview_limit,
+        offset=0,
+        ascending=False,
+    )
+    run["equity_preview"] = load_persisted_equity_snapshots(
+        run_id=run_id,
+        limit=safe_equity_preview_limit,
+        offset=0,
+        ascending=False,
+    )
     return run
 
 
@@ -1033,7 +1413,10 @@ def list_runs(limit: int = 100, offset: int = 0) -> list[dict]:
         ORDER BY COALESCE(started_at, created_at) DESC
         LIMIT ? OFFSET ?
         """,
-        (int(limit), int(offset)),
+        (
+            _coerce_limit(limit, default=100, minimum=1, maximum=1000),
+            _coerce_offset(offset, default=0),
+        ),        
     )
     rows = cur.fetchall()
     conn.close()
@@ -1058,7 +1441,11 @@ def get_fills_by_run_id(run_id: str, limit: int = 5000, offset: int = 0) -> list
         ORDER BY id ASC
         LIMIT ? OFFSET ?
         """,
-        (run_id, int(limit), int(offset)),
+        (
+            run_id,
+            _coerce_limit(limit, default=5000, minimum=1, maximum=1_000_000),
+            _coerce_offset(offset, default=0),
+        ),        
     )
     rows = cur.fetchall()
     conn.close()
@@ -1076,7 +1463,11 @@ def get_equity_by_run_id(run_id: str, limit: int = 5000, offset: int = 0) -> lis
         ORDER BY id ASC
         LIMIT ? OFFSET ?
         """,
-        (run_id, int(limit), int(offset)),
+        (
+            run_id,
+            _coerce_limit(limit, default=5000, minimum=1, maximum=1_000_000),
+            _coerce_offset(offset, default=0),
+        ),        
     )
     rows = cur.fetchall()
     conn.close()

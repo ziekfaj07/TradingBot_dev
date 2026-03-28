@@ -1,8 +1,5 @@
-from pathlib import Path
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from routers.dashboard_router import router as dashboard_router
@@ -29,24 +26,6 @@ app.include_router(strategy_router)
 app.include_router(ws_router)
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
-
-BASE_DIR = Path(__file__).resolve().parent
-FRONTEND_DIR = BASE_DIR / "templates"
-
-
-@app.get("/")
-def root():
-    return FileResponse(FRONTEND_DIR / "dashboard.html")
-
-
-@app.get("/dashboard")
-def dashboard_page():
-    return FileResponse(FRONTEND_DIR / "dashboard.html")
-
-
-@app.get("/backtest")
-def backtest_page():
-    return FileResponse(FRONTEND_DIR / "backtest.html")
 
 
 @app.get("/health")

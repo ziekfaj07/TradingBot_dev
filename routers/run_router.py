@@ -1,11 +1,14 @@
 # routers/run_router.py
 from __future__ import annotations
 
+from typing import Optional
+
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
 from core.run_naming import csv_filename_from_run_id
+from core.database import get_persisted_run, list_persisted_runs
 from services.mode_controller import Mode
 from services.controller_singleton import mode_controller
 
@@ -119,6 +122,49 @@ async def export_paper_equity_csv():
                 "Content-Disposition": f'attachment; filename="{filename}"',
             },
         )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/runs/history")
+async def runs_history(
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+    mode: Optional[str] = Query(default=None),
+    symbol: Optional[str] = Query(default=None),
+    state: Optional[str] = Query(default=None),
+    strategy_name: Optional[str] = Query(default=None),
+):
+    try:
+        return list_persisted_runs(
+            limit=limit,
+            offset=offset,
+            mode=mode,
+            symbol=symbol,
+            state=state,
+            strategy_name=strategy_name,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/runs/history/{run_id}")
+async def run_history_detail(
+    run_id: str,
+    fill_preview_limit: int = Query(default=50, ge=1, le=500),
+    equity_preview_limit: int = Query(default=200, ge=1, le=1000),
+):
+    try:
+        run = get_persisted_run(
+            run_id=run_id,
+            fill_preview_limit=fill_preview_limit,
+            equity_preview_limit=equity_preview_limit,
+        )
+        if run is None:
+            raise HTTPException(status_code=404, detail="Run not found.")
+        return run
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
