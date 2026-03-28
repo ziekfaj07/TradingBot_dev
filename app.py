@@ -3,6 +3,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from routers.dashboard_router import router as dashboard_router
 from routers.export_router import router as export_router
@@ -26,6 +27,8 @@ app.include_router(export_router)
 app.include_router(run_router)
 app.include_router(strategy_router)
 app.include_router(ws_router)
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 BASE_DIR = Path(__file__).resolve().parent
 FRONTEND_DIR = BASE_DIR / "templates"

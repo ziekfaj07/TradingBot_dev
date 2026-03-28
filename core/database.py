@@ -7,6 +7,7 @@ import sqlite3
 import time
 from typing import Optional
 
+
 DB_PATH = "database/market_data.db"
 
 
@@ -26,11 +27,10 @@ def _safe_table_name(name: str) -> str:
 
 def create_table(symbol: str):
     table_name = _safe_table_name(symbol)
-
     conn = get_connection()
     cursor = conn.cursor()
-
-    cursor.execute(f"""
+    cursor.execute(
+        f"""
         CREATE TABLE IF NOT EXISTS {table_name} (
             timestamp INTEGER PRIMARY KEY,
             open REAL,
@@ -39,8 +39,8 @@ def create_table(symbol: str):
             close REAL,
             volume REAL
         )
-    """)
-
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -53,7 +53,8 @@ def init_runtime_db():
     conn = get_connection()
     cur = conn.cursor()
 
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS runtime_runs (
             run_id TEXT PRIMARY KEY,
             mode TEXT NOT NULL,
@@ -65,9 +66,11 @@ def init_runtime_db():
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL
         )
-    """)
+        """
+    )
 
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS runtime_snapshots (
             run_id TEXT PRIMARY KEY,
             state_json TEXT,
@@ -79,9 +82,11 @@ def init_runtime_db():
             updated_at REAL NOT NULL,
             FOREIGN KEY(run_id) REFERENCES runtime_runs(run_id)
         )
-    """)
+        """
+    )
 
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS runtime_fills (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             run_id TEXT NOT NULL,
@@ -99,12 +104,49 @@ def init_runtime_db():
             created_at REAL NOT NULL,
             FOREIGN KEY(run_id) REFERENCES runtime_runs(run_id)
         )
-    """)
+        """
+    )
 
-    cur.execute("""
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS runtime_equity_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            ts INTEGER NOT NULL,
+            balance REAL NOT NULL,
+            equity REAL NOT NULL,
+            market_price REAL,
+            position_qty REAL NOT NULL,
+            side TEXT,
+            unrealized_pnl REAL NOT NULL,
+            realized_pnl REAL NOT NULL,
+            drawdown_pct REAL NOT NULL,
+            created_at REAL NOT NULL,
+            FOREIGN KEY(run_id) REFERENCES runtime_runs(run_id)
+        )
+        """
+    )
+
+    cur.execute(
+        """
         CREATE INDEX IF NOT EXISTS idx_runtime_fills_run_id_id
         ON runtime_fills(run_id, id)
-    """)
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_runtime_equity_run_id_id
+        ON runtime_equity_snapshots(run_id, id)
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_runtime_equity_run_id_ts
+        ON runtime_equity_snapshots(run_id, ts)
+        """
+    )
 
     conn.commit()
     conn.close()
@@ -122,11 +164,11 @@ def upsert_runtime_run(
     now = time.time()
     conn = get_connection()
     cur = conn.cursor()
-
-    cur.execute("""
+    cur.execute(
+        """
         INSERT INTO runtime_runs (
-            run_id, mode, state, started_at, stopped_at, last_error,
-            config_json, created_at, updated_at
+            run_id, mode, state, started_at, stopped_at,
+            last_error, config_json, created_at, updated_at
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(run_id) DO UPDATE SET
@@ -137,18 +179,19 @@ def upsert_runtime_run(
             last_error=excluded.last_error,
             config_json=excluded.config_json,
             updated_at=excluded.updated_at
-    """, (
-        run_id,
-        mode,
-        state,
-        started_at,
-        stopped_at,
-        last_error,
-        json.dumps(config),
-        now,
-        now,
-    ))
-
+        """,
+        (
+            run_id,
+            mode,
+            state,
+            started_at,
+            stopped_at,
+            last_error,
+            json.dumps(config),
+            now,
+            now,
+        ),
+    )
     conn.commit()
     conn.close()
 
@@ -165,8 +208,8 @@ def save_runtime_snapshot(
     now = time.time()
     conn = get_connection()
     cur = conn.cursor()
-
-    cur.execute("""
+    cur.execute(
+        """
         INSERT INTO runtime_snapshots (
             run_id, state_json, latest_bar_json, bars_json,
             last_processed_bar_ts, last_signal, trade_id, updated_at
@@ -180,17 +223,18 @@ def save_runtime_snapshot(
             last_signal=excluded.last_signal,
             trade_id=excluded.trade_id,
             updated_at=excluded.updated_at
-    """, (
-        run_id,
-        json.dumps(state_dict) if state_dict is not None else None,
-        json.dumps(latest_bar) if latest_bar is not None else None,
-        json.dumps(bars) if bars is not None else None,
-        last_processed_bar_ts,
-        last_signal,
-        trade_id,
-        now,
-    ))
-
+        """,
+        (
+            run_id,
+            json.dumps(state_dict) if state_dict is not None else None,
+            json.dumps(latest_bar) if latest_bar is not None else None,
+            json.dumps(bars) if bars is not None else None,
+            last_processed_bar_ts,
+            last_signal,
+            trade_id,
+            now,
+        ),
+    )
     conn.commit()
     conn.close()
 
@@ -198,29 +242,72 @@ def save_runtime_snapshot(
 def insert_runtime_fill(run_id: str, fill: dict):
     conn = get_connection()
     cur = conn.cursor()
-
-    cur.execute("""
+    cur.execute(
+        """
         INSERT INTO runtime_fills (
-            run_id, timestamp, type, side, price, qty, fee, equity_after,
-            entry_price, exit_price, trade_id, pnl, created_at
+            run_id, timestamp, type, side, price, qty, fee,
+            equity_after, entry_price, exit_price, trade_id, pnl, created_at
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        run_id,
-        str(fill.get("timestamp", "")),
-        str(fill.get("type", "")),
-        str(fill.get("side", "")),
-        float(fill.get("price", 0.0)),
-        float(fill.get("qty", 0.0)),
-        float(fill.get("fee", 0.0)),
-        float(fill.get("equity_after", 0.0)),
-        fill.get("entry_price"),
-        fill.get("exit_price"),
-        fill.get("trade_id"),
-        fill.get("pnl"),
-        time.time(),
-    ))
+        """,
+        (
+            run_id,
+            str(fill.get("timestamp", "")),
+            str(fill.get("type", "")),
+            str(fill.get("side", "")),
+            float(fill.get("price", 0.0)),
+            float(fill.get("qty", 0.0)),
+            float(fill.get("fee", 0.0)),
+            float(fill.get("equity_after", 0.0)),
+            fill.get("entry_price"),
+            fill.get("exit_price"),
+            fill.get("trade_id"),
+            fill.get("pnl"),
+            time.time(),
+        ),
+    )
+    conn.commit()
+    conn.close()
 
+
+def insert_runtime_equity_snapshot(
+    run_id: str,
+    *,
+    ts: int,
+    balance: float,
+    equity: float,
+    market_price: float | None,
+    position_qty: float,
+    side: str | None,
+    unrealized_pnl: float,
+    realized_pnl: float,
+    drawdown_pct: float,
+):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO runtime_equity_snapshots (
+            run_id, ts, balance, equity, market_price,
+            position_qty, side, unrealized_pnl, realized_pnl,
+            drawdown_pct, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            int(ts),
+            float(balance),
+            float(equity),
+            float(market_price) if market_price is not None else None,
+            float(position_qty),
+            side,
+            float(unrealized_pnl),
+            float(realized_pnl),
+            float(drawdown_pct),
+            time.time(),
+        ),
+    )
     conn.commit()
     conn.close()
 
@@ -228,61 +315,150 @@ def insert_runtime_fill(run_id: str, fill: dict):
 def load_runtime_fills(run_id: str, limit: int = 500, offset: int = 0) -> list[dict]:
     conn = get_connection()
     cur = conn.cursor()
-
-    cur.execute("""
+    cur.execute(
+        """
         SELECT
-            id,
-            timestamp, type, side, price, qty, fee, equity_after,
+            id, timestamp, type, side, price, qty, fee, equity_after,
+            entry_price, exit_price, trade_id, pnl, created_at
+        FROM runtime_fills
+        WHERE run_id = ?
+        ORDER BY id DESC
+        LIMIT ? OFFSET ?
+        """,
+        (run_id, limit, offset),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def load_runtime_fills_ascending(run_id: str, limit: int = 1_000_000, offset: int = 0) -> list[dict]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT
+            id, timestamp, type, side, price, qty, fee, equity_after,
             entry_price, exit_price, trade_id, pnl, created_at
         FROM runtime_fills
         WHERE run_id = ?
         ORDER BY id ASC
         LIMIT ? OFFSET ?
-    """, (run_id, limit, offset))
-
+        """,
+        (run_id, limit, offset),
+    )
     rows = cur.fetchall()
     conn.close()
-
     return [dict(row) for row in rows]
 
 
 def count_runtime_fills(run_id: str) -> int:
     conn = get_connection()
     cur = conn.cursor()
-
-    cur.execute("""
+    cur.execute(
+        """
         SELECT COUNT(*) AS cnt
         FROM runtime_fills
         WHERE run_id = ?
-    """, (run_id,))
+        """,
+        (run_id,),
+    )
     row = cur.fetchone()
     conn.close()
     return int(row["cnt"] if row else 0)
+
+
+def load_runtime_equity_snapshots(
+    run_id: str,
+    limit: int = 1000,
+    offset: int = 0,
+    ascending: bool = True,
+) -> list[dict]:
+    order = "ASC" if ascending else "DESC"
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        f"""
+        SELECT
+            id, run_id, ts, balance, equity, market_price,
+            position_qty, side, unrealized_pnl, realized_pnl,
+            drawdown_pct, created_at
+        FROM runtime_equity_snapshots
+        WHERE run_id = ?
+        ORDER BY id {order}
+        LIMIT ? OFFSET ?
+        """,
+        (run_id, limit, offset),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def count_runtime_equity_snapshots(run_id: str) -> int:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM runtime_equity_snapshots
+        WHERE run_id = ?
+        """,
+        (run_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return int(row["cnt"] if row else 0)
+
+
+def get_latest_equity_snapshot(run_id: str) -> Optional[dict]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT
+            id, run_id, ts, balance, equity, market_price,
+            position_qty, side, unrealized_pnl, realized_pnl,
+            drawdown_pct, created_at
+        FROM runtime_equity_snapshots
+        WHERE run_id = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (run_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
 
 
 def get_latest_paper_run() -> Optional[dict]:
     conn = get_connection()
     cur = conn.cursor()
 
-    cur.execute("""
+    cur.execute(
+        """
         SELECT *
         FROM runtime_runs
         WHERE mode = 'paper'
         ORDER BY COALESCE(updated_at, created_at) DESC
         LIMIT 1
-    """)
+        """
+    )
     run_row = cur.fetchone()
-
     if not run_row:
         conn.close()
         return None
 
-    cur.execute("""
+    cur.execute(
+        """
         SELECT *
         FROM runtime_snapshots
         WHERE run_id = ?
         LIMIT 1
-    """, (run_row["run_id"],))
+        """,
+        (run_row["run_id"],),
+    )
     snapshot_row = cur.fetchone()
 
     conn.close()
@@ -305,7 +481,13 @@ def get_latest_paper_run() -> Optional[dict]:
     else:
         run["snapshot"] = None
 
-    run["fills"] = load_runtime_fills(run["run_id"], limit=500, offset=0)
+    run["fills"] = load_runtime_fills_ascending(run["run_id"], limit=5000, offset=0)
+    run["equity_snapshots"] = load_runtime_equity_snapshots(
+        run["run_id"],
+        limit=5000,
+        offset=0,
+        ascending=True,
+    )
     return run
 
 
@@ -317,22 +499,20 @@ def update_run_state(
 ):
     conn = get_connection()
     cur = conn.cursor()
-
-    cur.execute("""
+    cur.execute(
+        """
         UPDATE runtime_runs
-        SET state = ?,
-            stopped_at = ?,
-            last_error = ?,
-            updated_at = ?
+        SET state = ?, stopped_at = ?, last_error = ?, updated_at = ?
         WHERE run_id = ?
-    """, (
-        state,
-        stopped_at,
-        last_error,
-        time.time(),
-        run_id,
-    ))
-
+        """,
+        (
+            state,
+            stopped_at,
+            last_error,
+            time.time(),
+            run_id,
+        ),
+    )
     conn.commit()
     conn.close()
 
@@ -340,52 +520,97 @@ def update_run_state(
 def delete_runtime_run(run_id: str):
     conn = get_connection()
     cur = conn.cursor()
-
+    cur.execute("DELETE FROM runtime_equity_snapshots WHERE run_id = ?", (run_id,))
     cur.execute("DELETE FROM runtime_fills WHERE run_id = ?", (run_id,))
     cur.execute("DELETE FROM runtime_snapshots WHERE run_id = ?", (run_id,))
     cur.execute("DELETE FROM runtime_runs WHERE run_id = ?", (run_id,))
-
     conn.commit()
     conn.close()
 
 
 def export_runtime_fills_csv(run_id: str) -> str:
-    rows = load_runtime_fills(run_id=run_id, limit=1_000_000, offset=0)
+    rows = load_runtime_fills_ascending(run_id=run_id, limit=1_000_000, offset=0)
 
     output = io.StringIO()
     writer = csv.writer(output)
-
-    writer.writerow([
-        "id",
-        "timestamp",
-        "type",
-        "side",
-        "price",
-        "qty",
-        "fee",
-        "equity_after",
-        "entry_price",
-        "exit_price",
-        "trade_id",
-        "pnl",
-        "created_at",
-    ])
+    writer.writerow(
+        [
+            "id",
+            "timestamp",
+            "type",
+            "side",
+            "price",
+            "qty",
+            "fee",
+            "equity_after",
+            "entry_price",
+            "exit_price",
+            "trade_id",
+            "pnl",
+            "created_at",
+        ]
+    )
 
     for row in rows:
-        writer.writerow([
-            row.get("id"),
-            row.get("timestamp"),
-            row.get("type"),
-            row.get("side"),
-            row.get("price"),
-            row.get("qty"),
-            row.get("fee"),
-            row.get("equity_after"),
-            row.get("entry_price"),
-            row.get("exit_price"),
-            row.get("trade_id"),
-            row.get("pnl"),
-            row.get("created_at"),
-        ])
+        writer.writerow(
+            [
+                row.get("id"),
+                row.get("timestamp"),
+                row.get("type"),
+                row.get("side"),
+                row.get("price"),
+                row.get("qty"),
+                row.get("fee"),
+                row.get("equity_after"),
+                row.get("entry_price"),
+                row.get("exit_price"),
+                row.get("trade_id"),
+                row.get("pnl"),
+                row.get("created_at"),
+            ]
+        )
+
+    return output.getvalue()
+
+
+def export_runtime_equity_csv(run_id: str) -> str:
+    rows = load_runtime_equity_snapshots(run_id=run_id, limit=1_000_000, offset=0, ascending=True)
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(
+        [
+            "id",
+            "run_id",
+            "ts",
+            "balance",
+            "equity",
+            "market_price",
+            "position_qty",
+            "side",
+            "unrealized_pnl",
+            "realized_pnl",
+            "drawdown_pct",
+            "created_at",
+        ]
+    )
+
+    for row in rows:
+        writer.writerow(
+            [
+                row.get("id"),
+                row.get("run_id"),
+                row.get("ts"),
+                row.get("balance"),
+                row.get("equity"),
+                row.get("market_price"),
+                row.get("position_qty"),
+                row.get("side"),
+                row.get("unrealized_pnl"),
+                row.get("realized_pnl"),
+                row.get("drawdown_pct"),
+                row.get("created_at"),
+            ]
+        )
 
     return output.getvalue()

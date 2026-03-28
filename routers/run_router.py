@@ -1,8 +1,7 @@
+# routers/run_router.py
 from __future__ import annotations
 
-from typing import Any
-
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
@@ -23,7 +22,6 @@ class ConfigureBody(BaseModel):
     market_type: str | None = None
     start: str | None = None
     end: str | None = None
-
     initial_balance: float | None = None
     fee_rate: float | None = None
     slippage_bps: float | None = None
@@ -35,15 +33,12 @@ class ConfigureBody(BaseModel):
     include_equity: bool | None = None
     equity_stride: int | None = None
     poll_seconds: float | None = None
-    candle_limit: int | None = None
-
-    # legacy EMA knobs
     ema_short: int | None = None
     ema_long: int | None = None
+    candle_limit: int | None = None
 
-    # generic v0.4.5 strategy layer
     strategy_name: str | None = None
-    strategy_params: dict[str, Any] | None = Field(default=None)
+    strategy_params: dict | None = None
 
 
 class DevActionBody(BaseModel):
@@ -57,9 +52,39 @@ async def status():
 
 
 @router.get("/paper/chart")
-async def paper_chart(limit: int = 300):
+async def paper_chart(limit: int = Query(default=300, ge=10, le=5000)):
     try:
         return mode_controller.get_chart_snapshot(limit=limit)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/paper/fills")
+async def paper_fills(
+    limit: int = Query(default=200, ge=1, le=5000),
+    offset: int = Query(default=0, ge=0),
+):
+    try:
+        return mode_controller.get_paper_fills(limit=limit, offset=offset)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/paper/equity")
+async def paper_equity(
+    limit: int = Query(default=500, ge=1, le=10000),
+    offset: int = Query(default=0, ge=0),
+):
+    try:
+        return mode_controller.get_paper_equity(limit=limit, offset=offset)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/paper/metrics")
+async def paper_metrics():
+    try:
+        return mode_controller.get_paper_metrics()
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -73,22 +98,36 @@ async def export_paper_fills_csv():
         return PlainTextResponse(
             content=csv_text,
             media_type="text/csv",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+            },
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.get("/paper/fills")
-async def paper_fills(limit: int = 200, offset: int = 0):
+@router.get("/paper/equity/export.csv")
+async def export_paper_equity_csv():
     try:
-        return mode_controller.get_paper_fills(limit=limit, offset=offset)
+        csv_text = mode_controller.export_paper_equity_csv()
+        run_id = mode_controller.status().get("run_id") or "paper_run"
+        filename = csv_filename_from_run_id(run_id).replace(".csv", "-equity.csv")
+        return PlainTextResponse(
+            content=csv_text,
+            media_type="text/csv",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+            },
+        )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/paper/dev/trace")
-async def paper_trace(limit: int = 200, offset: int = 0):
+async def paper_trace(
+    limit: int = Query(default=200, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+):
     try:
         return mode_controller.get_trace(limit=limit, offset=offset)
     except Exception as e:

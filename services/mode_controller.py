@@ -12,18 +12,25 @@ from typing import Optional
 import pandas as pd
 
 from core.binance_vision_provider import BinanceVisionProvider
+
 from core.database import (
+    count_runtime_equity_snapshots,
     count_runtime_fills,
     delete_runtime_run,
+    export_runtime_equity_csv,
     export_runtime_fills_csv,
     get_latest_paper_run,
-    init_runtime_db,
+    insert_runtime_equity_snapshot,
     insert_runtime_fill,
+    init_runtime_db,
+    load_runtime_equity_snapshots,
     load_runtime_fills,
+    load_runtime_fills_ascending,
     save_runtime_snapshot,
     update_run_state,
     upsert_runtime_run,
 )
+
 from core.execution_models import Fill, PortfolioState
 from core.run_naming import make_run_id
 
@@ -110,6 +117,7 @@ class ModeController:
         self._last_processed_bar_ts: int | None = None
         self._last_signal: int = 0
         self._fills: list[Fill] = []
+        self._equity_points: list[dict] = []
         self._trace: list[dict] = []
 
         init_runtime_db()
@@ -444,12 +452,13 @@ class ModeController:
             "last_processed_bar_ts": self._last_processed_bar_ts,
             "last_signal": self._last_signal,
             "fill_count": len(self._fills),
+            "equity_point_count": len(self._equity_points),
             "fills": [getattr(f, "__dict__", f) for f in reversed(self._fills[-10:])],
+            "latest_equity": self._equity_points[-1] if self._equity_points else None,
             "paper_state": self._serialize_state(),
+            "paper_metrics": self._build_metrics_payload(),
             "chart_symbol": cfg.get("symbol"),
             "chart_interval": cfg.get("interval"),
-            "strategy_name": self._resolved_strategy_name_from_config(self._status.config),
-            "strategy_params": self._resolved_strategy_params_from_config(self._status.config),
         }
 
         return {
@@ -547,6 +556,56 @@ class ModeController:
             "offset": offset,
             "fills": rows,
         }
+
+    def get_paper_equity(self, limit: int = 500, offset: int = 0) -> dict:
+        safe_limit = max(1, min(limit, 10000))
+        safe_offset = max(0, offset)
+
+        if not self._status.run_id:
+            rows = list(reversed(self._equity_points))
+            sliced = rows[safe_offset:safe_offset + safe_limit]
+            return {
+                "run_id": None,
+                "total": len(rows),
+                "limit": limit,
+                "offset": offset,
+                "points": list(reversed(sliced)),
+            }
+
+        rows_desc = load_runtime_equity_snapshots(
+            run_id=self._status.run_id,
+            limit=safe_limit,
+            offset=safe_offset,
+            ascending=False,
+        )
+        total = count_runtime_equity_snapshots(self._status.run_id)
+
+        if not rows_desc and self._equity_points:
+            mem_rows = list(reversed(self._equity_points))
+            rows_desc = mem_rows[safe_offset:safe_offset + safe_limit]
+            total = len(mem_rows)
+
+        return {
+            "run_id": self._status.run_id,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "points": list(reversed(rows_desc)),
+        }
+
+    def get_paper_metrics(self) -> dict:
+        return {
+            "run_id": self._status.run_id,
+            "metrics": self._build_metrics_payload(),
+        }
+
+    def export_paper_equity_csv(self) -> str:
+        if not self._status.run_id:
+            return (
+                "id,run_id,ts,balance,equity,market_price,position_qty,side,"
+                "unrealized_pnl,realized_pnl,drawdown_pct,created_at\n"
+            )
+        return export_runtime_equity_csv(self._status.run_id)
 
     def get_trace(self, limit: int = 200, offset: int = 0) -> dict:
         safe_limit = max(1, min(limit, 1000))
@@ -830,6 +889,219 @@ class ModeController:
             )
         return export_runtime_fills_csv(self._status.run_id)
 
+    def _serialize_state(self) -> dict | None:
+        if self._state is None:
+            return None
+
+        market_price = None
+        if self._latest_bar and self._latest_bar.get("close") is not None:
+            try:
+                market_price = float(self._latest_bar["close"])
+            except Exception:
+                market_price = None
+
+        equity = float(self._state.equity or 0.0)
+        unrealized = 0.0
+        if (
+            market_price is not None
+            and self._state.entry_price is not None
+            and self._state.position_qty != 0
+        ):
+            unrealized = float(self._state.position_qty) * (
+                float(market_price) - float(self._state.entry_price)
+            )
+
+        return {
+            "cash": float(self._state.cash),
+            "position_qty": float(self._state.position_qty),
+            "entry_price": self._state.entry_price,
+            "side": self._state.side,
+            "equity": equity,
+            "liquidation_price": self._state.liquidation_price,
+            "realized_pnl": float(self._state.realized_pnl),
+            "active_trade_id": self._state.active_trade_id,
+            "margin": float(self._state.margin),
+            "borrowed": float(self._state.borrowed),
+            "unrealized_pnl": float(unrealized),
+            "market_price": market_price,
+        }
+
+    def _build_equity_point(self) -> dict | None:
+        if self._state is None:
+            return None
+
+        market_price = None
+        if self._latest_bar and self._latest_bar.get("close") is not None:
+            try:
+                market_price = float(self._latest_bar["close"])
+            except Exception:
+                market_price = None
+
+        if market_price is None and self._state.entry_price is not None:
+            market_price = float(self._state.entry_price)
+
+        balance = float(self._state.cash)
+        equity = float(self._state.equity or balance)
+        realized_pnl = float(self._state.realized_pnl or 0.0)
+
+        unrealized_pnl = 0.0
+        if (
+            market_price is not None
+            and self._state.entry_price is not None
+            and self._state.position_qty != 0
+        ):
+            unrealized_pnl = float(self._state.position_qty) * (
+                float(market_price) - float(self._state.entry_price)
+            )
+
+        peak = max([float(p["equity"]) for p in self._equity_points], default=equity)
+        drawdown_pct = 0.0 if peak <= 0 else ((peak - equity) / peak) * 100.0
+
+        ts = None
+        if self._latest_bar and self._latest_bar.get("timestamp") is not None:
+            try:
+                ts = int(self._latest_bar["timestamp"])
+            except Exception:
+                ts = None
+        if ts is None:
+            ts = int(time.time())
+
+        return {
+            "run_id": self._status.run_id,
+            "ts": ts,
+            "balance": balance,
+            "equity": equity,
+            "market_price": market_price,
+            "position_qty": float(self._state.position_qty),
+            "side": self._state.side,
+            "unrealized_pnl": float(unrealized_pnl),
+            "realized_pnl": realized_pnl,
+            "drawdown_pct": float(max(drawdown_pct, 0.0)),
+        }
+
+    def _record_equity_point(self) -> None:
+        point = self._build_equity_point()
+        if not point:
+            return
+
+        last = self._equity_points[-1] if self._equity_points else None
+        if last:
+            same_ts = int(last.get("ts", 0)) == int(point["ts"])
+            same_equity = float(last.get("equity", 0.0)) == float(point["equity"])
+            same_balance = float(last.get("balance", 0.0)) == float(point["balance"])
+            same_qty = float(last.get("position_qty", 0.0)) == float(point["position_qty"])
+            if same_ts and same_equity and same_balance and same_qty:
+                return
+
+        self._equity_points.append(point)
+        if len(self._equity_points) > 10000:
+            self._equity_points = self._equity_points[-10000:]
+
+        if self._status.run_id:
+            insert_runtime_equity_snapshot(
+                self._status.run_id,
+                ts=int(point["ts"]),
+                balance=float(point["balance"]),
+                equity=float(point["equity"]),
+                market_price=point["market_price"],
+                position_qty=float(point["position_qty"]),
+                side=point["side"],
+                unrealized_pnl=float(point["unrealized_pnl"]),
+                realized_pnl=float(point["realized_pnl"]),
+                drawdown_pct=float(point["drawdown_pct"]),
+            )
+
+    def _build_metrics_payload(self) -> dict:
+        raw_fills = []
+        if self._status.run_id:
+            raw_fills = load_runtime_fills_ascending(self._status.run_id, limit=1_000_000, offset=0)
+        elif self._fills:
+            raw_fills = list(self._fills)
+
+        points = []
+        if self._status.run_id:
+            points = load_runtime_equity_snapshots(
+                self._status.run_id,
+                limit=1_000_000,
+                offset=0,
+                ascending=True,
+            )
+        elif self._equity_points:
+            points = list(self._equity_points)
+
+        # Normalize fills so downstream logic always works with dicts
+        fills: list[dict] = []
+        for item in raw_fills:
+            if isinstance(item, dict):
+                fills.append(item)
+            else:
+                fills.append(getattr(item, "__dict__", {}))
+
+        initial_balance = float(self._status.config.initial_balance)
+
+        if points:
+            start_equity = float(points[0]["equity"])
+            latest_equity = float(points[-1]["equity"])
+            latest_balance = float(points[-1]["balance"])
+            max_drawdown_pct = max(float(p.get("drawdown_pct", 0.0)) for p in points)
+        else:
+            start_equity = initial_balance
+            latest_equity = float(self._state.equity) if self._state else initial_balance
+            latest_balance = float(self._state.cash) if self._state else initial_balance
+            max_drawdown_pct = 0.0
+
+        exits = [
+            f for f in fills
+            if str(f.get("type", "")).upper() in {"EXIT", "LIQUIDATION"}
+        ]
+
+        closed_trades = len(exits)
+        wins = sum(1 for f in exits if float(f.get("pnl") or 0.0) > 0.0)
+        losses = sum(1 for f in exits if float(f.get("pnl") or 0.0) < 0.0)
+        breakeven = closed_trades - wins - losses
+
+        gross_profit = sum(
+            float(f.get("pnl") or 0.0) for f in exits if float(f.get("pnl") or 0.0) > 0.0
+        )
+        gross_loss = abs(
+            sum(float(f.get("pnl") or 0.0) for f in exits if float(f.get("pnl") or 0.0) < 0.0)
+        )
+        net_pnl = gross_profit - gross_loss
+
+        win_rate = (wins / closed_trades * 100.0) if closed_trades else 0.0
+        avg_trade_pnl = (net_pnl / closed_trades) if closed_trades else 0.0
+        profit_factor = (
+            gross_profit / gross_loss
+            if gross_loss > 0
+            else (gross_profit if gross_profit > 0 else 0.0)
+        )
+
+        return_pct = (
+            ((latest_equity - initial_balance) / initial_balance) * 100.0
+            if initial_balance > 0
+            else 0.0
+        )
+
+        return {
+            "initial_balance": initial_balance,
+            "start_equity": start_equity,
+            "latest_balance": latest_balance,
+            "latest_equity": latest_equity,
+            "net_pnl": net_pnl,
+            "return_pct": return_pct,
+            "max_drawdown_pct": max_drawdown_pct,
+            "closed_trades": closed_trades,
+            "wins": wins,
+            "losses": losses,
+            "breakeven": breakeven,
+            "win_rate_pct": win_rate,
+            "gross_profit": gross_profit,
+            "gross_loss": gross_loss,
+            "profit_factor": profit_factor,
+            "avg_trade_pnl": avg_trade_pnl,
+            "equity_points": len(points),
+        }
+
     def _persist_status(self) -> None:
         if not self._status.run_id:
             return
@@ -857,6 +1129,8 @@ class ModeController:
             last_signal=self._last_signal,
             trade_id=self._trade_id,
         )
+
+        self._record_equity_point()
 
     def _persist_fill(self, fill: Fill) -> None:
         if not self._status.run_id:
@@ -889,6 +1163,7 @@ class ModeController:
 
         restored_state = PortfolioState.from_dict(snapshot.get("state"))
         self._state = restored_state
+
         self._engine = ExecutionEngine(
             fee_rate=self._status.config.fee_rate,
             slippage_bps=self._status.config.slippage_bps,
@@ -903,6 +1178,8 @@ class ModeController:
             if fill:
                 self._fills.append(fill)
 
+        self._equity_points = list(restored.get("equity_snapshots") or [])
+
         restored_state_value = restored.get("state", EngineState.IDLE.value)
         if restored_state_value in {
             EngineState.RUNNING.value,
@@ -913,12 +1190,13 @@ class ModeController:
             self._status.last_error = (
                 self._status.last_error or "Recovered paper session after restart."
             )
-            update_run_state(
-                run_id=self._status.run_id,
-                state=EngineState.IDLE.value,
-                stopped_at=time.time(),
-                last_error=self._status.last_error,
-            )
+            if self._status.run_id:
+                update_run_state(
+                    run_id=self._status.run_id,
+                    state=EngineState.IDLE.value,
+                    stopped_at=time.time(),
+                    last_error=self._status.last_error,
+                )
         else:
             self._status.state = EngineState(restored_state_value)
 
@@ -929,6 +1207,7 @@ class ModeController:
         self._last_signal = 0
         self._trade_id = 0
         self._fills = []
+        self._equity_points = []
         self._trace = []
         self._state = None
         self._engine = None
@@ -1258,22 +1537,5 @@ class ModeController:
                 )
                 if fill:
                     await self._append_fill(fill)
-
-    def _serialize_state(self) -> dict | None:
-        if self._state is None:
-            return None
-
-        return {
-            "cash": self._state.cash,
-            "position_qty": self._state.position_qty,
-            "entry_price": self._state.entry_price,
-            "side": self._state.side,
-            "equity": self._state.equity,
-            "liquidation_price": self._state.liquidation_price,
-            "realized_pnl": self._state.realized_pnl,
-            "active_trade_id": self._state.active_trade_id,
-            "margin": self._state.margin,
-            "borrowed": self._state.borrowed,
-        }
 
 mode_controller = ModeController()
