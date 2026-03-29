@@ -5,10 +5,21 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import PlainTextResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from core.run_naming import csv_filename_from_run_id
-from core.database import get_persisted_run, list_persisted_runs
+from core.database import (
+    count_persisted_equity_snapshots,
+    count_persisted_fills,
+    export_persisted_equity_csv,
+    export_persisted_fills_csv,
+    get_persisted_run,
+    get_persisted_run_metrics,
+    get_persisted_run_row,
+    list_persisted_runs,
+    load_persisted_equity_snapshots,
+    load_persisted_fills,
+)
 from services.mode_controller import Mode
 from services.controller_singleton import mode_controller
 
@@ -39,7 +50,6 @@ class ConfigureBody(BaseModel):
     ema_short: int | None = None
     ema_long: int | None = None
     candle_limit: int | None = None
-
     strategy_name: str | None = None
     strategy_params: dict | None = None
 
@@ -47,6 +57,13 @@ class ConfigureBody(BaseModel):
 class DevActionBody(BaseModel):
     price: float | None = None
     note: str | None = None
+
+
+def _require_persisted_run(run_id: str) -> dict:
+    run = get_persisted_run_row(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    return run
 
 
 @router.get("/status")
@@ -163,6 +180,123 @@ async def run_history_detail(
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found.")
         return run
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# ============================================================
+# v0.5.3 Query Layer
+# ============================================================
+
+@router.get("/runs/{run_id}/fills")
+async def get_run_fills(
+    run_id: str,
+    limit: int = Query(default=200, ge=1, le=10000),
+    offset: int = Query(default=0, ge=0),
+    order: str = Query(default="desc"),
+):
+    try:
+        _require_persisted_run(run_id)
+        ascending = order.lower() == "asc"
+        rows = load_persisted_fills(
+            run_id=run_id,
+            limit=limit,
+            offset=offset,
+            ascending=ascending,
+        )
+        total = count_persisted_fills(run_id)
+        return {
+            "run_id": run_id,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "order": "asc" if ascending else "desc",
+            "fills": rows,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/runs/{run_id}/equity")
+async def get_run_equity(
+    run_id: str,
+    limit: int = Query(default=500, ge=1, le=20000),
+    offset: int = Query(default=0, ge=0),
+    order: str = Query(default="asc"),
+):
+    try:
+        _require_persisted_run(run_id)
+        ascending = order.lower() != "desc"
+        rows = load_persisted_equity_snapshots(
+            run_id=run_id,
+            limit=limit,
+            offset=offset,
+            ascending=ascending,
+        )
+        total = count_persisted_equity_snapshots(run_id)
+        return {
+            "run_id": run_id,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "order": "asc" if ascending else "desc",
+            "points": rows,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/runs/{run_id}/metrics")
+async def get_run_metrics(run_id: str):
+    try:
+        metrics = get_persisted_run_metrics(run_id)
+        if metrics is None:
+            raise HTTPException(status_code=404, detail="Run not found.")
+        return metrics
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/runs/{run_id}/export/fills.csv")
+async def export_run_fills_csv(run_id: str):
+    try:
+        _require_persisted_run(run_id)
+        csv_text = export_persisted_fills_csv(run_id)
+        filename = csv_filename_from_run_id(run_id)
+        return PlainTextResponse(
+            content=csv_text,
+            media_type="text/csv",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/runs/{run_id}/export/equity.csv")
+async def export_run_equity_csv(run_id: str):
+    try:
+        _require_persisted_run(run_id)
+        csv_text = export_persisted_equity_csv(run_id)
+        filename = csv_filename_from_run_id(run_id).replace(".csv", "-equity.csv")
+        return PlainTextResponse(
+            content=csv_text,
+            media_type="text/csv",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+            },
+        )
     except HTTPException:
         raise
     except Exception as e:

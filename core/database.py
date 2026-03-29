@@ -1472,3 +1472,305 @@ def get_equity_by_run_id(run_id: str, limit: int = 5000, offset: int = 0) -> lis
     rows = cur.fetchall()
     conn.close()
     return _rows_to_dicts(rows)
+
+
+# ============================================================
+# v0.5.3 Query Layer (persisted run-scoped query surface)
+# ============================================================
+
+def get_persisted_run_row(run_id: str) -> Optional[dict]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT
+            run_id,
+            run_label,
+            mode,
+            state,
+            symbol,
+            interval,
+            market_type,
+            strategy_name,
+            strategy_params_json,
+            config_json,
+            started_at,
+            stopped_at,
+            last_error,
+            created_at,
+            updated_at
+        FROM runs
+        WHERE run_id = ?
+        LIMIT 1
+        """,
+        (run_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+
+    if row is None:
+        return None
+
+    data = dict(row)
+    data["strategy_params"] = _json_loads(data.get("strategy_params_json"), default={}) or {}
+    data["config"] = _json_loads(data.get("config_json"), default={}) or {}
+    return data
+
+
+def count_persisted_fills(run_id: str) -> int:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COUNT(*) AS cnt FROM fills WHERE run_id = ?",
+        (run_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+
+    if row is None:
+        return 0
+
+    return _safe_int(row["cnt"])
+
+
+def count_persisted_equity_snapshots(run_id: str) -> int:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COUNT(*) AS cnt FROM equity_snapshots WHERE run_id = ?",
+        (run_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+
+    if row is None:
+        return 0
+
+    return _safe_int(row["cnt"])
+
+
+def _compute_max_drawdown_pct(points: list[dict]) -> float:
+    peak: Optional[float] = None
+    max_dd = 0.0
+
+    for point in points:
+        equity = _safe_float(point.get("equity"), default=0.0)
+        if peak is None or equity > peak:
+            peak = equity
+        if peak and peak > 0:
+            dd = ((peak - equity) / peak) * 100.0
+            if dd > max_dd:
+                max_dd = dd
+
+    return float(max_dd)
+
+
+def get_persisted_run_metrics(run_id: str) -> Optional[dict]:
+    run = get_persisted_run_row(run_id)
+    if run is None:
+        return None
+
+    fills = load_persisted_fills(
+        run_id=run_id,
+        limit=1_000_000,
+        offset=0,
+        ascending=True,
+    )
+    equity_points = load_persisted_equity_snapshots(
+        run_id=run_id,
+        limit=1_000_000,
+        offset=0,
+        ascending=True,
+    )
+
+    closed_trade_fills = [f for f in fills if f.get("pnl") is not None]
+    gross_pnl = sum(_safe_float(f.get("pnl")) for f in closed_trade_fills)
+    total_fees = sum(_safe_float(f.get("fee")) for f in fills)
+
+    winning = [f for f in closed_trade_fills if _safe_float(f.get("pnl")) > 0]
+    losing = [f for f in closed_trade_fills if _safe_float(f.get("pnl")) < 0]
+    breakeven = [f for f in closed_trade_fills if _safe_float(f.get("pnl")) == 0]
+
+    gross_wins = sum(_safe_float(f.get("pnl")) for f in winning)
+    gross_losses_abs = abs(sum(_safe_float(f.get("pnl")) for f in losing))
+
+    first_equity = _safe_float(equity_points[0].get("equity")) if equity_points else 0.0
+    last_equity = _safe_float(equity_points[-1].get("equity")) if equity_points else 0.0
+    peak_equity = max((_safe_float(p.get("equity")) for p in equity_points), default=0.0)
+    trough_equity = min((_safe_float(p.get("equity")) for p in equity_points), default=0.0)
+
+    absolute_return = last_equity - first_equity if equity_points else 0.0
+    return_pct = ((absolute_return / first_equity) * 100.0) if first_equity > 0 else 0.0
+
+    latest_drawdown_pct = 0.0
+    if equity_points:
+        latest_drawdown_pct = _safe_float(
+            equity_points[-1].get("drawdown_pct", equity_points[-1].get("drawdown"))
+        )
+
+    max_drawdown_pct = _compute_max_drawdown_pct(equity_points)
+
+    closed_trade_count = len(closed_trade_fills)
+    winning_trade_count = len(winning)
+    losing_trade_count = len(losing)
+    breakeven_trade_count = len(breakeven)
+
+    win_rate = (
+        (winning_trade_count / closed_trade_count) * 100.0
+        if closed_trade_count > 0
+        else 0.0
+    )
+
+    avg_closed_pnl = gross_pnl / closed_trade_count if closed_trade_count > 0 else 0.0
+    avg_win_pnl = gross_wins / winning_trade_count if winning_trade_count > 0 else 0.0
+    avg_loss_pnl = (
+        sum(_safe_float(f.get("pnl")) for f in losing) / losing_trade_count
+        if losing_trade_count > 0
+        else 0.0
+    )
+    profit_factor = (
+        gross_wins / gross_losses_abs
+        if gross_losses_abs > 0
+        else (float("inf") if gross_wins > 0 else 0.0)
+    )
+
+    return {
+        "run_id": run_id,
+        "summary": {
+            "run_label": run.get("run_label"),
+            "mode": run.get("mode"),
+            "state": run.get("state"),
+            "symbol": run.get("symbol"),
+            "interval": run.get("interval"),
+            "market_type": run.get("market_type"),
+            "strategy_name": run.get("strategy_name"),
+            "strategy_params": run.get("strategy_params", {}),
+            "started_at": run.get("started_at"),
+            "stopped_at": run.get("stopped_at"),
+            "last_error": run.get("last_error"),
+        },
+        "trade_stats": {
+            "fill_count": len(fills),
+            "entry_fill_count": sum(
+                1 for f in fills if str(f.get("type", "")).lower() in {"buy", "entry", "enter_long", "enter_short"}
+            ),
+            "exit_fill_count": sum(
+                1 for f in fills if str(f.get("type", "")).lower() in {"sell", "exit", "exit_long", "exit_short", "liquidate"}
+            ),
+            "closed_trade_count": closed_trade_count,
+            "winning_trade_count": winning_trade_count,
+            "losing_trade_count": losing_trade_count,
+            "breakeven_trade_count": breakeven_trade_count,
+            "win_rate": float(win_rate),
+            "gross_pnl": float(gross_pnl),
+            "total_fees": float(total_fees),
+            "net_closed_pnl": float(gross_pnl - total_fees),
+            "avg_closed_pnl": float(avg_closed_pnl),
+            "avg_win_pnl": float(avg_win_pnl),
+            "avg_loss_pnl": float(avg_loss_pnl),
+            "profit_factor": profit_factor,
+        },
+        "equity": {
+            "point_count": len(equity_points),
+            "first_equity": float(first_equity),
+            "last_equity": float(last_equity),
+            "peak_equity": float(peak_equity),
+            "trough_equity": float(trough_equity),
+            "absolute_return": float(absolute_return),
+            "return_pct": float(return_pct),
+            "latest_drawdown_pct": float(latest_drawdown_pct),
+            "max_drawdown_pct": float(max_drawdown_pct),
+        },
+    }
+
+
+def export_persisted_fills_csv(run_id: str) -> str:
+    rows = load_persisted_fills(
+        run_id=run_id,
+        limit=1_000_000,
+        offset=0,
+        ascending=True,
+    )
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "id",
+        "run_id",
+        "timestamp",
+        "type",
+        "side",
+        "price",
+        "qty",
+        "fee",
+        "equity_after",
+        "entry_price",
+        "exit_price",
+        "trade_id",
+        "pnl",
+        "created_at",
+    ])
+
+    for row in rows:
+        writer.writerow([
+            row.get("id"),
+            row.get("run_id"),
+            row.get("timestamp"),
+            row.get("type"),
+            row.get("side"),
+            row.get("price"),
+            row.get("qty"),
+            row.get("fee"),
+            row.get("equity_after"),
+            row.get("entry_price"),
+            row.get("exit_price"),
+            row.get("trade_id"),
+            row.get("pnl"),
+            row.get("created_at"),
+        ])
+
+    return output.getvalue()
+
+
+def export_persisted_equity_csv(run_id: str) -> str:
+    rows = load_persisted_equity_snapshots(
+        run_id=run_id,
+        limit=1_000_000,
+        offset=0,
+        ascending=True,
+    )
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "id",
+        "run_id",
+        "ts",
+        "balance",
+        "equity",
+        "market_price",
+        "position_qty",
+        "side",
+        "unrealized_pnl",
+        "realized_pnl",
+        "drawdown_pct",
+        "created_at",
+    ])
+
+    for row in rows:
+        writer.writerow([
+            row.get("id"),
+            row.get("run_id"),
+            row.get("ts"),
+            row.get("balance"),
+            row.get("equity"),
+            row.get("market_price"),
+            row.get("position_qty"),
+            row.get("side"),
+            row.get("unrealized_pnl"),
+            row.get("realized_pnl"),
+            row.get("drawdown_pct"),
+            row.get("created_at"),
+        ])
+
+    return output.getvalue()

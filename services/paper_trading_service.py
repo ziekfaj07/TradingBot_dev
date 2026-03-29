@@ -5,7 +5,6 @@ from services.execution_engine import ExecutionEngine
 
 
 class PaperTradingService:
-
     def __init__(
         self,
         *,
@@ -21,15 +20,13 @@ class PaperTradingService:
 
         self.state = PortfolioState(
             cash=starting_balance,
-            pos_qty=0.0,
+            position_qty=0.0,
             entry_price=0.0,
             equity=starting_balance,
         )
 
         self.engine = ExecutionEngine(
-            maker_fee=0.0002,
-            taker_fee=taker_fee,
-            allow_short=allow_short,
+            fee_rate=taker_fee,
         )
 
         self.trade_id = 0
@@ -45,15 +42,24 @@ class PaperTradingService:
         ts = "LIVE"  # You can replace with actual timestamp
 
         # liquidation check (futures only)
-        if self.engine.liquidation_check(self.state, self.market_type, price, self.leverage):
+        if self.engine.compute_liquidation_price(
+            self.state,
+            self.market_type,
+            price,
+            self.leverage,
+        ):
             self.state, fill = self.engine.liquidate(
-                ts, self.state, price, self.market_type, self.trade_id
+                ts,
+                self.state,
+                price,
+                self.market_type,
+                self.trade_id,
             )
             if fill:
                 self.trade_id += 1
 
         # ENTRY
-        if signal == 1 and self.state.pos_qty == 0:
+        if signal == 1 and self.state.position_qty == 0:
             self.trade_id += 1
             self.state, fill = self.engine.enter_long(
                 ts,
@@ -65,7 +71,7 @@ class PaperTradingService:
             )
 
         # EXIT
-        elif signal == -1 and self.state.pos_qty > 0:
+        elif signal == -1 and self.state.position_qty > 0:
             self.state, fill = self.engine.exit_long(
                 ts,
                 self.state,
@@ -79,7 +85,7 @@ class PaperTradingService:
 
         return {
             "balance_usd": round(self.state.cash, 2),
-            "position_qty": round(self.state.pos_qty, 6),
-            "entry_price": round(self.state.entry_price, 2),
+            "position_qty": round(self.state.position_qty, 6),
+            "entry_price": round(self.state.entry_price or 0.0, 2),
             "total_equity": round(equity, 2),
         }

@@ -55,7 +55,8 @@ class GateIOService(MarketDataService):
         "dogeusdt": "DOGE_USDT",
         "pepeusdt": "PEPE_USDT",
         "wifusdt": "WIF_USDT",
-        "bonkusdt": "BONK_USDT"
+        "bonkusdt": "BONK_USDT",
+        "shibusdt": "SHIB_USDT"
     }
 
     INTERVAL_MAP = {
