@@ -2,6 +2,7 @@ aiodns==4.0.0
 aiohappyeyeballs==2.6.1
 aiohttp==3.13.3
 aiosignal==1.4.0
+aiosqlite>=0.20,<1.0
 annotated-doc==0.0.4
 annotated-types==0.7.0
 anyio==4.12.1

@@ -144,6 +144,12 @@ class ModeController:
 
             config_dict = asdict(self._status.config)
 
+            # IMPORTANT:
+            # If we are re-configuring while still bound to an old idle paper run,
+            # detach first so the new config does not overwrite old persisted run data.
+            if self._status.mode == Mode.PAPER:
+                self._prepare_fresh_idle_config_locked()
+
             # --- Resolve strategy name ---
             strategy_name = (
                 kwargs.get("strategy_name")
@@ -209,6 +215,10 @@ class ModeController:
                     setattr(self._status.config, key, value)
 
             self._status.last_error = None
+
+            # IMPORTANT:
+            # Do not persist status/snapshot here when no run_id exists.
+            # start() will generate a fresh run_id and persist the new run cleanly.
             self._persist_status()
             self._persist_snapshot()
             return self.status()
@@ -251,6 +261,22 @@ class ModeController:
             params.setdefault("long", int(getattr(cfg, "ema_long", 21)))
 
         return params
+
+    def _prepare_fresh_idle_config_locked(self) -> None:
+        """
+        When re-configuring while idle, detach from any previously bound paper run
+        so the new config does not overwrite old persisted history.
+
+        This preserves historical runs and ensures the next start() generates a new
+        run_id from the new config.
+        """
+        self._status.run_id = None
+        self._status.run_label = None
+        self._status.started_at = None
+        self._status.stopped_at = None
+        self._status.last_error = None
+
+        self._reset_runtime_memory()
 
     def _apply_strategy_to_df(self, df: pd.DataFrame, cfg: RunConfig) -> pd.DataFrame:
         return StrategyEngine.apply(

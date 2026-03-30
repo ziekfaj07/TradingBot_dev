@@ -1,10 +1,13 @@
+import asyncio
 import csv
 import io
 import json
 import os
 import re
 import sqlite3
+import threading
 import time
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 DB_PATH = os.getenv("TRADINGBOT_DB_PATH", "database/tradingbot.db")
@@ -15,10 +18,24 @@ DB_PATH = os.getenv("TRADINGBOT_DB_PATH", "database/tradingbot.db")
 # ============================================================
 
 def get_connection() -> sqlite3.Connection:
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+
+    conn = sqlite3.connect(
+        DB_PATH,
+        timeout=30.0,
+        check_same_thread=False,
+    )
     conn.row_factory = sqlite3.Row
+
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA temp_store = MEMORY")
+    conn.execute("PRAGMA cache_size = -20000")
+
     return conn
 
 
@@ -86,6 +103,349 @@ def _row_to_dict(row: Optional[sqlite3.Row]) -> Optional[dict]:
 def _rows_to_dicts(rows: list[sqlite3.Row]) -> list[dict]:
     return [dict(r) for r in rows]
 
+
+# ============================================================
+# v0.5.4 Buffered runtime writes
+# ============================================================
+
+@dataclass
+class _RuntimeWriteBuffer:
+    fills: list[dict] = field(default_factory=list)
+    equity_points: list[dict] = field(default_factory=list)
+    last_flush_monotonic: float = field(default_factory=time.monotonic)
+
+
+_RUNTIME_WRITE_LOCK = threading.Lock()
+_RUNTIME_WRITE_BUFFERS: dict[str, _RuntimeWriteBuffer] = {}
+
+_FILL_BATCH_SIZE = _coerce_limit(
+    os.getenv("TRADINGBOT_DB_FILL_BATCH_SIZE"),
+    default=25,
+    minimum=1,
+    maximum=10_000,
+)
+
+_EQUITY_BATCH_SIZE = _coerce_limit(
+    os.getenv("TRADINGBOT_DB_EQUITY_BATCH_SIZE"),
+    default=100,
+    minimum=1,
+    maximum=50_000,
+)
+
+_DB_FLUSH_INTERVAL_SECONDS = max(
+    0.1,
+    _safe_float(os.getenv("TRADINGBOT_DB_FLUSH_INTERVAL_SECONDS"), 1.0),
+)
+
+
+def _get_runtime_buffer(run_id: str) -> _RuntimeWriteBuffer:
+    bucket = _RUNTIME_WRITE_BUFFERS.get(run_id)
+    if bucket is None:
+        bucket = _RuntimeWriteBuffer()
+        _RUNTIME_WRITE_BUFFERS[run_id] = bucket
+    return bucket
+
+
+def _normalize_fill_payload(run_id: str, fill: dict, now: Optional[float] = None) -> dict:
+    payload = dict(fill or {})
+    created_at = now if now is not None else time.time()
+    return {
+        "run_id": run_id,
+        "timestamp": str(payload.get("timestamp", "")),
+        "type": str(payload.get("type", "")),
+        "side": str(payload.get("side", "")),
+        "price": _safe_float(payload.get("price")),
+        "qty": _safe_float(payload.get("qty")),
+        "fee": _safe_float(payload.get("fee")),
+        "equity_after": _safe_float(payload.get("equity_after")),
+        "entry_price": payload.get("entry_price"),
+        "exit_price": payload.get("exit_price"),
+        "trade_id": payload.get("trade_id"),
+        "pnl": payload.get("pnl"),
+        "created_at": created_at,
+        "meta_json": _json_dumps(payload),
+    }
+
+
+def _normalize_equity_payload(run_id: str, point: dict, now: Optional[float] = None) -> dict:
+    payload = dict(point or {})
+    created_at = now if now is not None else time.time()
+    return {
+        "run_id": run_id,
+        "timestamp": str(payload.get("timestamp", "")),
+        "equity": _safe_float(payload.get("equity")),
+        "price": payload.get("price"),
+        "cash": payload.get("cash"),
+        "position_qty": payload.get("position_qty"),
+        "drawdown": payload.get("drawdown"),
+        "created_at": created_at,
+        "meta_json": _json_dumps(payload),
+    }
+
+
+def _insert_runtime_fills_batch_conn(
+    conn: sqlite3.Connection,
+    rows: list[dict],
+) -> int:
+    if not rows:
+        return 0
+
+    cur = conn.cursor()
+
+    cur.executemany(
+        """
+        INSERT INTO runtime_fills (
+            run_id,
+            timestamp,
+            type,
+            side,
+            price,
+            qty,
+            fee,
+            equity_after,
+            entry_price,
+            exit_price,
+            trade_id,
+            pnl,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                row["run_id"],
+                row["timestamp"],
+                row["type"],
+                row["side"],
+                row["price"],
+                row["qty"],
+                row["fee"],
+                row["equity_after"],
+                row["entry_price"],
+                row["exit_price"],
+                row["trade_id"],
+                row["pnl"],
+                row["created_at"],
+            )
+            for row in rows
+        ],
+    )
+
+    cur.executemany(
+        """
+        INSERT INTO fills (
+            run_id,
+            timestamp,
+            fill_type,
+            side,
+            price,
+            qty,
+            fee,
+            equity_after,
+            entry_price,
+            exit_price,
+            trade_id,
+            pnl,
+            meta_json,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                row["run_id"],
+                row["timestamp"],
+                row["type"],
+                row["side"],
+                row["price"],
+                row["qty"],
+                row["fee"],
+                row["equity_after"],
+                row["entry_price"],
+                row["exit_price"],
+                row["trade_id"],
+                row["pnl"],
+                row["meta_json"],
+                row["created_at"],
+            )
+            for row in rows
+        ],
+    )
+
+    return len(rows)
+
+
+def _insert_runtime_equity_batch_conn(
+    conn: sqlite3.Connection,
+    rows: list[dict],
+) -> int:
+    if not rows:
+        return 0
+
+    cur = conn.cursor()
+
+    cur.executemany(
+        """
+        INSERT INTO runtime_equity_snapshots (
+            run_id,
+            timestamp,
+            equity,
+            price,
+            cash,
+            position_qty,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                row["run_id"],
+                row["timestamp"],
+                row["equity"],
+                row["price"],
+                row["cash"],
+                row["position_qty"],
+                row["created_at"],
+            )
+            for row in rows
+        ],
+    )
+
+    cur.executemany(
+        """
+        INSERT INTO equity_snapshots (
+            run_id,
+            timestamp,
+            equity,
+            price,
+            cash,
+            position_qty,
+            drawdown,
+            meta_json,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                row["run_id"],
+                row["timestamp"],
+                row["equity"],
+                row["price"],
+                row["cash"],
+                row["position_qty"],
+                row["drawdown"],
+                row["meta_json"],
+                row["created_at"],
+            )
+            for row in rows
+        ],
+    )
+
+    return len(rows)
+
+
+def flush_runtime_write_buffers(run_id: Optional[str] = None) -> dict[str, int]:
+    with _RUNTIME_WRITE_LOCK:
+        if run_id is None:
+            targets = list(_RUNTIME_WRITE_BUFFERS.keys())
+        else:
+            targets = [run_id] if run_id in _RUNTIME_WRITE_BUFFERS else []
+
+        if not targets:
+            return {"fills": 0, "equity_points": 0}
+
+        drained: dict[str, tuple[list[dict], list[dict]]] = {}
+        for rid in targets:
+            bucket = _RUNTIME_WRITE_BUFFERS.get(rid)
+            if bucket is None:
+                continue
+
+            fills = bucket.fills[:]
+            equity_points = bucket.equity_points[:]
+
+            if fills or equity_points:
+                drained[rid] = (fills, equity_points)
+
+            bucket.fills.clear()
+            bucket.equity_points.clear()
+            bucket.last_flush_monotonic = time.monotonic()
+
+            if not bucket.fills and not bucket.equity_points:
+                _RUNTIME_WRITE_BUFFERS.pop(rid, None)
+
+    if not drained:
+        return {"fills": 0, "equity_points": 0}
+
+    conn = get_connection()
+    inserted_fills = 0
+    inserted_equity = 0
+
+    try:
+        for fills, equity_points in drained.values():
+            inserted_fills += _insert_runtime_fills_batch_conn(conn, fills)
+            inserted_equity += _insert_runtime_equity_batch_conn(conn, equity_points)
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    return {
+        "fills": inserted_fills,
+        "equity_points": inserted_equity,
+    }
+
+
+async def flush_runtime_write_buffers_async(run_id: Optional[str] = None) -> dict[str, int]:
+    return await asyncio.to_thread(flush_runtime_write_buffers, run_id)
+
+
+def _buffer_runtime_fill(run_id: str, fill: dict) -> None:
+    normalized = _normalize_fill_payload(run_id=run_id, fill=fill)
+    with _RUNTIME_WRITE_LOCK:
+        bucket = _get_runtime_buffer(run_id)
+        bucket.fills.append(normalized)
+        should_flush = (
+            len(bucket.fills) >= _FILL_BATCH_SIZE
+            or (time.monotonic() - bucket.last_flush_monotonic) >= _DB_FLUSH_INTERVAL_SECONDS
+        )
+
+    if should_flush:
+        flush_runtime_write_buffers(run_id)
+
+
+def _buffer_runtime_equity_point(run_id: str, point: dict) -> None:
+    normalized = _normalize_equity_payload(run_id=run_id, point=point)
+    with _RUNTIME_WRITE_LOCK:
+        bucket = _get_runtime_buffer(run_id)
+        bucket.equity_points.append(normalized)
+        should_flush = (
+            len(bucket.equity_points) >= _EQUITY_BATCH_SIZE
+            or (time.monotonic() - bucket.last_flush_monotonic) >= _DB_FLUSH_INTERVAL_SECONDS
+        )
+
+    if should_flush:
+        flush_runtime_write_buffers(run_id)
+
+
+async def insert_runtime_fill_async(run_id: str, fill: dict) -> int:
+    return await asyncio.to_thread(insert_runtime_fill, run_id, fill)
+
+
+async def insert_runtime_equity_snapshot_async(
+    run_id: str,
+    point: Optional[dict] = None,
+    **kwargs: Any,
+) -> int:
+    return await asyncio.to_thread(
+        insert_runtime_equity_snapshot,
+        run_id,
+        point,
+        **kwargs,
+    )
 
 # ============================================================
 # Legacy market-data storage
@@ -323,6 +683,62 @@ def init_runtime_db() -> None:
         """
     )
 
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_runtime_runs_mode_updated_at
+        ON runtime_runs(mode, updated_at DESC)
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_runtime_runs_mode_created_at
+        ON runtime_runs(mode, created_at DESC)
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_runtime_fills_run_id_created_at
+        ON runtime_fills(run_id, created_at)
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_runtime_equity_run_id_created_at
+        ON runtime_equity_snapshots(run_id, created_at)
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_runs_mode_updated_at
+        ON runs(mode, updated_at DESC)
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_runs_symbol_updated_at
+        ON runs(symbol, updated_at DESC)
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_fills_run_id_created_at
+        ON fills(run_id, created_at)
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_equity_snapshots_run_id_created_at
+        ON equity_snapshots(run_id, created_at)
+        """
+    )
+
     conn.commit()
     conn.close()
 
@@ -340,6 +756,8 @@ def upsert_runtime_run(
     last_error: Optional[str],
     config: dict,
 ) -> None:
+    flush_runtime_write_buffers(run_id)
+
     now = time.time()
     conn = get_connection()
     cur = conn.cursor()
@@ -441,6 +859,8 @@ def save_runtime_snapshot(
     last_signal: Optional[int],
     trade_id: Optional[int],
 ) -> None:
+    flush_runtime_write_buffers(run_id)
+
     now = time.time()
     conn = get_connection()
     cur = conn.cursor()
@@ -484,90 +904,8 @@ def save_runtime_snapshot(
 
 
 def insert_runtime_fill(run_id: str, fill: dict) -> int:
-    now = time.time()
-    fill = dict(fill or {})
-
-    conn = get_connection()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        INSERT INTO runtime_fills (
-            run_id,
-            timestamp,
-            type,
-            side,
-            price,
-            qty,
-            fee,
-            equity_after,
-            entry_price,
-            exit_price,
-            trade_id,
-            pnl,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            run_id,
-            str(fill.get("timestamp", "")),
-            str(fill.get("type", "")),
-            str(fill.get("side", "")),
-            _safe_float(fill.get("price")),
-            _safe_float(fill.get("qty")),
-            _safe_float(fill.get("fee")),
-            _safe_float(fill.get("equity_after")),
-            fill.get("entry_price"),
-            fill.get("exit_price"),
-            fill.get("trade_id"),
-            fill.get("pnl"),
-            now,
-        ),
-    )
-    runtime_fill_id = _safe_int(cur.lastrowid)
-
-    cur.execute(
-        """
-        INSERT INTO fills (
-            run_id,
-            timestamp,
-            fill_type,
-            side,
-            price,
-            qty,
-            fee,
-            equity_after,
-            entry_price,
-            exit_price,
-            trade_id,
-            pnl,
-            meta_json,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            run_id,
-            str(fill.get("timestamp", "")),
-            str(fill.get("type", "")),
-            str(fill.get("side", "")),
-            _safe_float(fill.get("price")),
-            _safe_float(fill.get("qty")),
-            _safe_float(fill.get("fee")),
-            fill.get("equity_after"),
-            fill.get("entry_price"),
-            fill.get("exit_price"),
-            fill.get("trade_id"),
-            fill.get("pnl"),
-            _json_dumps(fill),
-            now,
-        ),
-    )
-
-    conn.commit()
-    conn.close()
-    return runtime_fill_id
+    _buffer_runtime_fill(run_id, fill)
+    return 0
 
 
 def load_runtime_fills(
@@ -576,6 +914,8 @@ def load_runtime_fills(
     offset: int = 0,
     ascending: bool = False,
 ) -> list[dict]:
+    flush_runtime_write_buffers(run_id)    
+
     order = "ASC" if ascending else "DESC"
 
     conn = get_connection()
@@ -618,6 +958,8 @@ def load_runtime_fills_ascending(run_id: str, limit: int = 500, offset: int = 0)
 
 
 def count_runtime_fills(run_id: str) -> int:
+    flush_runtime_write_buffers(run_id)
+
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -636,115 +978,15 @@ def insert_runtime_equity_snapshot(
     point: Optional[dict] = None,
     **kwargs: Any,
 ) -> int:
-    """
-    Backward-compatible helper.
-
-    Supports both:
-        insert_runtime_equity_snapshot(run_id, point={...})
-
-    and the older call style:
-        insert_runtime_equity_snapshot(
-            run_id,
-            ts=...,
-            balance=...,
-            equity=...,
-            market_price=...,
-            position_qty=...,
-            side=...,
-            unrealized_pnl=...,
-            realized_pnl=...,
-            drawdown_pct=...,
-        )
-    """
-    now = time.time()
-
     if point is None:
-        timestamp_value = kwargs.get("ts", kwargs.get("timestamp", ""))
-        equity_value = kwargs.get("equity", kwargs.get("balance", 0.0))
-        price_value = kwargs.get("market_price", kwargs.get("price"))
-        cash_value = kwargs.get("balance", kwargs.get("cash"))
-        position_qty_value = kwargs.get("position_qty", 0.0)
-        drawdown_value = kwargs.get("drawdown_pct", kwargs.get("drawdown"))
+        point = {}
 
-        point = {
-            "timestamp": timestamp_value,
-            "equity": equity_value,
-            "price": price_value,
-            "cash": cash_value,
-            "position_qty": position_qty_value,
-            "drawdown": drawdown_value,
-            "side": kwargs.get("side"),
-            "unrealized_pnl": kwargs.get("unrealized_pnl"),
-            "realized_pnl": kwargs.get("realized_pnl"),
-        }
-    else:
+    if kwargs:
         point = dict(point)
+        point.update(kwargs)
 
-    timestamp = str(point.get("timestamp", ""))
-    equity = _safe_float(point.get("equity"))
-    price = point.get("price")
-    cash = point.get("cash")
-    position_qty = point.get("position_qty")
-
-    conn = get_connection()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        INSERT INTO runtime_equity_snapshots (
-            run_id,
-            timestamp,
-            equity,
-            price,
-            cash,
-            position_qty,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            run_id,
-            timestamp,
-            equity,
-            price,
-            cash,
-            position_qty,
-            now,
-        ),
-    )
-    runtime_id = _safe_int(cur.lastrowid)
-
-    cur.execute(
-        """
-        INSERT INTO equity_snapshots (
-            run_id,
-            timestamp,
-            equity,
-            price,
-            cash,
-            position_qty,
-            drawdown,
-            meta_json,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            run_id,
-            timestamp,
-            equity,
-            price,
-            cash,
-            position_qty,
-            point.get("drawdown"),
-            _json_dumps(point),
-            now,
-        ),
-    )
-
-    conn.commit()
-    conn.close()
-    return runtime_id
+    _buffer_runtime_equity_point(run_id, dict(point))
+    return 0
 
 
 def load_runtime_equity_snapshots(
@@ -753,6 +995,8 @@ def load_runtime_equity_snapshots(
     offset: int = 0,
     ascending: bool = True,
 ) -> list[dict]:
+    flush_runtime_write_buffers(run_id)    
+
     order = "ASC" if ascending else "DESC"
 
     conn = get_connection()
@@ -785,6 +1029,8 @@ def load_runtime_equity_snapshots(
 
 
 def count_runtime_equity_snapshots(run_id: str) -> int:
+    flush_runtime_write_buffers(run_id)
+
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -799,6 +1045,8 @@ def count_runtime_equity_snapshots(run_id: str) -> int:
 
 
 def get_latest_paper_run() -> Optional[dict]:
+    flush_runtime_write_buffers()
+
     conn = get_connection()
     cur = conn.cursor()
 
@@ -901,6 +1149,8 @@ def load_persisted_fills(
     offset: int = 0,
     ascending: bool = False,
 ) -> list[dict]:
+    flush_runtime_write_buffers(run_id)    
+
     order = "ASC" if ascending else "DESC"
 
     conn = get_connection()
@@ -944,6 +1194,8 @@ def load_persisted_equity_snapshots(
     offset: int = 0,
     ascending: bool = True,
 ) -> list[dict]:
+    flush_runtime_write_buffers(run_id)    
+
     order = "ASC" if ascending else "DESC"
 
     conn = get_connection()
@@ -1056,6 +1308,8 @@ def list_persisted_runs(
     state: Optional[str] = None,
     strategy_name: Optional[str] = None,
 ) -> dict:
+    flush_runtime_write_buffers()
+
     safe_limit = _coerce_limit(limit, default=100, minimum=1, maximum=1000)
     safe_offset = _coerce_offset(offset, default=0)
 
@@ -1167,6 +1421,8 @@ def get_persisted_run(
     fill_preview_limit: int = 50,
     equity_preview_limit: int = 200,
 ) -> Optional[dict]:
+    flush_runtime_write_buffers(run_id)
+
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -1258,6 +1514,8 @@ def update_run_state(
     stopped_at: Optional[float] = None,
     last_error: Optional[str] = None,
 ) -> None:
+    flush_runtime_write_buffers(run_id)
+
     now = time.time()
     conn = get_connection()
     cur = conn.cursor()
@@ -1285,6 +1543,8 @@ def update_run_state(
 
 
 def delete_runtime_run(run_id: str) -> None:
+    flush_runtime_write_buffers(run_id)
+
     conn = get_connection()
     cur = conn.cursor()
 
@@ -1302,6 +1562,8 @@ def delete_runtime_run(run_id: str) -> None:
 
 
 def export_runtime_fills_csv(run_id: str) -> str:
+    flush_runtime_write_buffers(run_id)
+
     rows = load_runtime_fills(run_id=run_id, limit=1_000_000, offset=0, ascending=True)
     output = io.StringIO()
     writer = csv.writer(output)
@@ -1349,6 +1611,8 @@ def export_runtime_fills_csv(run_id: str) -> str:
 
 
 def export_runtime_equity_csv(run_id: str) -> str:
+    flush_runtime_write_buffers(run_id)
+
     rows = load_runtime_equity_snapshots(run_id=run_id, limit=1_000_000, offset=0, ascending=True)
     output = io.StringIO()
     writer = csv.writer(output)
@@ -1479,6 +1743,8 @@ def get_equity_by_run_id(run_id: str, limit: int = 5000, offset: int = 0) -> lis
 # ============================================================
 
 def get_persisted_run_row(run_id: str) -> Optional[dict]:
+    flush_runtime_write_buffers(run_id)
+
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -1518,6 +1784,8 @@ def get_persisted_run_row(run_id: str) -> Optional[dict]:
 
 
 def count_persisted_fills(run_id: str) -> int:
+    flush_runtime_write_buffers(run_id)
+
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -1534,6 +1802,8 @@ def count_persisted_fills(run_id: str) -> int:
 
 
 def count_persisted_equity_snapshots(run_id: str) -> int:
+    flush_runtime_write_buffers(run_id)
+
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -1566,6 +1836,8 @@ def _compute_max_drawdown_pct(points: list[dict]) -> float:
 
 
 def get_persisted_run_metrics(run_id: str) -> Optional[dict]:
+    flush_runtime_write_buffers(run_id)
+
     run = get_persisted_run_row(run_id)
     if run is None:
         return None
@@ -1685,6 +1957,8 @@ def get_persisted_run_metrics(run_id: str) -> Optional[dict]:
 
 
 def export_persisted_fills_csv(run_id: str) -> str:
+    flush_runtime_write_buffers(run_id)
+
     rows = load_persisted_fills(
         run_id=run_id,
         limit=1_000_000,
@@ -1733,6 +2007,8 @@ def export_persisted_fills_csv(run_id: str) -> str:
 
 
 def export_persisted_equity_csv(run_id: str) -> str:
+    flush_runtime_write_buffers(run_id)
+
     rows = load_persisted_equity_snapshots(
         run_id=run_id,
         limit=1_000_000,
