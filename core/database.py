@@ -194,7 +194,7 @@ def _insert_runtime_fills_batch_conn(
 
     cur.executemany(
         """
-        INSERT INTO runtime_fills (
+        INSERT OR IGNORE INTO runtime_fills (
             run_id,
             timestamp,
             type,
@@ -233,7 +233,7 @@ def _insert_runtime_fills_batch_conn(
 
     cur.executemany(
         """
-        INSERT INTO fills (
+        INSERT OR IGNORE INTO fills (
             run_id,
             timestamp,
             fill_type,
@@ -554,6 +554,13 @@ def init_runtime_db() -> None:
 
     cur.execute(
         """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_fills_dedupe
+        ON runtime_fills(run_id, timestamp, type, side, trade_id, price, qty)
+        """
+    )    
+
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS runtime_equity_snapshots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             run_id TEXT NOT NULL,
@@ -650,6 +657,13 @@ def init_runtime_db() -> None:
         ON fills(run_id, trade_id)
         """
     )
+
+    cur.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_fills_dedupe
+        ON fills(run_id, timestamp, fill_type, side, trade_id, price, qty)
+        """
+    )    
 
     cur.execute(
         """

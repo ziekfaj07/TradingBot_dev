@@ -1,25 +1,11 @@
 # routers/run_router.py
 from __future__ import annotations
 
-from typing import Optional
-
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
 from core.run_naming import csv_filename_from_run_id
-from core.database import (
-    count_persisted_equity_snapshots,
-    count_persisted_fills,
-    export_persisted_equity_csv,
-    export_persisted_fills_csv,
-    get_persisted_run,
-    get_persisted_run_metrics,
-    get_persisted_run_row,
-    list_persisted_runs,
-    load_persisted_equity_snapshots,
-    load_persisted_fills,
-)
 from services.mode_controller import Mode
 from services.controller_singleton import mode_controller
 
@@ -47,23 +33,19 @@ class ConfigureBody(BaseModel):
     include_equity: bool | None = None
     equity_stride: int | None = None
     poll_seconds: float | None = None
+    bar_confirmations: int | None = None
+    max_reconnect_attempts: int | None = None
+    reconnect_backoff_base: float | None = None
+    dedupe_fill_window: int | None = None
     ema_short: int | None = None
     ema_long: int | None = None
     candle_limit: int | None = None
-    strategy_name: str | None = None
-    strategy_params: dict | None = None
+    debug_stream: bool | None = None
 
 
 class DevActionBody(BaseModel):
     price: float | None = None
     note: str | None = None
-
-
-def _require_persisted_run(run_id: str) -> dict:
-    run = get_persisted_run_row(run_id)
-    if run is None:
-        raise HTTPException(status_code=404, detail="Run not found.")
-    return run
 
 
 @router.get("/status")
@@ -72,39 +54,9 @@ async def status():
 
 
 @router.get("/paper/chart")
-async def paper_chart(limit: int = Query(default=300, ge=10, le=5000)):
+async def paper_chart(limit: int = 300):
     try:
         return mode_controller.get_chart_snapshot(limit=limit)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.get("/paper/fills")
-async def paper_fills(
-    limit: int = Query(default=200, ge=1, le=5000),
-    offset: int = Query(default=0, ge=0),
-):
-    try:
-        return mode_controller.get_paper_fills(limit=limit, offset=offset)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.get("/paper/equity")
-async def paper_equity(
-    limit: int = Query(default=500, ge=1, le=10000),
-    offset: int = Query(default=0, ge=0),
-):
-    try:
-        return mode_controller.get_paper_equity(limit=limit, offset=offset)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.get("/paper/metrics")
-async def paper_metrics():
-    try:
-        return mode_controller.get_paper_metrics()
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -119,195 +71,23 @@ async def export_paper_fills_csv():
             content=csv_text,
             media_type="text/csv",
             headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Disposition": f'attachment; filename="{filename}"'
             },
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.get("/paper/equity/export.csv")
-async def export_paper_equity_csv():
+@router.get("/paper/fills")
+async def paper_fills(limit: int = 200, offset: int = 0):
     try:
-        csv_text = mode_controller.export_paper_equity_csv()
-        run_id = mode_controller.status().get("run_id") or "paper_run"
-        filename = csv_filename_from_run_id(run_id).replace(".csv", "-equity.csv")
-        return PlainTextResponse(
-            content=csv_text,
-            media_type="text/csv",
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
-            },
-        )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.get("/runs/history")
-async def runs_history(
-    limit: int = Query(default=100, ge=1, le=1000),
-    offset: int = Query(default=0, ge=0),
-    mode: Optional[str] = Query(default=None),
-    symbol: Optional[str] = Query(default=None),
-    state: Optional[str] = Query(default=None),
-    strategy_name: Optional[str] = Query(default=None),
-):
-    try:
-        return list_persisted_runs(
-            limit=limit,
-            offset=offset,
-            mode=mode,
-            symbol=symbol,
-            state=state,
-            strategy_name=strategy_name,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.get("/runs/history/{run_id}")
-async def run_history_detail(
-    run_id: str,
-    fill_preview_limit: int = Query(default=50, ge=1, le=500),
-    equity_preview_limit: int = Query(default=200, ge=1, le=1000),
-):
-    try:
-        run = get_persisted_run(
-            run_id=run_id,
-            fill_preview_limit=fill_preview_limit,
-            equity_preview_limit=equity_preview_limit,
-        )
-        if run is None:
-            raise HTTPException(status_code=404, detail="Run not found.")
-        return run
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-# ============================================================
-# v0.5.3 Query Layer
-# ============================================================
-
-@router.get("/runs/{run_id}/fills")
-async def get_run_fills(
-    run_id: str,
-    limit: int = Query(default=200, ge=1, le=10000),
-    offset: int = Query(default=0, ge=0),
-    order: str = Query(default="desc"),
-):
-    try:
-        _require_persisted_run(run_id)
-        ascending = order.lower() == "asc"
-        rows = load_persisted_fills(
-            run_id=run_id,
-            limit=limit,
-            offset=offset,
-            ascending=ascending,
-        )
-        total = count_persisted_fills(run_id)
-        return {
-            "run_id": run_id,
-            "total": total,
-            "limit": limit,
-            "offset": offset,
-            "order": "asc" if ascending else "desc",
-            "fills": rows,
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.get("/runs/{run_id}/equity")
-async def get_run_equity(
-    run_id: str,
-    limit: int = Query(default=500, ge=1, le=20000),
-    offset: int = Query(default=0, ge=0),
-    order: str = Query(default="asc"),
-):
-    try:
-        _require_persisted_run(run_id)
-        ascending = order.lower() != "desc"
-        rows = load_persisted_equity_snapshots(
-            run_id=run_id,
-            limit=limit,
-            offset=offset,
-            ascending=ascending,
-        )
-        total = count_persisted_equity_snapshots(run_id)
-        return {
-            "run_id": run_id,
-            "total": total,
-            "limit": limit,
-            "offset": offset,
-            "order": "asc" if ascending else "desc",
-            "points": rows,
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.get("/runs/{run_id}/metrics")
-async def get_run_metrics(run_id: str):
-    try:
-        metrics = get_persisted_run_metrics(run_id)
-        if metrics is None:
-            raise HTTPException(status_code=404, detail="Run not found.")
-        return metrics
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.get("/runs/{run_id}/export/fills.csv")
-async def export_run_fills_csv(run_id: str):
-    try:
-        _require_persisted_run(run_id)
-        csv_text = export_persisted_fills_csv(run_id)
-        filename = csv_filename_from_run_id(run_id)
-        return PlainTextResponse(
-            content=csv_text,
-            media_type="text/csv",
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
-            },
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.get("/runs/{run_id}/export/equity.csv")
-async def export_run_equity_csv(run_id: str):
-    try:
-        _require_persisted_run(run_id)
-        csv_text = export_persisted_equity_csv(run_id)
-        filename = csv_filename_from_run_id(run_id).replace(".csv", "-equity.csv")
-        return PlainTextResponse(
-            content=csv_text,
-            media_type="text/csv",
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
-            },
-        )
-    except HTTPException:
-        raise
+        return mode_controller.get_paper_fills(limit=limit, offset=offset)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/paper/dev/trace")
-async def paper_trace(
-    limit: int = Query(default=200, ge=1, le=1000),
-    offset: int = Query(default=0, ge=0),
-):
+async def paper_trace(limit: int = 200, offset: int = 0):
     try:
         return mode_controller.get_trace(limit=limit, offset=offset)
     except Exception as e:

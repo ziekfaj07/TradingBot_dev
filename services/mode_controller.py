@@ -72,6 +72,10 @@ class RunConfig:
     include_equity: bool = False
     equity_stride: int = 1
     poll_seconds: float = 5.0
+    bar_confirmations: int = 1
+    max_reconnect_attempts: int = 8
+    reconnect_backoff_base: float = 1.5
+    dedupe_fill_window: int = 20
 
     # legacy EMA field kept for backward compatibility
     ema_short: int = 9
@@ -82,6 +86,8 @@ class RunConfig:
     strategy_params: dict = field(default_factory=dict)
 
     candle_limit: int = 300
+
+    debug_stream: bool = True
 
 
 @dataclass
@@ -119,6 +125,10 @@ class ModeController:
         self._fills: list[Fill] = []
         self._equity_points: list[dict] = []
         self._trace: list[dict] = []
+        self._recent_fill_keys: list[str] = []
+        self._recent_fill_key_set: set[str] = set()
+        self._reconnect_attempts: int = 0
+        self._last_fetch_error: str | None = None    
 
         init_runtime_db()
         self._restore_paper_session()
@@ -485,6 +495,8 @@ class ModeController:
             "paper_metrics": self._build_metrics_payload(),
             "chart_symbol": cfg.get("symbol"),
             "chart_interval": cfg.get("interval"),
+            "reconnect_attempts": self._reconnect_attempts,
+            "last_fetch_error": self._last_fetch_error,            
         }
 
         return {
@@ -648,6 +660,87 @@ class ModeController:
             "offset": offset,
             "events": sliced,
         }
+
+    def _fill_dedupe_key(self, fill: Fill | dict) -> str:
+        data = fill.to_dict() if hasattr(fill, "to_dict") else dict(fill or {})
+        return "|".join(
+            [
+                str(self._status.run_id or ""),
+                str(data.get("timestamp", "")),
+                str(data.get("type", "")),
+                str(data.get("side", "")),
+                str(data.get("trade_id", "")),
+                f"{float(data.get('price', 0.0)):.12f}",
+                f"{float(data.get('qty', 0.0)):.12f}",
+            ]
+        )
+
+    def _remember_fill_key(self, key: str) -> None:
+        if key in self._recent_fill_key_set:
+            return
+
+        self._recent_fill_keys.append(key)
+        self._recent_fill_key_set.add(key)
+
+        max_keys = max(5, int(self._status.config.dedupe_fill_window or 20))
+        while len(self._recent_fill_keys) > max_keys:
+            old = self._recent_fill_keys.pop(0)
+            self._recent_fill_key_set.discard(old)
+
+    def _is_duplicate_fill(self, fill: Fill | dict) -> bool:
+        key = self._fill_dedupe_key(fill)
+        return key in self._recent_fill_key_set
+
+    async def _sleep_or_stop(self, seconds: float) -> None:
+        timeout = max(0.05, float(seconds))
+        try:
+            await asyncio.wait_for(self._stop_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return
+
+    def _stable_bars_for_signal(self, bars: list[dict]) -> tuple[list[dict], int | None]:
+        confirmations = max(1, int(self._status.config.bar_confirmations or 1))
+        if len(bars) <= confirmations:
+            return [], None
+
+        stable_bars = bars[:-confirmations]
+        processed_ts = stable_bars[-1]["timestamp"] if stable_bars else None
+        return stable_bars, processed_ts
+
+    async def _append_fill(self, fill: Fill | dict) -> dict:
+        fill_obj = fill if isinstance(fill, Fill) else Fill.from_dict(fill)
+        if fill_obj is None:
+            raise RuntimeError("Cannot append empty fill.")
+
+        payload = fill_obj.to_dict()
+
+        if self._is_duplicate_fill(payload):
+            await self._broadcast_trace_event(
+                "duplicate_fill_ignored",
+                note="Skipped duplicate paper fill.",
+                data={
+                    "fill": payload,
+                    "run_id": self._status.run_id,
+                },
+            )
+            return payload
+
+        self._fills.append(fill_obj)
+        if len(self._fills) > 5000:
+            self._fills = self._fills[-5000:]
+
+        self._remember_fill_key(self._fill_dedupe_key(payload))
+
+        if self._status.run_id:
+            insert_runtime_fill(self._status.run_id, payload)
+
+        await ws_manager.broadcast(
+            {
+                "type": "fill",
+                "data": payload,
+            }
+        )
+        return payload
 
     async def force_buy(self, price: float | None = None, note: str | None = None) -> dict:
         async with self._lock:
@@ -1316,16 +1409,20 @@ class ModeController:
             self._status.state = EngineState(restored_state_value)
 
     def _reset_runtime_memory(self) -> None:
+        self._engine = None
+        self._state = None
+        self._trade_id = 0
         self._latest_bar = None
         self._bars = []
         self._last_processed_bar_ts = None
         self._last_signal = 0
-        self._trade_id = 0
         self._fills = []
         self._equity_points = []
         self._trace = []
-        self._state = None
-        self._engine = None
+        self._recent_fill_keys = []
+        self._recent_fill_key_set = set()
+        self._reconnect_attempts = 0
+        self._last_fetch_error = None
 
     def _build_runtime_objects(self) -> None:
         cfg = self._status.config
@@ -1652,5 +1749,135 @@ class ModeController:
                 )
                 if fill:
                     await self._append_fill(fill)
+
+    async def _run_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                cfg = self._status.config
+
+                bars = await asyncio.to_thread(
+                    self._fetch_recent_bars,
+                    cfg.symbol,
+                    cfg.interval,
+                    max(50, int(cfg.candle_limit or 300)),
+                )
+
+                if not bars:
+                    raise RuntimeError("No bars returned from market data service.")
+
+                self._reconnect_attempts = 0
+                self._last_fetch_error = None
+
+                latest_bar = bars[-1]
+                self._latest_bar = latest_bar
+                self._bars = bars[-max(1000, int(cfg.candle_limit or 300)) :]
+
+                latest_price = float(latest_bar["close"])
+                await self._mark_to_market(latest_price)
+
+                if bool(getattr(cfg, "debug_stream", False)):
+                    print(
+                        "[paper-loop]",
+                        f"run_id={self._status.run_id}",
+                        f"symbol={cfg.symbol}",
+                        f"interval={cfg.interval}",
+                        f"bar_ts={latest_bar.get('timestamp')}",
+                        f"close={latest_price}",
+                        f"position_qty={self._state.position_qty if self._state else 0.0}",
+                        f"signal={self._last_signal}",
+                        flush=True,
+                    )
+
+                stable_bars, processed_ts = self._stable_bars_for_signal(bars)
+
+                if (
+                    processed_ts is not None
+                    and (
+                        self._last_processed_bar_ts is None
+                        or int(processed_ts) > int(self._last_processed_bar_ts)
+                    )
+                ):
+                    signal = int(self._latest_signal_from_bars(stable_bars, cfg))
+                    self._last_signal = signal
+                    self._last_processed_bar_ts = int(processed_ts)
+
+                    if self._state is not None and self._engine is not None:
+                        fill = None
+
+                        if signal > 0 and float(self._state.position_qty) <= 0.0:
+                            self._trade_id += 1
+                            self._state, fill = self._engine.enter_long(
+                                ts_iso=str(int(processed_ts)),
+                                state=self._state,
+                                close=latest_price,
+                                market_type=cfg.market_type,
+                                leverage=cfg.leverage,
+                                trade_id=self._trade_id,
+                            )
+                        elif signal < 0 and float(self._state.position_qty) > 0.0:
+                            self._state, fill = self._engine.exit_long(
+                                ts_iso=str(int(processed_ts)),
+                                state=self._state,
+                                close=latest_price,
+                                market_type=cfg.market_type,
+                                trade_id=self._trade_id,
+                            )
+
+                        if fill is not None:
+                            await self._append_fill(fill)
+                            await self._broadcast_trace_event(
+                                "signal_fill",
+                                data={
+                                    "signal": signal,
+                                    "processed_bar_ts": int(processed_ts),
+                                    "price": latest_price,
+                                    "trade_id": getattr(fill, "trade_id", None),
+                                    "fill_type": getattr(fill, "type", None),
+                                },
+                            )
+
+                self._persist_status()
+                self._persist_snapshot()
+                await self._sleep_or_stop(cfg.poll_seconds)
+
+            except Exception as e:
+                self._reconnect_attempts += 1
+                self._last_fetch_error = str(e)
+
+                self._persist_status()
+                self._persist_snapshot()
+
+                await self._broadcast_trace_event(
+                    "reconnect_wait",
+                    note="Paper loop fetch/process error. Retrying.",
+                    data={
+                        "attempt": self._reconnect_attempts,
+                        "error": str(e),
+                    },
+                )
+
+                max_attempts = max(1, int(self._status.config.max_reconnect_attempts or 8))
+                backoff_base = max(1.0, float(self._status.config.reconnect_backoff_base or 1.5))
+
+                if self._reconnect_attempts >= max_attempts:
+                    self._status.state = EngineState.ERROR
+                    self._status.last_error = (
+                        f"Paper loop stopped after {self._reconnect_attempts} reconnect attempts: {e}"
+                    )
+                    self._persist_status()
+                    self._persist_snapshot()
+
+                    await self._broadcast_trace_event(
+                        "paper_error",
+                        note="Reconnect limit reached. Paper loop stopped.",
+                        data={
+                            "attempts": self._reconnect_attempts,
+                            "error": str(e),
+                        },
+                    )
+                    return
+
+                delay = min(30.0, backoff_base ** max(0, self._reconnect_attempts - 1))
+                await self._sleep_or_stop(delay)
 
 mode_controller = ModeController()
