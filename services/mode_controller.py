@@ -682,7 +682,7 @@ class ModeController:
         self._recent_fill_keys.append(key)
         self._recent_fill_key_set.add(key)
 
-        max_keys = max(5, int(self._status.config.dedupe_fill_window or 20))
+        max_keys = 20 # max(5, int(self._status.config.dedupe_fill_window or 20))
         while len(self._recent_fill_keys) > max_keys:
             old = self._recent_fill_keys.pop(0)
             self._recent_fill_key_set.discard(old)
@@ -744,28 +744,57 @@ class ModeController:
 
     async def force_buy(self, price: float | None = None, note: str | None = None) -> dict:
         async with self._lock:
-            self._ensure_manual_paper_runtime_locked()
+            if self._status.mode != Mode.PAPER:
+                raise RuntimeError("Force buy is only allowed in paper mode.")
 
-            if self._state is None or self._engine is None:
+            if self._status.state not in (EngineState.RUNNING, EngineState.IDLE):
+                raise RuntimeError("Force buy requires paper mode to be idle or running.")
+
+            if self._engine is None or self._state is None:
+                self._build_runtime_objects()
+
+            if self._engine is None or self._state is None:
                 raise RuntimeError("Paper runtime is not initialized.")
 
-            if self._state.position_qty > 0:
-                raise RuntimeError("Already in a long position.")
+            if float(self._state.position_qty or 0.0) > 0.0:
+                raise RuntimeError("Cannot force buy: a long position is already open.")
 
-            resolved_price = await self._resolve_reference_price_locked(price)
+            resolved_price: float | None = None
 
-            if self._state.position_qty < 0:
-                self._state, fill = self._engine.liquidate(
-                    ts_iso=str(int(time.time())),
-                    state=self._state,
-                    close=resolved_price,
-                    market_type=self._status.config.market_type,
-                    trade_id=self._trade_id,
-                )
-                if fill:
-                    await self._append_fill(fill)
+            # 1) explicit request price wins
+            if price is not None:
+                resolved_price = float(price)
+
+            # 2) latest in-memory bar
+            if resolved_price is None and self._latest_bar:
+                try:
+                    resolved_price = float(self._latest_bar.get("close"))
+                except (TypeError, ValueError):
+                    resolved_price = None
+
+            # 3) latest buffered bars
+            if resolved_price is None and self._bars:
+                try:
+                    resolved_price = float(self._bars[-1].get("close"))
+                except (TypeError, ValueError):
+                    resolved_price = None
+
+            # 4) live market fallback
+            if resolved_price is None:
+                live = self.market_data.get_price(self._status.config.symbol)
+                if isinstance(live, dict) and live.get("price_usd") is not None:
+                    resolved_price = float(live["price_usd"])
+
+            if resolved_price is None or resolved_price <= 0:
+                raise RuntimeError("Force buy could not resolve a valid execution price.")
 
             self._trade_id += 1
+
+            prev_cash = float(self._state.cash or 0.0)
+            prev_qty = float(self._state.position_qty or 0.0)
+            max_qty = float(self._status.config.max_qty or 0.0)
+            leverage = float(self._status.config.leverage or 1.0)
+
             self._state, fill = self._engine.enter_long(
                 ts_iso=str(int(time.time())),
                 state=self._state,
@@ -775,8 +804,12 @@ class ModeController:
                 trade_id=self._trade_id,
             )
 
-            if not fill:
-                raise RuntimeError("Force buy did not produce a fill.")
+            if fill is None:
+                raise RuntimeError(
+                    "Force buy did not produce a fill. "
+                    f"price={resolved_price}, cash={prev_cash}, "
+                    f"position_qty={prev_qty}, max_qty={max_qty}, leverage={leverage}"
+                )
 
             await self._append_fill(fill)
             await self._mark_to_market(resolved_price)
@@ -785,13 +818,14 @@ class ModeController:
 
             await self._broadcast_trace_event(
                 "force_buy",
-                note=note or "Manual paper buy executed.",
+                note=note or "Manual force buy executed.",
                 data={
                     "price": resolved_price,
-                    "trade_id": self._trade_id,
-                    "position_qty": self._state.position_qty,
+                    "trade_id": getattr(fill, "trade_id", None),
+                    "run_id": self._status.run_id,
                 },
             )
+
             return self.status()
 
     async def force_sell(self, price: float | None = None, note: str | None = None) -> dict:
