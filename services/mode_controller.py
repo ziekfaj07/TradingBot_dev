@@ -854,11 +854,11 @@ class ModeController:
             ):
                 raise RuntimeError("Stop paper trading before resetting it.")
 
-            old_run_id = self._status.run_id
+            previous_run_id = self._status.run_id
 
-            if old_run_id:
-                delete_runtime_run(old_run_id)
-
+            # IMPORTANT:
+            # Do NOT delete persisted history here.
+            # Reset should clear only the active controller/runtime state.
             self._status = RunStatus(mode=Mode.PAPER)
             self._stop_event = asyncio.Event()
             self._task = None
@@ -868,15 +868,18 @@ class ModeController:
             self._status.started_at = None
             self._status.stopped_at = None
             self._status.run_id = None
+            self._status.run_label = None
 
             await ws_manager.broadcast({
                 "type": "trace",
                 "data": {
                     "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
                     "event": "trace_cleared",
-                    "note": "Paper reset cleared runtime trace.",
+                    "note": "Paper reset cleared active runtime state. Persisted run history was preserved.",
                     "run_id": None,
-                    "data": {},
+                    "data": {
+                        "previous_run_id": previous_run_id,
+                    },
                 },
             })
 
