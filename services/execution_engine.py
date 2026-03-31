@@ -119,7 +119,13 @@ class ExecutionEngine:
 
     # ---------- Risk / liquidation ----------
 
-    def compute_liquidation_price(self, state: PortfolioState, market_type: str, market_price: float, leverage: float) -> bool:
+    def compute_liquidation_price(
+        self,
+        state: PortfolioState,
+        market_type: str,
+        market_price: float,
+        leverage: float,
+    ) -> bool:
         mt = (market_type or "spot").lower()
         if mt != "futures":
             return False
@@ -150,6 +156,7 @@ class ExecutionEngine:
         market_type: str,
         leverage: float,
         trade_id: int,
+        qty_override: float | None = None,
     ) -> Tuple[PortfolioState, Optional[Fill]]:
         mt = (market_type or "spot").lower()
         buy_px = self.apply_slippage(close, is_buy=True)
@@ -159,20 +166,43 @@ class ExecutionEngine:
             return state, None
 
         entry_trade_id = int(trade_id)
+        requested_qty = None
+        if qty_override is not None:
+            try:
+                requested_qty = float(qty_override)
+            except (TypeError, ValueError):
+                requested_qty = None
+
+        if requested_qty is not None and (requested_qty <= 0 or not math.isfinite(requested_qty)):
+            return state, None
+
+        fee = 0.0
 
         if mt == "spot":
-            # Spend all cash
-            notional = float(state.cash)
-            fee = notional * self.fee_rate
-            notional_after_fee = max(0.0, notional - fee)
+            if requested_qty is None:
+                # Spend all cash (legacy all-in behavior)
+                notional = float(state.cash)
+                fee = notional * self.fee_rate
+                notional_after_fee = max(0.0, notional - fee)
+                qty = notional_after_fee / buy_px
+                remaining_cash = 0.0
+            else:
+                qty = float(requested_qty)
+                gross_cost_after_fee = qty * buy_px
+                if self.fee_rate >= 1.0:
+                    return state, None
+                fee = gross_cost_after_fee * self.fee_rate / max(1e-12, (1.0 - self.fee_rate))
+                total_cash_needed = gross_cost_after_fee + fee
+                if total_cash_needed > float(state.cash) + 1e-12:
+                    return state, None
+                remaining_cash = max(0.0, float(state.cash) - total_cash_needed)
 
-            qty = notional_after_fee / buy_px
             # QTY SAFETY
-            if (not math.isfinite(qty)) or abs(qty) > self.max_qty:
+            if (not math.isfinite(qty)) or qty <= 0.0 or abs(qty) > self.max_qty:
                 return state, None
 
             state.position_qty = float(qty)
-            state.cash = 0.0
+            state.cash = float(remaining_cash)
             state.entry_price = float(buy_px)
             state.side = "long"
 
@@ -181,24 +211,30 @@ class ExecutionEngine:
             # Notional exposure = wallet_cash * leverage
             lev = min(max(float(leverage), 1.0), self.max_leverage)
 
-            notional = float(state.cash) * lev
-            fee = notional * self.fee_rate
+            if requested_qty is None:
+                notional = float(state.cash) * lev
+                fee = notional * self.fee_rate
+                qty = notional / buy_px
+            else:
+                qty = float(requested_qty)
+                notional = qty * buy_px
+                fee = notional * self.fee_rate
+                if fee > float(state.cash) + 1e-12:
+                    return state, None
 
-            qty = notional / buy_px
             # QTY SAFETY
-            if (not math.isfinite(qty)) or abs(qty) > self.max_qty:
+            if (not math.isfinite(qty)) or qty <= 0.0 or abs(qty) > self.max_qty:
                 return state, None
 
             # Pay fee from wallet
             state.cash = max(0.0, float(state.cash) - fee)
-
             state.position_qty = float(qty)
             state.entry_price = float(buy_px)
             state.side = "long"
 
         self._set_active_trade_id(state, entry_trade_id)
-
         eq_after = self.mark_equity(state, mt, close)
+
         fill = Fill(
             timestamp=ts_iso,
             type="ENTRY",
@@ -244,7 +280,8 @@ class ExecutionEngine:
             gross_pnl = float(exit_qty) * (float(sell_px) - entry_px)
             net_pnl = float(gross_pnl - entry_fee - fee)
 
-            state.cash = float(notional - fee)
+            # Keep any residual idle cash from partial/fixed-size entries.
+            state.cash = float(state.cash) + float(notional - fee)
 
         else:
             # Futures (linear): realize PnL into wallet, then pay exit fee
@@ -320,7 +357,8 @@ class ExecutionEngine:
             gross_pnl = float(exit_qty) * (float(exit_px) - entry_px)
             net_pnl = float(gross_pnl - entry_fee - fee)
 
-            state.cash = float(notional - fee)
+            # Keep any residual idle cash from partial/fixed-size entries.
+            state.cash = float(state.cash) + float(notional - fee)
         else:
             # Futures linear: realize pnl and pay fee
             gross_pnl = float(exit_qty) * (float(exit_px) - entry_px)

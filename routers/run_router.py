@@ -42,6 +42,16 @@ class ConfigureBody(BaseModel):
     candle_limit: int | None = None
     debug_stream: bool | None = None
 
+    position_sizing_mode: str | None = None
+    position_size_value: float | None = None
+
+    max_drawdown_pct: float | None = None
+    max_trades_per_day: int | None = None
+    cooldown_seconds: int | None = None
+
+    stop_loss_pct: float | None = None
+    take_profit_pct: float | None = None
+
 
 class DevActionBody(BaseModel):
     price: float | None = None

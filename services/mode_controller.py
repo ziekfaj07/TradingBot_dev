@@ -12,7 +12,6 @@ from typing import Optional
 import pandas as pd
 
 from core.binance_vision_provider import BinanceVisionProvider
-
 from core.database import (
     count_runtime_equity_snapshots,
     count_runtime_fills,
@@ -30,15 +29,15 @@ from core.database import (
     update_run_state,
     upsert_runtime_run,
 )
-
 from core.execution_models import Fill, PortfolioState
 from core.run_naming import make_run_id
-
 from services.execution_engine import ExecutionEngine
 from services.market_data_service import CoinGeckoService, GateIOService
+from services.risk_engine import RiskEngine
 from services.runner import run_signal_backed_loop
 from services.strategy_engine import StrategyEngine
 from services.ws_manager import ws_manager
+
 
 class Mode(str, Enum):
     BACKTEST = "backtest"
@@ -69,6 +68,17 @@ class RunConfig:
     maintenance_margin: float = 0.005
     max_leverage: float = 50.0
     max_qty: float = 10.0
+
+    position_sizing_mode: str = "all_in"
+    position_size_value: float | None = None
+
+    max_drawdown_pct: float | None = None
+    max_trades_per_day: int | None = None
+    cooldown_seconds: int = 0
+
+    stop_loss_pct: float | None = None
+    take_profit_pct: float | None = None
+
     include_equity: bool = False
     equity_stride: int = 1
     poll_seconds: float = 5.0
@@ -77,16 +87,15 @@ class RunConfig:
     reconnect_backoff_base: float = 1.5
     dedupe_fill_window: int = 20
 
-    # legacy EMA field kept for backward compatibility
+    # legacy EMA fields kept for backward compatibility
     ema_short: int = 9
     ema_long: int = 21
 
-    #v0.4.5 generic strategy selection
+    # v0.4.5 generic strategy selection
     strategy_name: str = "ema_crossover"
     strategy_params: dict = field(default_factory=dict)
 
     candle_limit: int = 300
-
     debug_stream: bool = True
 
 
@@ -125,10 +134,18 @@ class ModeController:
         self._fills: list[Fill] = []
         self._equity_points: list[dict] = []
         self._trace: list[dict] = []
+
+        self._risk_engine = RiskEngine()
+        self._peak_equity: float = 0.0
+        self._trades_today: int = 0
+        self._trade_day_key: str | None = None
+        self._last_exit_ts: float | None = None
+        self._risk_halt_reason: str | None = None
+
         self._recent_fill_keys: list[str] = []
         self._recent_fill_key_set: set[str] = set()
         self._reconnect_attempts: int = 0
-        self._last_fetch_error: str | None = None    
+        self._last_fetch_error: str | None = None
 
         init_runtime_db()
         self._restore_paper_session()
@@ -154,13 +171,9 @@ class ModeController:
 
             config_dict = asdict(self._status.config)
 
-            # IMPORTANT:
-            # If we are re-configuring while still bound to an old idle paper run,
-            # detach first so the new config does not overwrite old persisted run data.
             if self._status.mode == Mode.PAPER:
                 self._prepare_fresh_idle_config_locked()
 
-            # --- Resolve strategy name ---
             strategy_name = (
                 kwargs.get("strategy_name")
                 or self._status.config.strategy_name
@@ -168,13 +181,9 @@ class ModeController:
             )
             strategy_name = str(strategy_name).strip().lower()
 
-            # --- Incoming params ---
             incoming = dict(kwargs.get("strategy_params", {}) or {})
-
-            # --- Remove Swagger junk ---
             incoming.pop("additionalProp1", None)
 
-            # --- Normalize common typos ---
             if "look_back" in incoming:
                 incoming["lookback"] = incoming.pop("look_back")
 
@@ -183,24 +192,18 @@ class ModeController:
                     "confirm_break_previous_extreme"
                 )
 
-            # --- Fold legacy EMA fields ---
             if kwargs.get("ema_short") is not None:
                 incoming["short"] = int(kwargs["ema_short"])
             if kwargs.get("ema_long") is not None:
                 incoming["long"] = int(kwargs["ema_long"])
 
-            # --- Strategy-specific cleaning ---
             if strategy_name == "ema_crossover":
                 clean = {
                     "short": int(incoming.get("short", 9)),
                     "long": int(incoming.get("long", 21)),
                 }
-
             elif strategy_name == "donchian_breakout":
-                clean = {
-                    "lookback": int(incoming.get("lookback", 20))
-                }
-
+                clean = {"lookback": int(incoming.get("lookback", 20))}
             elif strategy_name == "three_candle_reversal":
                 clean = {
                     "min_body_ratio": float(incoming.get("min_body_ratio", 0.55)),
@@ -211,12 +214,9 @@ class ModeController:
                         incoming.get("confirm_break_prev_extreme", True)
                     ),
                 }
-
             else:
-                # fallback for future strategies
                 clean = incoming
 
-            # --- Apply updates ---
             kwargs["strategy_name"] = strategy_name
             kwargs["strategy_params"] = clean
 
@@ -225,10 +225,6 @@ class ModeController:
                     setattr(self._status.config, key, value)
 
             self._status.last_error = None
-
-            # IMPORTANT:
-            # Do not persist status/snapshot here when no run_id exists.
-            # start() will generate a fresh run_id and persist the new run cleanly.
             self._persist_status()
             self._persist_snapshot()
             return self.status()
@@ -242,7 +238,9 @@ class ModeController:
     ) -> None:
         cfg = cfg or self._status.config
         effective_mode = mode or self._status.mode
-        effective_started_at = started_at if started_at is not None else self._status.started_at
+        effective_started_at = (
+            started_at if started_at is not None else self._status.started_at
+        )
 
         if effective_started_at is None:
             effective_started_at = time.time()
@@ -265,7 +263,6 @@ class ModeController:
         params = dict(getattr(cfg, "strategy_params", {}) or {})
         strategy_name = self._resolved_strategy_name_from_config(cfg)
 
-        # backward compatibility for old EMA config fields
         if strategy_name == "ema_crossover":
             params.setdefault("short", int(getattr(cfg, "ema_short", 9)))
             params.setdefault("long", int(getattr(cfg, "ema_long", 21)))
@@ -273,19 +270,11 @@ class ModeController:
         return params
 
     def _prepare_fresh_idle_config_locked(self) -> None:
-        """
-        When re-configuring while idle, detach from any previously bound paper run
-        so the new config does not overwrite old persisted history.
-
-        This preserves historical runs and ensures the next start() generates a new
-        run_id from the new config.
-        """
         self._status.run_id = None
         self._status.run_label = None
         self._status.started_at = None
         self._status.stopped_at = None
         self._status.last_error = None
-
         self._reset_runtime_memory()
 
     def _apply_strategy_to_df(self, df: pd.DataFrame, cfg: RunConfig) -> pd.DataFrame:
@@ -322,14 +311,12 @@ class ModeController:
             self._status.stopped_at = None
             self._status.last_error = None
 
-            # Always generate a fresh identity from the CURRENT config when starting.
             self._refresh_run_identity(
                 self._status.config,
                 started_at=self._status.started_at,
                 mode=self._status.mode,
             )
 
-            # Start a clean runtime for the current config/run identity.
             self._reset_runtime_memory()
             self._build_runtime_objects()
 
@@ -401,7 +388,6 @@ class ModeController:
             self._status.stopped_at = None
             self._status.last_error = None
 
-            # Backtest response/status should reflect the EFFECTIVE backtest config.
             self._refresh_run_identity(
                 cfg,
                 started_at=self._status.started_at,
@@ -452,6 +438,14 @@ class ModeController:
                 leverage=cfg.leverage,
                 include_equity=cfg.include_equity,
                 equity_stride=cfg.equity_stride,
+                risk_engine=self._risk_engine,
+                position_sizing_mode=cfg.position_sizing_mode,
+                position_size_value=cfg.position_size_value,
+                max_drawdown_pct=cfg.max_drawdown_pct,
+                max_trades_per_day=cfg.max_trades_per_day,
+                cooldown_seconds=cfg.cooldown_seconds,
+                stop_loss_pct=cfg.stop_loss_pct,
+                take_profit_pct=cfg.take_profit_pct,
             )
 
             async with self._lock:
@@ -466,6 +460,7 @@ class ModeController:
                     "liquidated": output.liquidated,
                     "trades": output.trades,
                     "equity_curve": output.equity_curve,
+                    "risk_events": output.risk_events,
                 },
             }
 
@@ -496,7 +491,8 @@ class ModeController:
             "chart_symbol": cfg.get("symbol"),
             "chart_interval": cfg.get("interval"),
             "reconnect_attempts": self._reconnect_attempts,
-            "last_fetch_error": self._last_fetch_error,            
+            "last_fetch_error": self._last_fetch_error,
+            "risk": self._build_risk_payload(),
         }
 
         return {
@@ -523,7 +519,7 @@ class ModeController:
 
         try:
             return {
-                "time": int(bar["timestamp"]),   # lightweight-charts wants UNIX seconds
+                "time": int(bar["timestamp"]),
                 "open": float(bar["open"]),
                 "high": float(bar["high"]),
                 "low": float(bar["low"]),
@@ -537,10 +533,7 @@ class ModeController:
         cfg = self._status.config
         effective_limit = max(10, int(limit or cfg.candle_limit or 300))
 
-        # Prefer in-memory bars when available so chart matches current paper session exactly.
         bars = self._bars[-effective_limit:] if self._bars else []
-
-        # If engine is idle or bars are empty, bootstrap from market data using current config.
         if not bars:
             bars = self._fetch_recent_bars(
                 symbol=cfg.symbol,
@@ -682,7 +675,7 @@ class ModeController:
         self._recent_fill_keys.append(key)
         self._recent_fill_key_set.add(key)
 
-        max_keys = 20 # max(5, int(self._status.config.dedupe_fill_window or 20))
+        max_keys = max(5, int(self._status.config.dedupe_fill_window or 20))
         while len(self._recent_fill_keys) > max_keys:
             old = self._recent_fill_keys.pop(0)
             self._recent_fill_key_set.discard(old)
@@ -707,41 +700,6 @@ class ModeController:
         processed_ts = stable_bars[-1]["timestamp"] if stable_bars else None
         return stable_bars, processed_ts
 
-    async def _append_fill(self, fill: Fill | dict) -> dict:
-        fill_obj = fill if isinstance(fill, Fill) else Fill.from_dict(fill)
-        if fill_obj is None:
-            raise RuntimeError("Cannot append empty fill.")
-
-        payload = fill_obj.to_dict()
-
-        if self._is_duplicate_fill(payload):
-            await self._broadcast_trace_event(
-                "duplicate_fill_ignored",
-                note="Skipped duplicate paper fill.",
-                data={
-                    "fill": payload,
-                    "run_id": self._status.run_id,
-                },
-            )
-            return payload
-
-        self._fills.append(fill_obj)
-        if len(self._fills) > 5000:
-            self._fills = self._fills[-5000:]
-
-        self._remember_fill_key(self._fill_dedupe_key(payload))
-
-        if self._status.run_id:
-            insert_runtime_fill(self._status.run_id, payload)
-
-        await ws_manager.broadcast(
-            {
-                "type": "fill",
-                "data": payload,
-            }
-        )
-        return payload
-
     async def force_buy(self, price: float | None = None, note: str | None = None) -> dict:
         async with self._lock:
             if self._status.mode != Mode.PAPER:
@@ -761,25 +719,21 @@ class ModeController:
 
             resolved_price: float | None = None
 
-            # 1) explicit request price wins
             if price is not None:
                 resolved_price = float(price)
 
-            # 2) latest in-memory bar
             if resolved_price is None and self._latest_bar:
                 try:
                     resolved_price = float(self._latest_bar.get("close"))
                 except (TypeError, ValueError):
                     resolved_price = None
 
-            # 3) latest buffered bars
             if resolved_price is None and self._bars:
                 try:
                     resolved_price = float(self._bars[-1].get("close"))
                 except (TypeError, ValueError):
                     resolved_price = None
 
-            # 4) live market fallback
             if resolved_price is None:
                 live = self.market_data.get_price(self._status.config.symbol)
                 if isinstance(live, dict) and live.get("price_usd") is not None:
@@ -788,13 +742,17 @@ class ModeController:
             if resolved_price is None or resolved_price <= 0:
                 raise RuntimeError("Force buy could not resolve a valid execution price.")
 
-            self._trade_id += 1
-
             prev_cash = float(self._state.cash or 0.0)
             prev_qty = float(self._state.position_qty or 0.0)
             max_qty = float(self._status.config.max_qty or 0.0)
             leverage = float(self._status.config.leverage or 1.0)
 
+            gate = self._check_entry_gate_locked(resolved_price)
+            if not gate["allowed"]:
+                self._risk_halt_reason = gate["reason"]
+                raise RuntimeError(f"Risk gate blocked entry: {gate['reason']}")
+
+            self._trade_id += 1
             self._state, fill = self._engine.enter_long(
                 ts_iso=str(int(time.time())),
                 state=self._state,
@@ -802,6 +760,7 @@ class ModeController:
                 market_type=self._status.config.market_type,
                 leverage=self._status.config.leverage,
                 trade_id=self._trade_id,
+                qty_override=self._compute_entry_qty_locked(resolved_price),
             )
 
             if fill is None:
@@ -947,10 +906,7 @@ class ModeController:
         data: dict | None = None,
     ) -> dict:
         entry = self._append_trace_event(event=event, note=note, data=data)
-        await ws_manager.broadcast({
-            "type": "trace",
-            "data": entry,
-        })
+        await ws_manager.broadcast({"type": "trace", "data": entry})
         return entry
 
     def _ensure_manual_paper_runtime_locked(self) -> None:
@@ -1009,9 +965,6 @@ class ModeController:
 
             previous_run_id = self._status.run_id
 
-            # IMPORTANT:
-            # Do NOT delete persisted history here.
-            # Reset should clear only the active controller/runtime state.
             self._status = RunStatus(mode=Mode.PAPER)
             self._stop_event = asyncio.Event()
             self._task = None
@@ -1023,18 +976,20 @@ class ModeController:
             self._status.run_id = None
             self._status.run_label = None
 
-            await ws_manager.broadcast({
-                "type": "trace",
-                "data": {
-                    "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-                    "event": "trace_cleared",
-                    "note": "Paper reset cleared active runtime state. Persisted run history was preserved.",
-                    "run_id": None,
+            await ws_manager.broadcast(
+                {
+                    "type": "trace",
                     "data": {
-                        "previous_run_id": previous_run_id,
+                        "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                        "event": "trace_cleared",
+                        "note": "Paper reset cleared active runtime state. Persisted run history was preserved.",
+                        "run_id": None,
+                        "data": {
+                            "previous_run_id": previous_run_id,
+                        },
                     },
-                },
-            })
+                }
+            )
 
             return self.status()
 
@@ -1137,10 +1092,6 @@ class ModeController:
         }
 
     def _normalize_equity_point(self, point: dict) -> dict:
-        """
-        Normalize equity point shape so both in-memory points and DB-loaded points
-        can be consumed by metrics/UI code safely.
-        """
         if not point:
             return {
                 "ts": int(time.time()),
@@ -1404,23 +1355,34 @@ class ModeController:
         restored_state = PortfolioState.from_dict(snapshot.get("state"))
         self._state = restored_state
 
-        self._engine = ExecutionEngine(
-            fee_rate=self._status.config.fee_rate,
-            slippage_bps=self._status.config.slippage_bps,
-            maintenance_margin=self._status.config.maintenance_margin,
-            max_leverage=self._status.config.max_leverage,
-            max_qty=self._status.config.max_qty,
-        ) if restored_state else None
+        self._engine = (
+            ExecutionEngine(
+                fee_rate=self._status.config.fee_rate,
+                slippage_bps=self._status.config.slippage_bps,
+                maintenance_margin=self._status.config.maintenance_margin,
+                max_leverage=self._status.config.max_leverage,
+                max_qty=self._status.config.max_qty,
+            )
+            if restored_state
+            else None
+        )
 
         self._fills = []
+        self._recent_fill_keys = []
+        self._recent_fill_key_set = set()
         for item in restored.get("fills", []):
             fill = Fill.from_dict(item)
             if fill:
                 self._fills.append(fill)
+                self._remember_fill_key(self._fill_dedupe_key(fill))
 
         self._equity_points = self._normalize_equity_points(
             list(restored.get("equity_points") or restored.get("equity_snapshots") or [])
         )
+        self._reset_risk_runtime_locked()
+        for fill in self._fills:
+            self._register_fill_for_risk_locked(fill)
+        self._update_peak_equity_locked()
 
         restored_state_value = restored.get("state", EngineState.IDLE.value)
         if restored_state_value in {
@@ -1457,6 +1419,7 @@ class ModeController:
         self._recent_fill_key_set = set()
         self._reconnect_attempts = 0
         self._last_fetch_error = None
+        self._reset_risk_runtime_locked()
 
     def _build_runtime_objects(self) -> None:
         cfg = self._status.config
@@ -1508,32 +1471,6 @@ class ModeController:
         self._status.stopped_at = None
         self._status.last_error = None
 
-    async def _run_loop(self) -> None:
-        try:
-            while not self._stop_event.is_set():
-                await self._paper_step()
-
-                if self._stop_event.is_set():
-                    break
-
-                await asyncio.sleep(self._status.config.poll_seconds)
-                
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            async with self._lock:
-                self._status.state = EngineState.ERROR
-                self._status.last_error = str(e)
-                self._status.stopped_at = time.time()
-                self._persist_status()
-                self._persist_snapshot()
-                await self._broadcast_trace_event(
-                    "runtime_error",
-                    note=str(e),
-                    data={"run_id": self._status.run_id},
-                )
-            return
-
     async def _broadcast_runtime_update(self) -> None:
         latest_price = None
         latest_candle = None
@@ -1551,86 +1488,20 @@ class ModeController:
             entry_price = self._state.entry_price
             equity = self._state.equity
 
-        await ws_manager.broadcast({
-            "type": "status",
-            "data": self.status(),
-        })
-
-        await ws_manager.broadcast({
-            "type": "tick",
-            "price": latest_price,
-        })
-
-        await ws_manager.broadcast({
-            "type": "position",
-            "qty": position_qty,
-            "entry_price": entry_price,
-        })
-
-        await ws_manager.broadcast({
-            "type": "equity",
-            "equity": equity,
-        })
+        await ws_manager.broadcast({"type": "status", "data": self.status()})
+        await ws_manager.broadcast({"type": "tick", "price": latest_price})
+        await ws_manager.broadcast({"type": "position", "qty": position_qty, "entry_price": entry_price})
+        await ws_manager.broadcast({"type": "equity", "equity": equity})
 
         if latest_candle:
-            await ws_manager.broadcast({
-                "type": "candle",
-                "symbol": self._status.config.symbol,
-                "interval": self._status.config.interval,
-                "candle": latest_candle,
-            })
-
-    async def _paper_step(self) -> None:
-        async with self._lock:
-            cfg = self._status.config
-
-            bars = await asyncio.to_thread(
-                self._fetch_recent_bars,
-                cfg.symbol,
-                cfg.interval,
-                cfg.candle_limit,
+            await ws_manager.broadcast(
+                {
+                    "type": "candle",
+                    "symbol": self._status.config.symbol,
+                    "interval": self._status.config.interval,
+                    "candle": latest_candle,
+                }
             )
-
-            if not bars:
-                return
-
-            self._bars = bars[-cfg.candle_limit:]
-            self._latest_bar = self._bars[-1]
-
-            closed_bar = self._get_newly_closed_bar(self._bars)
-            if closed_bar is None:
-                await self._mark_to_market(self._latest_bar["close"])
-                self._persist_snapshot()
-                await self._broadcast_runtime_update()
-                return
-
-            signal = self._compute_signal_from_closed_bars(self._bars)
-            previous_signal = self._last_signal
-
-            self._last_processed_bar_ts = closed_bar["timestamp"]
-            self._last_signal = signal
-
-            if signal != 0 and signal != previous_signal:
-                await self._broadcast_trace_event(
-                    "signal_changed",
-                    data={
-                        "signal": signal,
-                        "bar_ts": closed_bar["timestamp"],
-                        "price": closed_bar["close"],
-                    },
-                )
-
-            print(
-                f"[paper] closed_ts={closed_bar['timestamp']} "
-                f"close={closed_bar['close']} signal={signal} "
-                f"pos={self._state.position_qty if self._state else None} "
-                f"fills={len(self._fills)}"
-            )
-
-            await self._apply_signal(signal=signal, bar=closed_bar)
-            await self._mark_to_market(closed_bar["close"])
-            self._persist_snapshot()
-            await self._broadcast_runtime_update()
 
     def _fetch_recent_bars(self, symbol: str, interval: str, limit: int) -> list[dict]:
         try:
@@ -1639,80 +1510,28 @@ class ModeController:
         except Exception:
             return []
 
-    def _get_newly_closed_bar(self, bars: list[dict]) -> dict | None:
-        if len(bars) < 2:
-            return None
-
-        confirmed_bar = bars[-2]
-        ts = confirmed_bar["timestamp"]
-
-        if self._last_processed_bar_ts is None:
-            self._last_processed_bar_ts = ts
-            return confirmed_bar
-
-        if ts > self._last_processed_bar_ts:
-            return confirmed_bar
-
-        return None
-
-    def _compute_signal_from_closed_bars(self, bars: list[dict]) -> int:
-        try:
-            return self._latest_signal_from_bars(bars, self._status.config)
-        except Exception as e:
-            self._status.last_error = str(e)
-            return 0
-
-    async def _apply_signal(self, signal: int, bar: dict) -> None:
-        if self._engine is None or self._state is None:
-            return
-
-        price = float(bar["close"])
-        ts_iso = str(bar["timestamp"])
-        cfg = self._status.config
-
-        if signal == 1:
-            if self._state.position_qty < 0:
-                self._state, fill = self._engine.liquidate(
-                    ts_iso=ts_iso,
-                    state=self._state,
-                    close=price,
-                    market_type=cfg.market_type,
-                    trade_id=self._trade_id,
-                )
-                if fill:
-                    await self._append_fill(fill)
-
-            if self._state.position_qty == 0:
-                self._trade_id += 1
-                self._state, fill = self._engine.enter_long(
-                    ts_iso=ts_iso,
-                    state=self._state,
-                    close=price,
-                    market_type=cfg.market_type,
-                    leverage=cfg.leverage,
-                    trade_id=self._trade_id,
-                )
-                if fill:
-                    await self._append_fill(fill)
-
-        elif signal == -1:
-            if self._state.position_qty > 0:
-                self._state, fill = self._engine.exit_long(
-                    ts_iso=ts_iso,
-                    state=self._state,
-                    close=price,
-                    market_type=cfg.market_type,
-                    trade_id=self._trade_id,
-                )
-                if fill:
-                    await self._append_fill(fill)
-
-    async def _append_fill(self, fill) -> None:
+    async def _append_fill(self, fill: Fill | dict) -> None:
         normalized = fill if isinstance(fill, Fill) else Fill.from_dict(getattr(fill, "__dict__", fill))
         if normalized is None:
             return
 
+        if self._is_duplicate_fill(normalized):
+            await self._broadcast_trace_event(
+                "duplicate_fill_ignored",
+                note="Skipped duplicate paper fill.",
+                data={
+                    "fill": normalized.to_dict(),
+                    "run_id": self._status.run_id,
+                },
+            )
+            return
+
         self._fills.append(normalized)
+        if len(self._fills) > 5000:
+            self._fills = self._fills[-5000:]
+
+        self._remember_fill_key(self._fill_dedupe_key(normalized))
+        self._register_fill_for_risk_locked(normalized)
 
         if not self._status.run_id:
             print("[paper][warn] fill created but run_id is missing; fill will not persist")
@@ -1733,10 +1552,7 @@ class ModeController:
             },
         )
 
-        await ws_manager.broadcast({
-            "type": "fills"
-        })
-
+        await ws_manager.broadcast({"type": "fills"})
         await self._broadcast_runtime_update()
 
     def _calculate_order_qty(self, price: float) -> float:
@@ -1764,6 +1580,8 @@ class ModeController:
             market_type=self._status.config.market_type,
         )
 
+        self._update_peak_equity_locked(price)
+
         if self._status.config.market_type == "futures":
             is_liquidatable = self._engine.compute_liquidation_price(
                 state=self._state,
@@ -1785,8 +1603,8 @@ class ModeController:
                     await self._append_fill(fill)
 
     async def _run_loop(self) -> None:
-        while not self._stop_event.is_set():
-            try:
+        try:
+            while not self._stop_event.is_set():
                 cfg = self._status.config
 
                 bars = await asyncio.to_thread(
@@ -1838,16 +1656,69 @@ class ModeController:
                     if self._state is not None and self._engine is not None:
                         fill = None
 
-                        if signal > 0 and float(self._state.position_qty) <= 0.0:
-                            self._trade_id += 1
-                            self._state, fill = self._engine.enter_long(
+                        risk_exit = self._check_static_exit_locked(latest_price)
+                        if risk_exit["should_exit"] and float(self._state.position_qty) > 0.0:
+                            self._state, fill = self._engine.exit_long(
                                 ts_iso=str(int(processed_ts)),
                                 state=self._state,
                                 close=latest_price,
                                 market_type=cfg.market_type,
-                                leverage=cfg.leverage,
                                 trade_id=self._trade_id,
                             )
+
+                            if fill is not None:
+                                await self._append_fill(fill)
+                                await self._broadcast_trace_event(
+                                    "risk_exit",
+                                    note=f"Exited by {risk_exit['reason']}",
+                                    data={
+                                        "processed_bar_ts": int(processed_ts),
+                                        "price": latest_price,
+                                        "trade_id": getattr(fill, "trade_id", None),
+                                        "fill_type": getattr(fill, "type", None),
+                                        **(risk_exit.get("meta", {}) or {}),
+                                    },
+                                )
+
+                        elif signal > 0 and float(self._state.position_qty) <= 0.0:
+                            entry_gate = self._check_entry_gate_locked(latest_price)
+
+                            if entry_gate["allowed"]:
+                                self._trade_id += 1
+                                self._state, fill = self._engine.enter_long(
+                                    ts_iso=str(int(processed_ts)),
+                                    state=self._state,
+                                    close=latest_price,
+                                    market_type=cfg.market_type,
+                                    leverage=cfg.leverage,
+                                    trade_id=self._trade_id,
+                                    qty_override=self._compute_entry_qty_locked(latest_price),
+                                )
+
+                                if fill is not None:
+                                    await self._append_fill(fill)
+                                    await self._broadcast_trace_event(
+                                        "signal_fill",
+                                        data={
+                                            "signal": signal,
+                                            "processed_bar_ts": int(processed_ts),
+                                            "price": latest_price,
+                                            "trade_id": getattr(fill, "trade_id", None),
+                                            "fill_type": getattr(fill, "type", None),
+                                        },
+                                    )
+                            else:
+                                self._risk_halt_reason = entry_gate["reason"]
+                                await self._broadcast_trace_event(
+                                    "entry_blocked",
+                                    note=f"Risk blocked entry: {entry_gate['reason']}",
+                                    data={
+                                        "processed_bar_ts": int(processed_ts),
+                                        "price": latest_price,
+                                        **(entry_gate.get("meta", {}) or {}),
+                                    },
+                                )
+
                         elif signal < 0 and float(self._state.position_qty) > 0.0:
                             self._state, fill = self._engine.exit_long(
                                 ts_iso=str(int(processed_ts)),
@@ -1857,61 +1728,210 @@ class ModeController:
                                 trade_id=self._trade_id,
                             )
 
-                        if fill is not None:
-                            await self._append_fill(fill)
-                            await self._broadcast_trace_event(
-                                "signal_fill",
-                                data={
-                                    "signal": signal,
-                                    "processed_bar_ts": int(processed_ts),
-                                    "price": latest_price,
-                                    "trade_id": getattr(fill, "trade_id", None),
-                                    "fill_type": getattr(fill, "type", None),
-                                },
-                            )
+                            if fill is not None:
+                                await self._append_fill(fill)
+                                await self._broadcast_trace_event(
+                                    "signal_fill",
+                                    data={
+                                        "signal": signal,
+                                        "processed_bar_ts": int(processed_ts),
+                                        "price": latest_price,
+                                        "trade_id": getattr(fill, "trade_id", None),
+                                        "fill_type": getattr(fill, "type", None),
+                                    },
+                                )
 
                 self._persist_status()
                 self._persist_snapshot()
                 await self._sleep_or_stop(cfg.poll_seconds)
 
-            except Exception as e:
-                self._reconnect_attempts += 1
-                self._last_fetch_error = str(e)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self._reconnect_attempts += 1
+            self._last_fetch_error = str(e)
 
+            self._persist_status()
+            self._persist_snapshot()
+
+            await self._broadcast_trace_event(
+                "reconnect_wait",
+                note="Paper loop fetch/process error. Retrying.",
+                data={
+                    "attempt": self._reconnect_attempts,
+                    "error": str(e),
+                },
+            )
+
+            max_attempts = max(1, int(self._status.config.max_reconnect_attempts or 8))
+            backoff_base = max(1.0, float(self._status.config.reconnect_backoff_base or 1.5))
+
+            if self._reconnect_attempts >= max_attempts:
+                self._status.state = EngineState.ERROR
+                self._status.last_error = (
+                    f"Paper loop stopped after {self._reconnect_attempts} reconnect attempts: {e}"
+                )
+                self._status.stopped_at = time.time()
                 self._persist_status()
                 self._persist_snapshot()
 
                 await self._broadcast_trace_event(
-                    "reconnect_wait",
-                    note="Paper loop fetch/process error. Retrying.",
+                    "paper_error",
+                    note="Reconnect limit reached. Paper loop stopped.",
                     data={
-                        "attempt": self._reconnect_attempts,
+                        "attempts": self._reconnect_attempts,
                         "error": str(e),
                     },
                 )
+                return
 
-                max_attempts = max(1, int(self._status.config.max_reconnect_attempts or 8))
-                backoff_base = max(1.0, float(self._status.config.reconnect_backoff_base or 1.5))
+            delay = min(30.0, backoff_base ** max(0, self._reconnect_attempts - 1))
+            await self._sleep_or_stop(delay)
+            if not self._stop_event.is_set():
+                await self._run_loop()
 
-                if self._reconnect_attempts >= max_attempts:
-                    self._status.state = EngineState.ERROR
-                    self._status.last_error = (
-                        f"Paper loop stopped after {self._reconnect_attempts} reconnect attempts: {e}"
-                    )
-                    self._persist_status()
-                    self._persist_snapshot()
+    def _risk_day_key_now(self) -> str:
+        return datetime.utcnow().strftime("%Y-%m-%d")
 
-                    await self._broadcast_trace_event(
-                        "paper_error",
-                        note="Reconnect limit reached. Paper loop stopped.",
-                        data={
-                            "attempts": self._reconnect_attempts,
-                            "error": str(e),
-                        },
-                    )
-                    return
+    def _roll_trade_day_if_needed(self) -> None:
+        today = self._risk_day_key_now()
+        if self._trade_day_key != today:
+            self._trade_day_key = today
+            self._trades_today = 0
 
-                delay = min(30.0, backoff_base ** max(0, self._reconnect_attempts - 1))
-                await self._sleep_or_stop(delay)
+    def _current_equity_locked(self, market_price: float | None = None) -> float:
+        if self._state is None:
+            return 0.0
+
+        resolved_price = market_price
+        if resolved_price is None and self._latest_bar and self._latest_bar.get("close") is not None:
+            try:
+                resolved_price = float(self._latest_bar["close"])
+            except Exception:
+                resolved_price = None
+
+        if resolved_price is None and self._state.entry_price is not None:
+            resolved_price = float(self._state.entry_price)
+
+        if self._engine is None or resolved_price is None:
+            return float(self._state.equity or self._state.cash)
+
+        try:
+            return float(
+                self._engine.mark_equity(
+                    state=self._state,
+                    market_price=float(resolved_price),
+                    market_type=self._status.config.market_type,
+                )
+            )
+        except Exception:
+            return float(self._state.equity or self._state.cash)
+
+    def _reset_risk_runtime_locked(self) -> None:
+        self._trade_day_key = self._risk_day_key_now()
+        self._trades_today = 0
+        self._last_exit_ts = None
+        self._risk_halt_reason = None
+        starting_equity = float(self._status.config.initial_balance or 0.0)
+        self._peak_equity = max(0.0, starting_equity)
+
+    def _update_peak_equity_locked(self, market_price: float | None = None) -> None:
+        current_equity = self._current_equity_locked(market_price)
+        self._peak_equity = max(float(self._peak_equity or 0.0), float(current_equity or 0.0))
+
+    def _register_fill_for_risk_locked(self, fill: Fill) -> None:
+        self._roll_trade_day_if_needed()
+
+        fill_type = str(getattr(fill, "type", "")).upper()
+        if fill_type == "ENTRY":
+            self._trades_today += 1
+
+        if fill_type in {"EXIT", "LIQUIDATION"}:
+            self._last_exit_ts = time.time()
+
+        try:
+            eq_after = float(getattr(fill, "equity_after", 0.0) or 0.0)
+            self._peak_equity = max(float(self._peak_equity or 0.0), eq_after)
+        except Exception:
+            pass
+
+    def _build_risk_payload(self) -> dict:
+        self._roll_trade_day_if_needed()
+        current_equity = self._current_equity_locked()
+        peak_equity = max(float(self._peak_equity or 0.0), current_equity)
+        drawdown_pct = 0.0
+        if peak_equity > 0:
+            drawdown_pct = max(0.0, (peak_equity - current_equity) / peak_equity * 100.0)
+
+        return {
+            "position_sizing_mode": self._status.config.position_sizing_mode,
+            "position_size_value": self._status.config.position_size_value,
+            "max_drawdown_pct": self._status.config.max_drawdown_pct,
+            "max_trades_per_day": self._status.config.max_trades_per_day,
+            "cooldown_seconds": self._status.config.cooldown_seconds,
+            "stop_loss_pct": self._status.config.stop_loss_pct,
+            "take_profit_pct": self._status.config.take_profit_pct,
+            "peak_equity": peak_equity,
+            "current_equity": current_equity,
+            "drawdown_pct": drawdown_pct,
+            "trades_today": self._trades_today,
+            "trade_day": self._trade_day_key,
+            "last_exit_ts": self._last_exit_ts,
+            "risk_halt_reason": self._risk_halt_reason,
+        }
+
+    def _compute_entry_qty_locked(self, entry_price: float) -> float | None:
+        if self._state is None or self._engine is None:
+            return None
+
+        return self._risk_engine.compute_entry_qty(
+            state=self._state,
+            market_type=self._status.config.market_type,
+            entry_price=entry_price,
+            leverage=self._status.config.leverage,
+            fee_rate=self._status.config.fee_rate,
+            max_leverage=self._status.config.max_leverage,
+            max_qty=self._status.config.max_qty,
+            sizing_mode=self._status.config.position_sizing_mode,
+            sizing_value=self._status.config.position_size_value,
+        )
+
+    def _check_entry_gate_locked(self, market_price: float | None = None) -> dict:
+        self._roll_trade_day_if_needed()
+        current_equity = self._current_equity_locked(market_price)
+        self._peak_equity = max(float(self._peak_equity or 0.0), current_equity)
+
+        result = self._risk_engine.evaluate_entry_gate(
+            now_ts=time.time(),
+            current_equity=current_equity,
+            peak_equity=self._peak_equity,
+            trades_today=self._trades_today,
+            last_exit_ts=self._last_exit_ts,
+            max_drawdown_pct=self._status.config.max_drawdown_pct,
+            max_trades_per_day=self._status.config.max_trades_per_day,
+            cooldown_seconds=self._status.config.cooldown_seconds,
+        )
+        return {
+            "allowed": result.allowed,
+            "reason": result.reason,
+            "meta": result.meta or {},
+        }
+
+    def _check_static_exit_locked(self, market_price: float) -> dict:
+        if self._state is None or self._state.position_qty <= 0:
+            return {"should_exit": False, "reason": None, "meta": {}}
+
+        result = self._risk_engine.evaluate_long_exit(
+            entry_price=self._state.entry_price,
+            market_price=market_price,
+            stop_loss_pct=self._status.config.stop_loss_pct,
+            take_profit_pct=self._status.config.take_profit_pct,
+        )
+        return {
+            "should_exit": result.should_exit,
+            "reason": result.reason,
+            "meta": result.meta or {},
+        }
+
 
 mode_controller = ModeController()
