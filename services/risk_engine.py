@@ -17,6 +17,11 @@ class RiskGateResult:
 
 
 @dataclass
+class ExitLevels:
+    stop_price: float | None = None
+    take_price: float | None = None
+
+@dataclass
 class ExitSignal:
     should_exit: bool
     reason: Optional[str] = None
@@ -32,7 +37,9 @@ class RiskEngine:
     - cooldown logic
     - static stop loss / take profit
 
-    Defaults are intentionally no-op / backward-compatible.
+    Design note:
+    exit-level resolution is separated so ATR-based exits can later plug into
+    the same interface without changing ModeController / runner call sites.
     """
 
     def _safe_float(self, value: object, default: float = 0.0) -> float:
@@ -246,6 +253,34 @@ class RiskEngine:
 
         return RiskGateResult(allowed=True)
 
+    def _resolve_long_exit_levels(
+        self,
+        *,
+        entry_price: float | None,
+        stop_loss_pct: float | None,
+        take_profit_pct: float | None,
+    ) -> ExitLevels:
+        ep = self._safe_float(entry_price, 0.0)
+        if ep <= 0.0:
+            return ExitLevels()
+
+        sl = self._safe_float(stop_loss_pct, 0.0)
+        tp = self._safe_float(take_profit_pct, 0.0)
+
+        stop_price: float | None = None
+        take_price: float | None = None
+
+        if sl > 0.0:
+            stop_price = ep * (1.0 - sl / 100.0)
+
+        if tp > 0.0:
+            take_price = ep * (1.0 + tp / 100.0)
+
+        return ExitLevels(
+            stop_price=stop_price,
+            take_price=take_price,
+        )
+
     def evaluate_long_exit(
         self,
         *,
@@ -256,38 +291,51 @@ class RiskEngine:
     ) -> ExitSignal:
         ep = self._safe_float(entry_price, 0.0)
         mp = self._safe_float(market_price, 0.0)
+
         if ep <= 0.0 or mp <= 0.0:
             return ExitSignal(should_exit=False)
 
-        sl = self._safe_float(stop_loss_pct, 0.0)
-        tp = self._safe_float(take_profit_pct, 0.0)
+        levels = self._resolve_long_exit_levels(
+            entry_price=ep,
+            stop_loss_pct=stop_loss_pct,
+            take_profit_pct=take_profit_pct,
+        )
 
-        if sl > 0.0:
-            stop_price = ep * (1.0 - sl / 100.0)
-            if mp <= stop_price:
-                return ExitSignal(
-                    should_exit=True,
-                    reason="stop_loss",
-                    meta={
-                        "entry_price": ep,
-                        "market_price": mp,
-                        "stop_loss_pct": sl,
-                        "stop_price": stop_price,
-                    },
-                )
+        if levels.stop_price is not None and mp <= levels.stop_price:
+            return ExitSignal(
+                should_exit=True,
+                reason="stop_loss",
+                meta={
+                    "entry_price": ep,
+                    "market_price": mp,
+                    "stop_loss_pct": self._safe_float(stop_loss_pct, 0.0),
+                    "stop_price": levels.stop_price,
+                    "take_price": levels.take_price,
+                    "exit_family": "static",
+                },
+            )
 
-        if tp > 0.0:
-            take_price = ep * (1.0 + tp / 100.0)
-            if mp >= take_price:
-                return ExitSignal(
-                    should_exit=True,
-                    reason="take_profit",
-                    meta={
-                        "entry_price": ep,
-                        "market_price": mp,
-                        "take_profit_pct": tp,
-                        "take_price": take_price,
-                    },
-                )
+        if levels.take_price is not None and mp >= levels.take_price:
+            return ExitSignal(
+                should_exit=True,
+                reason="take_profit",
+                meta={
+                    "entry_price": ep,
+                    "market_price": mp,
+                    "take_profit_pct": self._safe_float(take_profit_pct, 0.0),
+                    "take_price": levels.take_price,
+                    "stop_price": levels.stop_price,
+                    "exit_family": "static",
+                },
+            )
 
-        return ExitSignal(should_exit=False)
+        return ExitSignal(
+            should_exit=False,
+            meta={
+                "entry_price": ep,
+                "market_price": mp,
+                "stop_price": levels.stop_price,
+                "take_price": levels.take_price,
+                "exit_family": "static",
+            },
+        )

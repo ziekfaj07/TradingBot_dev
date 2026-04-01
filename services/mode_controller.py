@@ -1676,6 +1676,16 @@ class ModeController:
                 latest_price = float(latest_bar["close"])
                 await self._mark_to_market(latest_price)
 
+                static_exit_done = await self._maybe_execute_static_exit_locked(
+                    market_price=latest_price,
+                    now_ts=latest_bar.get("timestamp"),
+                )
+                if static_exit_done:
+                    self._persist_status()
+                    self._persist_snapshot()
+                    await self._sleep_or_stop(cfg.poll_seconds)
+                    continue
+
                 if bool(getattr(cfg, "debug_stream", False)):
                     print(
                         "[paper-loop]",
@@ -1705,35 +1715,11 @@ class ModeController:
                     if self._state is not None and self._engine is not None:
                         fill = None
 
-                        risk_exit = self._check_static_exit_locked(latest_price)
-                        if risk_exit["should_exit"] and float(self._state.position_qty) > 0.0:
-                            self._state, fill = self._engine.exit_long(
-                                ts_iso=str(int(processed_ts)),
-                                state=self._state,
-                                close=latest_price,
-                                market_type=cfg.market_type,
-                                trade_id=self._trade_id,
-                            )
-
-                            if fill is not None:
-                                await self._append_fill(fill)
-                                await self._broadcast_trace_event(
-                                    "risk_exit",
-                                    note=f"Exited by {risk_exit['reason']}",
-                                    data={
-                                        "processed_bar_ts": int(processed_ts),
-                                        "price": latest_price,
-                                        "trade_id": getattr(fill, "trade_id", None),
-                                        "fill_type": getattr(fill, "type", None),
-                                        **(risk_exit.get("meta", {}) or {}),
-                                    },
-                                )
-
-                        elif signal > 0 and float(self._state.position_qty) <= 0.0:
+                        if signal > 0 and float(self._state.position_qty) <= 0.0:
                             entry_gate = self._check_entry_gate_locked(
                                 latest_price,
                                 now_ts=processed_ts,
-                            )                            
+                            )
 
                             if entry_gate["allowed"]:
                                 self._trade_id += 1
@@ -2003,5 +1989,59 @@ class ModeController:
             "meta": result.meta or {},
         }
 
+    async def _maybe_execute_static_exit_locked(
+        self,
+        *,
+        market_price: float,
+        now_ts: object | None = None,
+    ) -> bool:
+        if self._state is None or self._engine is None:
+            return False
+
+        if float(self._state.position_qty or 0.0) <= 0.0:
+            return False
+
+        decision = self._check_static_exit_locked(market_price)
+        if not decision.get("should_exit"):
+            return False
+
+        effective_ts = now_ts
+        if effective_ts is None and self._latest_bar:
+            effective_ts = self._latest_bar.get("timestamp")
+
+        ts_sec = self._coerce_epoch_seconds(effective_ts)
+        ts_iso = (
+            datetime.utcfromtimestamp(ts_sec).isoformat()
+            if ts_sec is not None
+            else str(int(time.time()))
+        )
+
+        self._state, fill = self._engine.exit_long(
+            ts_iso=ts_iso,
+            state=self._state,
+            close=float(market_price),
+            market_type=self._status.config.market_type,
+            trade_id=self._trade_id,
+        )
+
+        if not fill:
+            return False
+
+        await self._append_fill(fill)
+        await self._mark_to_market(float(market_price))
+        self._persist_status()
+        self._persist_snapshot()
+
+        await self._broadcast_trace_event(
+            "paper_risk_exit",
+            note=f"Static {decision.get('reason')} triggered.",
+            data={
+                "reason": decision.get("reason"),
+                "market_price": float(market_price),
+                "trade_id": getattr(fill, "trade_id", None),
+                "meta": decision.get("meta", {}) or {},
+            },
+        )
+        return True
 
 mode_controller = ModeController()
