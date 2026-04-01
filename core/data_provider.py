@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+
 import pandas as pd
 
 
@@ -13,9 +14,6 @@ class DataProvider(ABC):
         end: str | None = None,
     ) -> pd.DataFrame:
         """Return normalized OHLCV dataframe."""
-
-        print(df["timestamp"].min(), df["timestamp"].max())
-        print(df["timestamp"].dtype)
 
     @abstractmethod
     def export_to_csv(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Optional
 
 from core.execution_models import PortfolioState
@@ -65,6 +66,62 @@ class RiskEngine:
         }
         return aliases.get(mode, mode)
 
+    def _coerce_epoch_seconds(self, value: object) -> float | None:
+        if value is None:
+            return None
+
+        if isinstance(value, (int, float)):
+            v = float(value)
+            if not math.isfinite(v):
+                return None
+
+            av = abs(v)
+            # ns / us / ms / s
+            if av >= 1e17:
+                return v / 1_000_000_000.0
+            if av >= 1e14:
+                return v / 1_000_000.0
+            if av >= 1e11:
+                return v / 1_000.0
+            return v
+
+        if isinstance(value, datetime):
+            dt = value
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+            return float(dt.timestamp())
+
+        if hasattr(value, "timestamp"):
+            try:
+                ts = value.timestamp()
+                return float(ts) if ts is not None else None
+            except Exception:
+                pass
+
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+
+            try:
+                return self._coerce_epoch_seconds(float(text))
+            except Exception:
+                pass
+
+            try:
+                dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                else:
+                    dt = dt.astimezone(timezone.utc)
+                return float(dt.timestamp())
+            except Exception:
+                return None
+
+        return None
+
     def compute_entry_qty(
         self,
         *,
@@ -106,7 +163,6 @@ class RiskEngine:
         elif mode == "fixed_pct":
             budget = cash * (value / 100.0)
         else:
-            # Unknown mode => preserve current behavior
             return None
 
         budget = max(0.0, min(budget, cash))
@@ -114,11 +170,9 @@ class RiskEngine:
             return 0.0
 
         if mt == "spot":
-            # budget is cash-to-spend including fee
             notional_after_fee = max(0.0, budget * (1.0 - fee_rate))
             qty = notional_after_fee / px
         else:
-            # futures: budget is wallet capital to allocate; exposure = budget * leverage
             notional = budget * lev
             fee = notional * fee_rate
             if fee >= cash:
@@ -133,16 +187,19 @@ class RiskEngine:
     def evaluate_entry_gate(
         self,
         *,
-        now_ts: float | None,
+        now_ts: float | int | str | datetime | None,
         current_equity: float,
         peak_equity: float,
         trades_today: int,
-        last_exit_ts: float | None,
+        last_exit_ts: float | int | str | datetime | None,
         max_drawdown_pct: float | None,
         max_trades_per_day: int | None,
         cooldown_seconds: int | None,
     ) -> RiskGateResult:
-        now_ts = self._safe_float(now_ts, time.time())
+        now_sec = self._coerce_epoch_seconds(now_ts)
+        if now_sec is None:
+            now_sec = time.time()
+
         current_equity = self._safe_float(current_equity, 0.0)
         peak_equity = max(self._safe_float(peak_equity, current_equity), current_equity)
 
@@ -173,8 +230,9 @@ class RiskEngine:
             )
 
         cooldown = self._safe_int(cooldown_seconds, 0)
-        if cooldown > 0 and last_exit_ts is not None:
-            elapsed = max(0.0, now_ts - self._safe_float(last_exit_ts))
+        last_exit_sec = self._coerce_epoch_seconds(last_exit_ts)
+        if cooldown > 0 and last_exit_sec is not None:
+            elapsed = max(0.0, now_sec - last_exit_sec)
             if elapsed < cooldown:
                 return RiskGateResult(
                     allowed=False,

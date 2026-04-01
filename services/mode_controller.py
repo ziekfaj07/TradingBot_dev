@@ -383,17 +383,20 @@ class ModeController:
                     cfg_dict[key] = value
             cfg = RunConfig(**cfg_dict)
 
+            started_at = time.time()
             self._status.state = EngineState.STARTING
-            self._status.started_at = time.time()
+            self._status.started_at = started_at
             self._status.stopped_at = None
             self._status.last_error = None
 
             self._refresh_run_identity(
                 cfg,
-                started_at=self._status.started_at,
+                started_at=started_at,
                 mode=Mode.BACKTEST,
             )
 
+            run_id = self._status.run_id
+            run_label = self._status.run_label
             self._persist_status()
 
         try:
@@ -406,7 +409,12 @@ class ModeController:
             )
 
             if df.empty:
-                raise RuntimeError("No historical data returned for backtest.")
+                raise RuntimeError(
+                    f"No historical data returned for backtest. "
+                    f"symbol={cfg.symbol} interval={cfg.interval} market_type={cfg.market_type} "
+                    f"start={cfg.start} end={cfg.end} "
+                    f"provider_root={self.provider.root_dir} hist_dir={self.provider.hist_dir}"
+                )
 
             df = self._apply_strategy_to_df(df, cfg)
             df["signal"] = df["signal"].shift(1).fillna(0).astype(int)
@@ -448,13 +456,54 @@ class ModeController:
                 take_profit_pct=cfg.take_profit_pct,
             )
 
+            stopped_at = time.time()
+
+            backtest_status = {
+                "mode": Mode.BACKTEST.value,
+                "state": EngineState.IDLE.value,
+                "run_id": run_id,
+                "run_label": run_label,
+                "started_at": started_at,
+                "stopped_at": stopped_at,
+                "last_error": None,
+                "config": asdict(cfg),
+                "runtime": {
+                    "has_engine": False,
+                    "has_state": False,
+                    "latest_bar": None,
+                    "bar_count": int(len(df)),
+                    "last_processed_bar_ts": None,
+                    "last_signal": 0,
+                    "fill_count": len(output.trades),
+                    "equity_point_count": len(output.equity_curve),
+                    "fills": [],
+                    "latest_equity": output.final_equity,
+                    "paper_state": None,
+                    "paper_metrics": None,
+                    "chart_symbol": cfg.symbol,
+                    "chart_interval": cfg.interval,
+                    "reconnect_attempts": 0,
+                    "last_fetch_error": None,
+                    "risk": {
+                        "position_sizing_mode": cfg.position_sizing_mode,
+                        "position_size_value": cfg.position_size_value,
+                        "max_drawdown_pct": cfg.max_drawdown_pct,
+                        "max_trades_per_day": cfg.max_trades_per_day,
+                        "cooldown_seconds": cfg.cooldown_seconds,
+                        "stop_loss_pct": cfg.stop_loss_pct,
+                        "take_profit_pct": cfg.take_profit_pct,
+                    },
+                },
+            }
+
             async with self._lock:
                 self._status.state = EngineState.IDLE
-                self._status.stopped_at = time.time()
+                self._status.stopped_at = stopped_at
+                self._status.last_error = None
                 self._persist_status()
 
             return {
-                "status": self.status(),
+                "status": backtest_status,
                 "result": {
                     "final_equity": output.final_equity,
                     "liquidated": output.liquidated,
@@ -1681,7 +1730,10 @@ class ModeController:
                                 )
 
                         elif signal > 0 and float(self._state.position_qty) <= 0.0:
-                            entry_gate = self._check_entry_gate_locked(latest_price)
+                            entry_gate = self._check_entry_gate_locked(
+                                latest_price,
+                                now_ts=processed_ts,
+                            )                            
 
                             if entry_gate["allowed"]:
                                 self._trade_id += 1
@@ -1790,11 +1842,22 @@ class ModeController:
             if not self._stop_event.is_set():
                 await self._run_loop()
 
-    def _risk_day_key_now(self) -> str:
-        return datetime.utcnow().strftime("%Y-%m-%d")
+    def _coerce_epoch_seconds(self, value: object) -> float | None:
+        return self._risk_engine._coerce_epoch_seconds(value)
 
-    def _roll_trade_day_if_needed(self) -> None:
-        today = self._risk_day_key_now()
+    def _day_key_from_ts(self, value: object | None = None) -> str:
+        ts = self._coerce_epoch_seconds(value)
+        if ts is None:
+            return datetime.utcnow().strftime("%Y-%m-%d")
+        return datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d")
+
+    def _risk_day_key_now(self) -> str:
+        if self._latest_bar and self._latest_bar.get("timestamp") is not None:
+            return self._day_key_from_ts(self._latest_bar.get("timestamp"))
+        return self._day_key_from_ts()
+
+    def _roll_trade_day_if_needed(self, now_ts: object | None = None) -> None:
+        today = self._day_key_from_ts(now_ts)
         if self._trade_day_key != today:
             self._trade_day_key = today
             self._trades_today = 0
@@ -1840,14 +1903,15 @@ class ModeController:
         self._peak_equity = max(float(self._peak_equity or 0.0), float(current_equity or 0.0))
 
     def _register_fill_for_risk_locked(self, fill: Fill) -> None:
-        self._roll_trade_day_if_needed()
+        fill_ts = self._coerce_epoch_seconds(getattr(fill, "timestamp", None))
+        self._roll_trade_day_if_needed(fill_ts)
 
         fill_type = str(getattr(fill, "type", "")).upper()
         if fill_type == "ENTRY":
             self._trades_today += 1
 
         if fill_type in {"EXIT", "LIQUIDATION"}:
-            self._last_exit_ts = time.time()
+            self._last_exit_ts = fill_ts if fill_ts is not None else time.time()
 
         try:
             eq_after = float(getattr(fill, "equity_after", 0.0) or 0.0)
@@ -1896,13 +1960,19 @@ class ModeController:
             sizing_value=self._status.config.position_size_value,
         )
 
-    def _check_entry_gate_locked(self, market_price: float | None = None) -> dict:
-        self._roll_trade_day_if_needed()
+    def _check_entry_gate_locked(self, market_price: float | None = None, now_ts: object | None = None) -> dict:
+        self._roll_trade_day_if_needed(now_ts)
         current_equity = self._current_equity_locked(market_price)
         self._peak_equity = max(float(self._peak_equity or 0.0), current_equity)
 
+        effective_now_ts = now_ts
+        if effective_now_ts is None and self._latest_bar and self._latest_bar.get("timestamp") is not None:
+            effective_now_ts = self._latest_bar.get("timestamp")
+        if effective_now_ts is None:
+            effective_now_ts = time.time()
+
         result = self._risk_engine.evaluate_entry_gate(
-            now_ts=time.time(),
+            now_ts=effective_now_ts,
             current_equity=current_equity,
             peak_equity=self._peak_equity,
             trades_today=self._trades_today,

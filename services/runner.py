@@ -1,11 +1,10 @@
-# services/runner.py
-
 from __future__ import annotations
 
-import time
-
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
+
+import pandas as pd
 
 from core.execution_models import PortfolioState
 from services.execution_engine import ExecutionEngine
@@ -20,6 +19,26 @@ class RunOutput:
     final_equity: float
     liquidated: bool
     risk_events: list[dict]
+
+
+def _to_utc_timestamp(value: Any) -> pd.Timestamp:
+    if isinstance(value, pd.Timestamp):
+        ts = value
+    else:
+        ts = pd.to_datetime(value, errors="coerce", utc=True)
+
+    if pd.isna(ts):
+        raise ValueError(f"Invalid timestamp in backtest loop: {value!r}")
+
+    if ts.tzinfo is None:
+        return ts.tz_localize("UTC")
+
+    return ts.tz_convert("UTC")
+
+
+def _day_key_from_ts(value: Any) -> str:
+    ts = _to_utc_timestamp(value)
+    return ts.strftime("%Y-%m-%d")
 
 
 def run_signal_backed_loop(
@@ -41,8 +60,8 @@ def run_signal_backed_loop(
     take_profit_pct: float | None = None,
 ) -> RunOutput:
     """
-    Transplanted from BacktestService (the per-bar loop + equity/trade tracking).
     Expects df to have columns: timestamp, close, signal.
+    Uses bar time (not wall-clock time) for all backtest risk timing.
     """
 
     trades: list[dict] = []
@@ -51,20 +70,24 @@ def run_signal_backed_loop(
     liquidated = False
     trade_id = 0
 
-    # for per-trade pnl tracking
-    # baseline starts from initial state cash (same meaning as your initial_balance)
     open_trade_equity_baseline = float(state.cash)
 
     risk_engine = risk_engine or RiskEngine()
     trades_today = 0
-    last_exit_ts: float | None = None
+    last_exit_ts: Any = None
     peak_equity = float(state.cash)
+    trade_day: str | None = None
 
     for i in range(len(df)):
-        ts = df["timestamp"].iloc[i]
-        ts_iso = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+        ts = _to_utc_timestamp(df["timestamp"].iloc[i])
+        ts_iso = ts.isoformat()
         close = float(df["close"].iloc[i])
         signal = int(df["signal"].iloc[i])
+
+        day_key = _day_key_from_ts(ts)
+        if trade_day != day_key:
+            trade_day = day_key
+            trades_today = 0
 
         current_equity = float(engine.mark_equity(state, market_type, close))
         peak_equity = max(peak_equity, current_equity)
@@ -83,8 +106,8 @@ def run_signal_backed_loop(
             if fill:
                 trades.append(fill.__dict__)
                 liquidated = True
-                open_trade_equity_baseline = state.cash
-                last_exit_ts = time.time()
+                open_trade_equity_baseline = float(state.cash)
+                last_exit_ts = getattr(fill, "timestamp", None) or ts_iso
                 risk_events.append(
                     {
                         "timestamp": ts_iso,
@@ -107,9 +130,10 @@ def run_signal_backed_loop(
                 state, fill = engine.exit_long(ts_iso, state, close, market_type, trade_id)
                 if fill:
                     realized_pnl = float(fill.equity_after) - float(open_trade_equity_baseline)
-                    fill.pnl - realized_pnl
+                    fill.pnl = realized_pnl
                     trades.append(fill.__dict__)
                     open_trade_equity_baseline = float(fill.equity_after)
+                    last_exit_ts = getattr(fill, "timestamp", None) or ts_iso
                     risk_events.append(
                         {
                             "timestamp": ts_iso,
@@ -122,7 +146,7 @@ def run_signal_backed_loop(
         # Entry
         if signal == 1 and state.position_qty == 0.0:
             gate = risk_engine.evaluate_entry_gate(
-                now_ts=time.time(),
+                now_ts=ts,
                 current_equity=current_equity,
                 peak_equity=peak_equity,
                 trades_today=trades_today,
@@ -145,10 +169,18 @@ def run_signal_backed_loop(
                 )
 
                 trade_id += 1
-                state, fill = engine.enter_long(ts_iso, state, close, market_type, leverage, trade_id, qty_override=qty_override)
+                state, fill = engine.enter_long(
+                    ts_iso,
+                    state,
+                    close,
+                    market_type,
+                    leverage,
+                    trade_id,
+                    qty_override=qty_override,
+                )
                 if fill:
                     trades.append(fill.__dict__)
-                    open_trade_equity_baseline = engine.mark_equity(state, market_type, close)
+                    open_trade_equity_baseline = float(engine.mark_equity(state, market_type, close))
                     trades_today += 1
             else:
                 risk_events.append(
@@ -168,9 +200,8 @@ def run_signal_backed_loop(
                 fill.pnl = realized_pnl
                 trades.append(fill.__dict__)
                 open_trade_equity_baseline = float(fill.equity_after)
-                last_exit_ts = time.time()
+                last_exit_ts = getattr(fill, "timestamp", None) or ts_iso
 
-        # mark-to-market equity
         eq = engine.mark_equity(state, market_type, close)
         peak_equity = max(peak_equity, float(eq))
 
@@ -178,7 +209,7 @@ def run_signal_backed_loop(
             if equity_stride <= 1 or (i % equity_stride == 0):
                 equity_curve.append(
                     {
-                        "timestamp": ts_iso, 
+                        "timestamp": ts_iso,
                         "equity": float(eq),
                     }
                 )

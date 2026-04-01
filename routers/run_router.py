@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import PlainTextResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from typing import Any
 
 from core.run_naming import csv_filename_from_run_id
 from services.mode_controller import Mode
@@ -39,6 +40,8 @@ class ConfigureBody(BaseModel):
     dedupe_fill_window: int | None = None
     ema_short: int | None = None
     ema_long: int | None = None
+    strategy_name: str | None = None
+    strategy_params: dict[str, Any] | None = Field(default=None)
     candle_limit: int | None = None
     debug_stream: bool | None = None
 
