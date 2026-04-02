@@ -6,12 +6,14 @@ from services.strategies.base import BaseStrategy
 from services.strategies.donchian_breakout import DonchianBreakoutStrategy
 from services.strategies.ema_crossover import EmaCrossoverStrategy
 from services.strategies.three_candle_reversal import ThreeCandleReversalStrategy
+from services.strategies.bollinger_mean_reversion import BollingerMeanReversion
 
 
 STRATEGY_REGISTRY: dict[str, type[BaseStrategy]] = {
+    BollingerMeanReversion.name: BollingerMeanReversion,  
+    DonchianBreakoutStrategy.name: DonchianBreakoutStrategy,
     EmaCrossoverStrategy.name: EmaCrossoverStrategy,
     ThreeCandleReversalStrategy.name: ThreeCandleReversalStrategy,
-    DonchianBreakoutStrategy.name: DonchianBreakoutStrategy,
 }
 
 

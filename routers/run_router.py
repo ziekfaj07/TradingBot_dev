@@ -1,16 +1,21 @@
-# routers/run_router.py
 from __future__ import annotations
+
+from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import PlainTextResponse
-from pydantic import BaseModel, Field
-from typing import Any
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from core.run_naming import csv_filename_from_run_id
-from services.mode_controller import Mode
+from core.strategy_schemas import StrategyRegistry
 from services.controller_singleton import mode_controller
+from services.mode_controller import Mode
 
 router = APIRouter(prefix="/api/run", tags=["run"])
+
+
+JSONScalar = str | int | float | bool | None
+JSONDict = dict[str, JSONScalar]
 
 
 class SetModeBody(BaseModel):
@@ -18,6 +23,8 @@ class SetModeBody(BaseModel):
 
 
 class ConfigureBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     symbol: str | None = None
     interval: str | None = None
     market_type: str | None = None
@@ -41,7 +48,7 @@ class ConfigureBody(BaseModel):
     ema_short: int | None = None
     ema_long: int | None = None
     strategy_name: str | None = None
-    strategy_params: dict[str, Any] | None = Field(default=None)
+    strategy_params: JSONDict | None = Field(default=None)
     candle_limit: int | None = None
     debug_stream: bool | None = None
 
@@ -54,6 +61,20 @@ class ConfigureBody(BaseModel):
 
     stop_loss_pct: float | None = None
     take_profit_pct: float | None = None
+
+    @model_validator(mode="after")
+    def validate_strategy_block(self) -> "ConfigureBody":
+        if self.strategy_name is None and self.strategy_params:
+            raise ValueError("strategy_params was provided but strategy_name is missing")
+
+        canonical_name, normalized_params = StrategyRegistry.validate(
+            self.strategy_name,
+            self.strategy_params,
+        )
+
+        self.strategy_name = canonical_name
+        self.strategy_params = normalized_params
+        return self
 
 
 class DevActionBody(BaseModel):

@@ -6,13 +6,15 @@ import time
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Iterable
+from typing import Iterable, TypeAlias
 
 import pandas as pd
 import requests
 
 from core.data_provider import DataProvider
 
+UtcTimestamp: TypeAlias = pd.Timestamp
+OptionalUtcTimestamp: TypeAlias = pd.Timestamp | None
 
 @dataclass(frozen=True)
 class _CoverageRequest:
@@ -132,9 +134,9 @@ class BinanceVisionProvider(DataProvider):
             return None
         return text
 
-    def _to_utc_timestamp(self, value) -> pd.Timestamp:
+    def _to_utc_timestamp(self, value) -> OptionalUtcTimestamp:
         if value is None:
-            return pd.NaT
+            return None
 
         if isinstance(value, pd.Timestamp):
             ts = value
@@ -142,21 +144,21 @@ class BinanceVisionProvider(DataProvider):
             ts = pd.to_datetime(value, errors="coerce")
 
         if pd.isna(ts):
-            return pd.NaT
+            return None
 
         if getattr(ts, "tzinfo", None) is None:
             return ts.tz_localize("UTC")
 
         return ts.tz_convert("UTC")
 
-    def _parse_bound(self, value: str | None, *, is_end: bool) -> pd.Timestamp:
+    def _parse_bound(self, value: str | None, *, is_end: bool) -> OptionalUtcTimestamp:
         text = self._normalize_bound_text(value)
         if text is None:
-            return pd.NaT
+            return None
 
         ts = self._to_utc_timestamp(text)
-        if pd.isna(ts):
-            return pd.NaT
+        if ts is None:
+            return None
 
         # Treat YYYY-MM-DD as a whole UTC day for end bounds.
         if is_end and len(text) == 10 and text[4] == "-" and text[7] == "-":
@@ -186,9 +188,9 @@ class BinanceVisionProvider(DataProvider):
         start_ts = self._parse_bound(start, is_end=False)
         end_ts = self._parse_bound(end, is_end=True)
 
-        if pd.isna(end_ts):
+        if end_ts is None:
             end_ts = now
-        if pd.isna(start_ts):
+        if start_ts is None:
             start_ts = end_ts - self._default_lookback_for_interval(interval)
 
         if start_ts > end_ts:
@@ -215,6 +217,18 @@ class BinanceVisionProvider(DataProvider):
             "1w": pd.Timedelta(days=7),
         }
         return mapping[interval]
+
+    def _scalar_to_int(self, value) -> int:
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+        try:
+            return int(float(value))
+        except Exception as e:
+            raise ValueError(f"Cannot coerce value to int: {value!r}") from e
 
     def _iter_years(self, start: pd.Timestamp, end: pd.Timestamp) -> Iterable[int]:
         for year in range(start.year, end.year + 1):
@@ -541,7 +555,12 @@ class BinanceVisionProvider(DataProvider):
 
         work["year"] = work["timestamp"].dt.year
         for year, year_df in work.groupby("year", sort=True):
-            year_path = self._year_parquet_path(symbol, interval, market_type, int(year))
+            year_path = self._year_parquet_path(
+                symbol,
+                interval,
+                market_type,
+                self._scalar_to_int(year),
+            )
             incoming = year_df.drop(columns=["year"]).copy()
 
             if os.path.exists(year_path):
@@ -866,15 +885,15 @@ class BinanceVisionProvider(DataProvider):
         if df.empty:
             return self._empty_ohlcv_df()
 
-        s = self._to_utc_timestamp(start) if start is not None else pd.NaT
-        e = self._to_utc_timestamp(end) if end is not None else pd.NaT
+        s = self._to_utc_timestamp(start)
+        e = self._to_utc_timestamp(end)
 
         out = df.copy()
         out["timestamp"] = self._normalize_timestamp_series(out["timestamp"])
 
-        if pd.notna(s):
+        if s is not None:
             out = out[out["timestamp"] >= s]
-        if pd.notna(e):
+        if e is not None:
             out = out[out["timestamp"] <= e]
 
         return out.reset_index(drop=True)
