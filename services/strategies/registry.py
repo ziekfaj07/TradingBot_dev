@@ -10,12 +10,11 @@ from services.strategies.bollinger_mean_reversion import BollingerMeanReversion
 
 
 STRATEGY_REGISTRY: dict[str, type[BaseStrategy]] = {
-    BollingerMeanReversion.name: BollingerMeanReversion,  
+    BollingerMeanReversion.name: BollingerMeanReversion,
     DonchianBreakoutStrategy.name: DonchianBreakoutStrategy,
     EmaCrossoverStrategy.name: EmaCrossoverStrategy,
     ThreeCandleReversalStrategy.name: ThreeCandleReversalStrategy,
 }
-
 
 def get_strategy(name: str, **params: Any) -> BaseStrategy:
     key = (name or "").strip().lower()

@@ -7,7 +7,7 @@ import math
 import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Any, Mapping, Optional, Sequence, cast
 
 import pandas as pd
 
@@ -79,6 +79,11 @@ class RunConfig:
     stop_loss_pct: float | None = None
     take_profit_pct: float | None = None
 
+    exit_mode: str = "static"   # "static" | "atr"
+    atr_period: int = 14
+    atr_stop_mult: float = 1.5
+    atr_take_mult: float = 2.5
+
     include_equity: bool = False
     equity_stride: int = 1
     poll_seconds: float = 5.0
@@ -127,13 +132,13 @@ class ModeController:
         self._state: Optional[PortfolioState] = None
         self._trade_id: int = 0
 
-        self._latest_bar: dict | None = None
-        self._bars: list[dict] = []
+        self._latest_bar: dict[str, Any] | None = None
+        self._bars: list[dict[str, Any]] = []
         self._last_processed_bar_ts: int | None = None
         self._last_signal: int = 0
         self._fills: list[Fill] = []
-        self._equity_points: list[dict] = []
-        self._trace: list[dict] = []
+        self._equity_points: list[dict[str, Any]] = []
+        self._trace: list[dict[str, Any]] = []
 
         self._risk_engine = RiskEngine()
         self._peak_equity: float = 0.0
@@ -454,6 +459,10 @@ class ModeController:
                 cooldown_seconds=cfg.cooldown_seconds,
                 stop_loss_pct=cfg.stop_loss_pct,
                 take_profit_pct=cfg.take_profit_pct,
+                exit_mode=cfg.exit_mode,
+                atr_period=cfg.atr_period,
+                atr_stop_mult=cfg.atr_stop_mult,
+                atr_take_mult=cfg.atr_take_mult,                
             )
 
             stopped_at = time.time()
@@ -477,7 +486,7 @@ class ModeController:
                     "fill_count": len(output.trades),
                     "equity_point_count": len(output.equity_curve),
                     "fills": [],
-                    "latest_equity": output.final_equity,
+                    "latest_equity": output.final_equity,                    
                     "paper_state": None,
                     "paper_metrics": None,
                     "chart_symbol": cfg.symbol,
@@ -492,6 +501,10 @@ class ModeController:
                         "cooldown_seconds": cfg.cooldown_seconds,
                         "stop_loss_pct": cfg.stop_loss_pct,
                         "take_profit_pct": cfg.take_profit_pct,
+                        "exit_mode": cfg.exit_mode,
+                        "atr_period": cfg.atr_period,
+                        "atr_stop_mult": cfg.atr_stop_mult,
+                        "atr_take_mult": cfg.atr_take_mult,                        
                     },
                 },
             }
@@ -642,7 +655,7 @@ class ModeController:
         safe_offset = max(0, offset)
 
         if not self._status.run_id:
-            rows = list(reversed(self._normalize_equity_points(self._equity_points)))
+            rows = list(reversed(self._normalize_equity_points(cast(Sequence[Mapping[str, Any]], self._equity_points))))
             sliced = rows[safe_offset:safe_offset + safe_limit]
             return {
                 "run_id": None,
@@ -658,11 +671,11 @@ class ModeController:
             offset=safe_offset,
             ascending=False,
         )
-        rows_desc = self._normalize_equity_points(rows_desc)
+        rows_desc = self._normalize_equity_points(cast(Sequence[Mapping[str, Any]], rows_desc))
         total = count_runtime_equity_snapshots(self._status.run_id)
 
         if not rows_desc and self._equity_points:
-            mem_rows = list(reversed(self._normalize_equity_points(self._equity_points)))
+            mem_rows = list(reversed(self._normalize_equity_points(cast(Sequence[Mapping[str, Any]], self._equity_points))))
             rows_desc = mem_rows[safe_offset:safe_offset + safe_limit]
             total = len(mem_rows)
 
@@ -703,8 +716,31 @@ class ModeController:
             "events": sliced,
         }
 
-    def _fill_dedupe_key(self, fill: Fill | dict) -> str:
-        data = fill.to_dict() if hasattr(fill, "to_dict") else dict(fill or {})
+    def _safe_float_value(self, value: Any, default: float = 0.0) -> float:
+        try:
+            if value is None:
+                return default
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _safe_int_value(self, value: Any, default: int = 0) -> int:
+        try:
+            if value is None:
+                return default
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _fill_to_dict(self, fill: Fill | Mapping[str, Any] | None) -> dict[str, Any]:
+        if fill is None:
+            return {}
+        if isinstance(fill, Fill):
+            return cast(dict[str, Any], fill.to_dict())
+        return dict(fill)
+
+    def _fill_dedupe_key(self, fill: Fill | Mapping[str, Any]) -> str:
+        data = self._fill_to_dict(fill)
         return "|".join(
             [
                 str(self._status.run_id or ""),
@@ -712,8 +748,8 @@ class ModeController:
                 str(data.get("type", "")),
                 str(data.get("side", "")),
                 str(data.get("trade_id", "")),
-                f"{float(data.get('price', 0.0)):.12f}",
-                f"{float(data.get('qty', 0.0)):.12f}",
+                f"{self._safe_float_value(data.get('price', 0.0)):.12f}",
+                f"{self._safe_float_value(data.get('qty', 0.0)):.12f}",
             ]
         )
 
@@ -729,10 +765,9 @@ class ModeController:
             old = self._recent_fill_keys.pop(0)
             self._recent_fill_key_set.discard(old)
 
-    def _is_duplicate_fill(self, fill: Fill | dict) -> bool:
+    def _is_duplicate_fill(self, fill: Fill | Mapping[str, Any]) -> bool:
         key = self._fill_dedupe_key(fill)
         return key in self._recent_fill_key_set
-
     async def _sleep_or_stop(self, seconds: float) -> None:
         timeout = max(0.05, float(seconds))
         try:
@@ -740,15 +775,19 @@ class ModeController:
         except asyncio.TimeoutError:
             return
 
-    def _stable_bars_for_signal(self, bars: list[dict]) -> tuple[list[dict], int | None]:
+    def _stable_bars_for_signal(
+        self,
+        bars: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], int | None]:
         confirmations = max(1, int(self._status.config.bar_confirmations or 1))
         if len(bars) <= confirmations:
             return [], None
 
         stable_bars = bars[:-confirmations]
-        processed_ts = stable_bars[-1]["timestamp"] if stable_bars else None
+        processed_ts = None
+        if stable_bars:
+            processed_ts = self._safe_int_value(stable_bars[-1].get("timestamp"), default=0) or None
         return stable_bars, processed_ts
-
     async def force_buy(self, price: float | None = None, note: str | None = None) -> dict:
         async with self._lock:
             if self._status.mode != Mode.PAPER:
@@ -773,13 +812,19 @@ class ModeController:
 
             if resolved_price is None and self._latest_bar:
                 try:
-                    resolved_price = float(self._latest_bar.get("close"))
+                    close_value = self._latest_bar.get("close")
+                    resolved_price = self._safe_float_value(close_value, 0.0)
+                    if resolved_price <= 0.0:
+                        resolved_price = None
                 except (TypeError, ValueError):
                     resolved_price = None
 
             if resolved_price is None and self._bars:
                 try:
-                    resolved_price = float(self._bars[-1].get("close"))
+                    close_value = self._bars[-1].get("close")
+                    resolved_price = self._safe_float_value(close_value, 0.0)
+                    if resolved_price <= 0.0:
+                        resolved_price = None
                 except (TypeError, ValueError):
                     resolved_price = None
 
@@ -1140,7 +1185,7 @@ class ModeController:
             "drawdown_pct": float(max(drawdown_pct, 0.0)),
         }
 
-    def _normalize_equity_point(self, point: dict) -> dict:
+    def _normalize_equity_point(self, point: Mapping[str, Any] | None) -> dict[str, Any]:
         if not point:
             return {
                 "ts": int(time.time()),
@@ -1154,54 +1199,28 @@ class ModeController:
                 "drawdown_pct": 0.0,
             }
 
-        ts_value = point.get("ts", point.get("timestamp"))
-        try:
-            ts_value = int(ts_value) if ts_value is not None else int(time.time())
-        except Exception:
-            ts_value = int(time.time())
+        ts_raw = point.get("ts", point.get("timestamp"))
+        ts_value = self._safe_int_value(ts_raw, int(time.time()))
 
-        balance_value = point.get("balance", point.get("cash"))
-        try:
-            balance_value = float(balance_value) if balance_value is not None else 0.0
-        except Exception:
-            balance_value = 0.0
+        balance_raw = point.get("balance", point.get("cash"))
+        balance_value = self._safe_float_value(balance_raw, 0.0)
 
-        equity_value = point.get("equity")
-        try:
-            equity_value = float(equity_value) if equity_value is not None else balance_value
-        except Exception:
-            equity_value = balance_value
+        equity_raw = point.get("equity")
+        equity_value = self._safe_float_value(equity_raw, balance_value)
 
-        market_price_value = point.get("market_price", point.get("price"))
-        if market_price_value is not None:
+        market_price_raw = point.get("market_price", point.get("price"))
+        market_price_value = None
+        if market_price_raw is not None:
             try:
-                market_price_value = float(market_price_value)
+                market_price_value = float(market_price_raw)
             except Exception:
                 market_price_value = None
 
-        position_qty_value = point.get("position_qty", 0.0)
-        try:
-            position_qty_value = float(position_qty_value)
-        except Exception:
-            position_qty_value = 0.0
-
-        unrealized_pnl_value = point.get("unrealized_pnl", 0.0)
-        try:
-            unrealized_pnl_value = float(unrealized_pnl_value)
-        except Exception:
-            unrealized_pnl_value = 0.0
-
-        realized_pnl_value = point.get("realized_pnl", 0.0)
-        try:
-            realized_pnl_value = float(realized_pnl_value)
-        except Exception:
-            realized_pnl_value = 0.0
-
-        drawdown_value = point.get("drawdown_pct", point.get("drawdown", 0.0))
-        try:
-            drawdown_value = float(drawdown_value) if drawdown_value is not None else 0.0
-        except Exception:
-            drawdown_value = 0.0
+        position_qty_value = self._safe_float_value(point.get("position_qty", 0.0), 0.0)
+        unrealized_pnl_value = self._safe_float_value(point.get("unrealized_pnl", 0.0), 0.0)
+        realized_pnl_value = self._safe_float_value(point.get("realized_pnl", 0.0), 0.0)
+        drawdown_raw = point.get("drawdown_pct", point.get("drawdown", 0.0))
+        drawdown_value = self._safe_float_value(drawdown_raw, 0.0)
 
         return {
             "ts": ts_value,
@@ -1214,10 +1233,8 @@ class ModeController:
             "realized_pnl": realized_pnl_value,
             "drawdown_pct": drawdown_value,
         }
-
-    def _normalize_equity_points(self, points: list[dict]) -> list[dict]:
+    def _normalize_equity_points(self, points: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
         return [self._normalize_equity_point(p) for p in points]
-
     def _record_equity_point(self) -> None:
         point = self._build_equity_point()
         if not point:
@@ -1225,10 +1242,10 @@ class ModeController:
 
         last = self._equity_points[-1] if self._equity_points else None
         if last:
-            same_ts = int(last.get("ts", 0)) == int(point["ts"])
-            same_equity = float(last.get("equity", 0.0)) == float(point["equity"])
-            same_balance = float(last.get("balance", 0.0)) == float(point["balance"])
-            same_qty = float(last.get("position_qty", 0.0)) == float(point["position_qty"])
+            same_ts = self._safe_int_value(last.get("ts"), 0) == self._safe_int_value(point.get("ts"), 0)
+            same_equity = self._safe_float_value(last.get("equity"), 0.0) == self._safe_float_value(point.get("equity"), 0.0)
+            same_balance = self._safe_float_value(last.get("balance"), 0.0) == self._safe_float_value(point.get("balance"), 0.0)
+            same_qty = self._safe_float_value(last.get("position_qty"), 0.0) == self._safe_float_value(point.get("position_qty"), 0.0)
             if same_ts and same_equity and same_balance and same_qty:
                 return
 
@@ -1239,17 +1256,16 @@ class ModeController:
         if self._status.run_id:
             insert_runtime_equity_snapshot(
                 self._status.run_id,
-                ts=int(point["ts"]),
-                balance=float(point["balance"]),
-                equity=float(point["equity"]),
-                market_price=point["market_price"],
-                position_qty=float(point["position_qty"]),
-                side=point["side"],
-                unrealized_pnl=float(point["unrealized_pnl"]),
-                realized_pnl=float(point["realized_pnl"]),
-                drawdown_pct=float(point["drawdown_pct"]),
+                ts=self._safe_int_value(point.get("ts"), int(time.time())),
+                balance=self._safe_float_value(point.get("balance"), 0.0),
+                equity=self._safe_float_value(point.get("equity"), 0.0),
+                market_price=point.get("market_price"),
+                position_qty=self._safe_float_value(point.get("position_qty"), 0.0),
+                side=point.get("side"),
+                unrealized_pnl=self._safe_float_value(point.get("unrealized_pnl"), 0.0),
+                realized_pnl=self._safe_float_value(point.get("realized_pnl"), 0.0),
+                drawdown_pct=self._safe_float_value(point.get("drawdown_pct"), 0.0),
             )
-
     def _build_metrics_payload(self) -> dict:
         raw_fills = []
         if self._status.run_id:
@@ -1257,7 +1273,7 @@ class ModeController:
         elif self._fills:
             raw_fills = list(self._fills)
 
-        raw_points = []
+        raw_points: Sequence[Mapping[str, Any]] = []
         if self._status.run_id:
             raw_points = load_runtime_equity_snapshots(
                 self._status.run_id,
@@ -1425,9 +1441,11 @@ class ModeController:
                 self._fills.append(fill)
                 self._remember_fill_key(self._fill_dedupe_key(fill))
 
-        self._equity_points = self._normalize_equity_points(
-            list(restored.get("equity_points") or restored.get("equity_snapshots") or [])
-        )
+        restored_points_raw = restored.get("equity_points") or restored.get("equity_snapshots") or []
+        restored_points: list[Mapping[str, Any]] = [
+            item for item in restored_points_raw if isinstance(item, Mapping)
+        ]
+        self._equity_points = self._normalize_equity_points(restored_points)
         self._reset_risk_runtime_locked()
         for fill in self._fills:
             self._register_fill_for_risk_locked(fill)
@@ -1928,6 +1946,12 @@ class ModeController:
             "trade_day": self._trade_day_key,
             "last_exit_ts": self._last_exit_ts,
             "risk_halt_reason": self._risk_halt_reason,
+            "exit_mode": self._status.config.exit_mode,
+            "atr_period": self._status.config.atr_period,
+            "atr_stop_mult": self._status.config.atr_stop_mult,
+            "atr_take_mult": self._status.config.atr_take_mult,
+            "maintenance_margin": self._status.config.maintenance_margin,
+            "max_leverage": self._status.config.max_leverage,
         }
 
     def _compute_entry_qty_locked(self, entry_price: float) -> float | None:
@@ -1949,7 +1973,7 @@ class ModeController:
     def _check_entry_gate_locked(self, market_price: float | None = None, now_ts: object | None = None) -> dict:
         self._roll_trade_day_if_needed(now_ts)
         current_equity = self._current_equity_locked(market_price)
-        self._peak_equity = max(float(self._peak_equity or 0.0), current_equity)
+        self._peak_equity = max(self._safe_float_value(self._peak_equity, 0.0), current_equity)
 
         effective_now_ts = now_ts
         if effective_now_ts is None and self._latest_bar and self._latest_bar.get("timestamp") is not None:
