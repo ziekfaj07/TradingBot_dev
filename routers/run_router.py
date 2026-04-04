@@ -48,7 +48,7 @@ class ConfigureBody(BaseModel):
     ema_short: int | None = None
     ema_long: int | None = None
     strategy_name: str | None = None
-    strategy_params: JSONDict | None = Field(default=None)
+    strategy_params: dict[str, Any] | None = Field(default=None)
     candle_limit: int | None = None
     debug_stream: bool | None = None
 
@@ -58,9 +58,15 @@ class ConfigureBody(BaseModel):
     max_drawdown_pct: float | None = None
     max_trades_per_day: int | None = None
     cooldown_seconds: int | None = None
-
+    
     stop_loss_pct: float | None = None
     take_profit_pct: float | None = None
+
+    # add these four
+    exit_mode: str | None = None
+    atr_period: int | None = None
+    atr_stop_mult: float | None = None
+    atr_take_mult: float | None = None
 
     @model_validator(mode="after")
     def validate_strategy_block(self) -> "ConfigureBody":
