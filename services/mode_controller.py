@@ -83,20 +83,26 @@ class RunConfig:
     atr_period: int = 14
     atr_stop_mult: float = 1.5
     atr_take_mult: float = 2.5
+    atr_reference_mode: str = "entry"  # "entry" | "floating"
 
     include_equity: bool = False
     equity_stride: int = 1
+    include_trades: bool = True
+    include_risk_events: bool = True
+    debug_risk_telemetry: bool = False
+    max_equity_points: int | None = 2000
+    max_trades_returned: int | None = None
+    max_risk_events_returned: int | None = None
+
     poll_seconds: float = 5.0
     bar_confirmations: int = 1
     max_reconnect_attempts: int = 8
     reconnect_backoff_base: float = 1.5
     dedupe_fill_window: int = 20
 
-    # legacy EMA fields kept for backward compatibility
     ema_short: int = 9
     ema_long: int = 21
 
-    # v0.4.5 generic strategy selection
     strategy_name: str = "ema_crossover"
     strategy_params: dict = field(default_factory=dict)
 
@@ -462,7 +468,14 @@ class ModeController:
                 exit_mode=cfg.exit_mode,
                 atr_period=cfg.atr_period,
                 atr_stop_mult=cfg.atr_stop_mult,
-                atr_take_mult=cfg.atr_take_mult,                
+                atr_take_mult=cfg.atr_take_mult,
+                atr_reference_mode=cfg.atr_reference_mode,
+                include_trades=cfg.include_trades,
+                include_risk_events=cfg.include_risk_events,
+                debug_risk_telemetry=cfg.debug_risk_telemetry,
+                max_equity_points=cfg.max_equity_points,
+                max_trades_returned=cfg.max_trades_returned,
+                max_risk_events_returned=cfg.max_risk_events_returned,
             )
 
             stopped_at = time.time()
@@ -486,7 +499,7 @@ class ModeController:
                     "fill_count": len(output.trades),
                     "equity_point_count": len(output.equity_curve),
                     "fills": [],
-                    "latest_equity": output.final_equity,                    
+                    "latest_equity": output.final_equity,
                     "paper_state": None,
                     "paper_metrics": None,
                     "chart_symbol": cfg.symbol,
@@ -504,7 +517,8 @@ class ModeController:
                         "exit_mode": cfg.exit_mode,
                         "atr_period": cfg.atr_period,
                         "atr_stop_mult": cfg.atr_stop_mult,
-                        "atr_take_mult": cfg.atr_take_mult,                        
+                        "atr_take_mult": cfg.atr_take_mult,
+                        "atr_reference_mode": cfg.atr_reference_mode,
                     },
                 },
             }
@@ -523,6 +537,7 @@ class ModeController:
                     "trades": output.trades,
                     "equity_curve": output.equity_curve,
                     "risk_events": output.risk_events,
+                    "metrics": output.metrics,
                 },
             }
 
@@ -768,6 +783,7 @@ class ModeController:
     def _is_duplicate_fill(self, fill: Fill | Mapping[str, Any]) -> bool:
         key = self._fill_dedupe_key(fill)
         return key in self._recent_fill_key_set
+
     async def _sleep_or_stop(self, seconds: float) -> None:
         timeout = max(0.05, float(seconds))
         try:
@@ -788,6 +804,7 @@ class ModeController:
         if stable_bars:
             processed_ts = self._safe_int_value(stable_bars[-1].get("timestamp"), default=0) or None
         return stable_bars, processed_ts
+
     async def force_buy(self, price: float | None = None, note: str | None = None) -> dict:
         async with self._lock:
             if self._status.mode != Mode.PAPER:
@@ -1233,8 +1250,10 @@ class ModeController:
             "realized_pnl": realized_pnl_value,
             "drawdown_pct": drawdown_value,
         }
+
     def _normalize_equity_points(self, points: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
         return [self._normalize_equity_point(p) for p in points]
+
     def _record_equity_point(self) -> None:
         point = self._build_equity_point()
         if not point:
@@ -1266,6 +1285,7 @@ class ModeController:
                 realized_pnl=self._safe_float_value(point.get("realized_pnl"), 0.0),
                 drawdown_pct=self._safe_float_value(point.get("drawdown_pct"), 0.0),
             )
+
     def _build_metrics_payload(self) -> dict:
         raw_fills = []
         if self._status.run_id:
@@ -1950,6 +1970,7 @@ class ModeController:
             "atr_period": self._status.config.atr_period,
             "atr_stop_mult": self._status.config.atr_stop_mult,
             "atr_take_mult": self._status.config.atr_take_mult,
+            "atr_reference_mode": self._status.config.atr_reference_mode,
             "maintenance_margin": self._status.config.maintenance_margin,
             "max_leverage": self._status.config.max_leverage,
         }
@@ -2067,5 +2088,6 @@ class ModeController:
             },
         )
         return True
+
 
 mode_controller = ModeController()

@@ -126,6 +126,26 @@ class RiskEngine:
         }
         return aliases.get(mode, mode)
 
+    def _normalize_atr_reference_mode(self, value: Any) -> str:
+        mode = str(value or "entry").strip().lower()
+
+        aliases = {
+            "entry_locked": "entry",
+            "entry-lock": "entry",
+            "entrylock": "entry",
+            "entry_frozen": "entry",
+            "entry-frozen": "entry",
+            "frozen": "entry",
+            "snapshot": "entry",
+            "locked": "entry",
+            "dynamic": "floating",
+            "trail": "floating",
+            "trailing": "floating",
+        }
+
+        normalized = aliases.get(mode, mode)
+        return "floating" if normalized == "floating" else "entry"
+
     def _coerce_epoch_seconds(self, value: Any) -> float | None:
         if value is None:
             return None

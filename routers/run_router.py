@@ -38,8 +38,16 @@ class ConfigureBody(BaseModel):
     maintenance_margin: float | None = None
     max_leverage: float | None = None
     max_qty: float | None = None
+
     include_equity: bool | None = None
     equity_stride: int | None = None
+    include_trades: bool | None = None
+    include_risk_events: bool | None = None
+    debug_risk_telemetry: bool | None = None
+    max_equity_points: int | None = None
+    max_trades_returned: int | None = None
+    max_risk_events_returned: int | None = None
+
     poll_seconds: float | None = None
     bar_confirmations: int | None = None
     max_reconnect_attempts: int | None = None
@@ -58,15 +66,15 @@ class ConfigureBody(BaseModel):
     max_drawdown_pct: float | None = None
     max_trades_per_day: int | None = None
     cooldown_seconds: int | None = None
-    
+
     stop_loss_pct: float | None = None
     take_profit_pct: float | None = None
 
-    # add these four
     exit_mode: str | None = None
     atr_period: int | None = None
     atr_stop_mult: float | None = None
     atr_take_mult: float | None = None
+    atr_reference_mode: str | None = None
 
     @model_validator(mode="after")
     def validate_strategy_block(self) -> "ConfigureBody":
