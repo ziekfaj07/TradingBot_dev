@@ -76,6 +76,14 @@ class ConfigureBody(BaseModel):
     atr_take_mult: float | None = None
     atr_reference_mode: str | None = None
 
+    # v0.6.4 / v0.6.4.1 liquidation + margin config
+    margin_mode: str | None = None
+    enable_liquidation: bool | None = None
+    use_mark_price_for_liquidation: bool | None = None
+    mark_price_source: str | None = None
+    liquidation_fee_rate: float | None = None
+    maintenance_margin_override: float | None = None    
+
     @model_validator(mode="after")
     def validate_strategy_block(self) -> "ConfigureBody":
         if self.strategy_name is None and self.strategy_params:

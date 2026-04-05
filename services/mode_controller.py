@@ -32,6 +32,7 @@ from core.database import (
 from core.execution_models import Fill, PortfolioState
 from core.run_naming import make_run_id
 from services.execution_engine import ExecutionEngine
+from services.margin_engine import evaluate_position_margin
 from services.market_data_service import CoinGeckoService, GateIOService
 from services.risk_engine import RiskEngine
 from services.runner import run_signal_backed_loop
@@ -84,6 +85,14 @@ class RunConfig:
     atr_stop_mult: float = 1.5
     atr_take_mult: float = 2.5
     atr_reference_mode: str = "entry"  # "entry" | "floating"
+
+    # v0.6.4 / v0.6.4.1 liquidation + margin config
+    margin_mode: str = "isolated"
+    enable_liquidation: bool = True
+    use_mark_price_for_liquidation: bool = True
+    mark_price_source: str = "close"
+    liquidation_fee_rate: float = 0.005
+    maintenance_margin_override: float | None = None    
 
     include_equity: bool = False
     equity_stride: int = 1
@@ -436,6 +445,7 @@ class ModeController:
                 maintenance_margin=cfg.maintenance_margin,
                 max_leverage=cfg.max_leverage,
                 max_qty=cfg.max_qty,
+                liquidation_fee_rate=cfg.liquidation_fee_rate,
             )
 
             state = PortfolioState(
@@ -447,6 +457,7 @@ class ModeController:
                 liquidation_price=None,
                 realized_pnl=0.0,
                 active_trade_id=None,
+                margin_mode=cfg.margin_mode,
             )
 
             output = run_signal_backed_loop(
@@ -455,6 +466,7 @@ class ModeController:
                 state=state,
                 market_type=cfg.market_type,
                 leverage=cfg.leverage,
+                allow_short=cfg.allow_short,                
                 include_equity=cfg.include_equity,
                 equity_stride=cfg.equity_stride,
                 risk_engine=self._risk_engine,
@@ -469,13 +481,11 @@ class ModeController:
                 atr_period=cfg.atr_period,
                 atr_stop_mult=cfg.atr_stop_mult,
                 atr_take_mult=cfg.atr_take_mult,
-                atr_reference_mode=cfg.atr_reference_mode,
-                include_trades=cfg.include_trades,
-                include_risk_events=cfg.include_risk_events,
-                debug_risk_telemetry=cfg.debug_risk_telemetry,
-                max_equity_points=cfg.max_equity_points,
-                max_trades_returned=cfg.max_trades_returned,
-                max_risk_events_returned=cfg.max_risk_events_returned,
+                margin_mode=cfg.margin_mode,
+                enable_liquidation=cfg.enable_liquidation,
+                use_mark_price_for_liquidation=cfg.use_mark_price_for_liquidation,
+                mark_price_source=cfg.mark_price_source,
+                maintenance_margin_override=cfg.maintenance_margin_override,
             )
 
             stopped_at = time.time()
@@ -537,7 +547,13 @@ class ModeController:
                     "trades": output.trades,
                     "equity_curve": output.equity_curve,
                     "risk_events": output.risk_events,
-                    "metrics": output.metrics,
+                    "metrics": self._build_backtest_metrics_from_output(
+                        initial_balance=cfg.initial_balance,
+                        final_equity=output.final_equity,
+                        trades=output.trades,
+                        equity_curve=output.equity_curve,
+                        liquidation_count=output.liquidation_count,
+                    ),                    
                 },
             }
 
@@ -1286,6 +1302,76 @@ class ModeController:
                 drawdown_pct=self._safe_float_value(point.get("drawdown_pct"), 0.0),
             )
 
+    def _build_backtest_metrics_from_output(
+        self,
+        *,
+        initial_balance: float,
+        final_equity: float,
+        trades: Sequence[Mapping[str, Any]],
+        equity_curve: Sequence[Mapping[str, Any]],
+        liquidation_count: int = 0,
+    ) -> dict:
+        initial_balance = float(initial_balance)
+        final_equity = float(final_equity)
+
+        total_return_pct = (
+            ((final_equity - initial_balance) / initial_balance) * 100.0
+            if initial_balance > 0.0
+            else 0.0
+        )
+
+        if equity_curve:
+            eq = [float(p.get("equity", initial_balance)) for p in equity_curve]
+        else:
+            eq = [initial_balance]
+            for t in trades:
+                if str(t.get("type", "")).upper() in {"EXIT", "LIQUIDATION"}:
+                    eq.append(float(t.get("equity_after", eq[-1])))
+
+        if not eq:
+            eq = [initial_balance]
+
+        peak = eq[0]
+        max_drawdown_pct = 0.0
+        for value in eq:
+            if value > peak:
+                peak = value
+            if peak > 0.0:
+                dd = ((peak - value) / peak) * 100.0
+                if dd > max_drawdown_pct:
+                    max_drawdown_pct = dd
+
+        exit_fills = [
+            t for t in trades
+            if str(t.get("type", "")).upper() in {"EXIT", "LIQUIDATION"}
+        ]
+
+        pnls = [float(t.get("pnl", 0.0) or 0.0) for t in exit_fills]
+        wins = [p for p in pnls if p > 0.0]
+        losses = [p for p in pnls if p < 0.0]
+
+        total_trades = len(pnls)
+        win_rate_pct = (len(wins) / total_trades * 100.0) if total_trades else 0.0
+
+        gross_profit = sum(wins)
+        gross_loss = abs(sum(losses))
+
+        if gross_loss > 0.0:
+            profit_factor = gross_profit / gross_loss
+        else:
+            profit_factor = gross_profit if gross_profit > 0.0 else 0.0
+
+        return {
+            "initial_balance": initial_balance,
+            "final_equity": final_equity,
+            "total_return_percent": total_return_pct,
+            "max_drawdown_percent": max_drawdown_pct,
+            "total_trades": total_trades,
+            "win_rate_percent": win_rate_pct,
+            "profit_factor": profit_factor,
+            "liquidation_count": int(liquidation_count),
+        }
+
     def _build_metrics_payload(self) -> dict:
         raw_fills = []
         if self._status.run_id:
@@ -1669,25 +1755,49 @@ class ModeController:
 
         self._update_peak_equity_locked(price)
 
-        if self._status.config.market_type == "futures":
-            is_liquidatable = self._engine.compute_liquidation_price(
-                state=self._state,
-                market_type=self._status.config.market_type,
-                market_price=price,
-                leverage=self._status.config.leverage,
-            )
-            self._state.liquidation_price = None
+        if self._status.config.market_type != "futures":
+            return
 
-            if is_liquidatable and self._state.position_qty != 0.0:
-                self._state, fill = self._engine.liquidate(
-                    ts_iso=str(int(time.time())),
-                    state=self._state,
-                    close=price,
-                    market_type=self._status.config.market_type,
-                    trade_id=self._trade_id,
-                )
-                if fill:
-                    await self._append_fill(fill)
+        if float(self._state.position_qty or 0.0) == 0.0:
+            self._state.mark_price = float(price)
+            self._state.liquidation_price = None
+            self._state.maintenance_margin = 0.0
+            self._state.maintenance_margin_rate = 0.0
+            self._state.maintenance_amount = 0.0
+            self._state.margin_balance = 0.0
+            self._state.margin_ratio = None
+            self._state.bankruptcy_price = None
+            return
+
+        snapshot = evaluate_position_margin(
+            state=self._state,
+            market_type=self._status.config.market_type,
+            mark_price=float(price),
+            leverage=self._status.config.leverage,
+            margin_mode=self._status.config.margin_mode,
+            maintenance_margin_override=self._status.config.maintenance_margin_override,
+        )
+
+        self._engine.apply_margin_snapshot(self._state, snapshot)
+
+        if not self._status.config.enable_liquidation:
+            return
+
+        if snapshot is None or not snapshot.should_liquidate:
+            return
+
+        self._state, fill = self._engine.liquidate(
+            ts_iso=str(int(time.time())),
+            state=self._state,
+            close=float(price),
+            market_type=self._status.config.market_type,
+            trade_id=self._trade_id,
+            exec_price=snapshot.liquidation_price,
+            mark_price=snapshot.mark_price,
+            margin_snapshot=snapshot,
+        )
+        if fill:
+            await self._append_fill(fill)
 
     async def _run_loop(self) -> None:
         try:

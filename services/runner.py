@@ -1,12 +1,22 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 import pandas as pd
 
 from core.execution_models import PortfolioState
 from services.execution_engine import ExecutionEngine
+from services.margin_engine import (
+    DEFAULT_MARGIN_TIERS,
+    MarginSnapshot,
+    MarginTier,
+    MarginTierResolver,
+    derive_mark_price,
+    evaluate_position_margin,
+)
 from services.risk_engine import RiskEngine
 
 
@@ -18,7 +28,10 @@ class RunOutput:
     final_equity: float
     liquidated: bool
     risk_events: list[dict]
-    metrics: dict
+    liquidation_count: int = 0
+    max_margin_ratio: float | None = None
+    closest_liquidation_distance_pct: float | None = None
+    last_margin_snapshot: dict | None = None
 
 
 def _to_utc_timestamp(value: Any) -> pd.Timestamp:
@@ -26,13 +39,10 @@ def _to_utc_timestamp(value: Any) -> pd.Timestamp:
         ts = value
     else:
         ts = pd.to_datetime(value, errors="coerce", utc=True)
-
     if pd.isna(ts):
         raise ValueError(f"Invalid timestamp in backtest loop: {value!r}")
-
     if ts.tzinfo is None:
         return ts.tz_localize("UTC")
-
     return ts.tz_convert("UTC")
 
 
@@ -47,7 +57,6 @@ def _compute_atr(
     period: int,
 ) -> pd.Series:
     safe_period = max(1, int(period or 14))
-
     high = pd.to_numeric(df["high"], errors="coerce")
     low = pd.to_numeric(df["low"], errors="coerce")
     close = pd.to_numeric(df["close"], errors="coerce")
@@ -66,6 +75,27 @@ def _compute_atr(
     return atr
 
 
+def _snapshot_to_dict(snapshot: MarginSnapshot | None) -> dict | None:
+    if snapshot is None:
+        return None
+    return {
+        "mark_price": float(snapshot.mark_price),
+        "notional": float(snapshot.notional),
+        "unrealized_pnl": float(snapshot.unrealized_pnl),
+        "collateral": float(snapshot.collateral),
+        "maintenance_margin": float(snapshot.maintenance_margin),
+        "maintenance_margin_rate": float(snapshot.maintenance_margin_rate),
+        "maintenance_amount": float(snapshot.maintenance_amount),
+        "margin_balance": float(snapshot.margin_balance),
+        "margin_ratio": snapshot.margin_ratio,
+        "liquidation_price": snapshot.liquidation_price,
+        "bankruptcy_price": snapshot.bankruptcy_price,
+        "should_liquidate": bool(snapshot.should_liquidate),
+        "margin_mode": snapshot.margin_mode,
+        "active_tier_cap": snapshot.active_tier_cap,
+    }
+
+
 def run_signal_backed_loop(
     df: Any,
     *,
@@ -73,6 +103,7 @@ def run_signal_backed_loop(
     state: PortfolioState,
     market_type: str,
     leverage: float,
+    allow_short: bool = False,    
     include_equity: bool = False,
     equity_stride: int = 1,
     risk_engine: RiskEngine | None = None,
@@ -87,13 +118,12 @@ def run_signal_backed_loop(
     atr_period: int = 14,
     atr_stop_mult: float | None = 1.5,
     atr_take_mult: float | None = 2.5,
-    atr_reference_mode: str = "entry",
-    include_trades: bool = True,
-    include_risk_events: bool = True,
-    debug_risk_telemetry: bool = False,
-    max_equity_points: int | None = 2000,
-    max_trades_returned: int | None = None,
-    max_risk_events_returned: int | None = None,
+    margin_mode: str = "isolated",
+    enable_liquidation: bool = True,
+    use_mark_price_for_liquidation: bool = True,
+    mark_price_source: str = "close",
+    maintenance_margin_override: float | None = None,
+    margin_tiers: list[MarginTier] | None = None,
 ) -> RunOutput:
     """
     Expects df to have columns: timestamp, close, signal.
@@ -107,11 +137,9 @@ def run_signal_backed_loop(
         df = df.copy()
 
     risk_engine = risk_engine or RiskEngine()
-    normalized_exit_mode = risk_engine._normalize_exit_mode(exit_mode)
-    normalized_atr_reference_mode = risk_engine._normalize_atr_reference_mode(
-        atr_reference_mode
-    )
+    resolver = MarginTierResolver(margin_tiers or DEFAULT_MARGIN_TIERS)
 
+    normalized_exit_mode = risk_engine._normalize_exit_mode(exit_mode)
     if normalized_exit_mode == "atr":
         required_cols = {"high", "low", "close"}
         missing = required_cols - set(df.columns)
@@ -121,49 +149,41 @@ def run_signal_backed_loop(
             )
         df["atr"] = _compute_atr(df, period=atr_period)
 
-    row_count = len(df)
-
-    safe_equity_stride = max(1, int(equity_stride or 1))
-    if include_equity and max_equity_points is not None and max_equity_points > 0:
-        min_stride_for_cap = max(
-            1, (row_count + max_equity_points - 1) // max_equity_points
-        )
-        safe_equity_stride = max(safe_equity_stride, min_stride_for_cap)
-
-    timestamps = df["timestamp"].tolist()
-    closes = pd.to_numeric(df["close"], errors="coerce").tolist()
-    signals = (
-        pd.to_numeric(df["signal"], errors="coerce").fillna(0).astype(int).tolist()
-    )
-    atr_values = df["atr"].tolist() if normalized_exit_mode == "atr" else None
-
     trades: list[dict] = []
     equity_curve: list[dict] = []
     risk_events: list[dict] = []
+
     liquidated = False
+    liquidation_count = 0
     trade_id = 0
-
-    initial_balance = float(state.cash)    
     open_trade_equity_baseline = float(state.cash)
-
     trades_today = 0
     last_exit_ts: Any = None
     peak_equity = float(state.cash)
     trade_day: str | None = None
+    max_margin_ratio: float | None = None
+    closest_liquidation_distance_pct: float | None = None
+    last_margin_snapshot: dict | None = None
 
-    active_atr_value: float | None = None
-    active_stop_price: float | None = None
-    active_take_price: float | None = None
+    state.margin_mode = str(margin_mode or getattr(state, "margin_mode", "isolated")).strip().lower()
 
-    for i in range(row_count):
-        ts = _to_utc_timestamp(timestamps[i])
+    has_high = "high" in df.columns
+    has_low = "low" in df.columns
+    has_open = "open" in df.columns
+
+    for i in range(len(df)):
+        ts = _to_utc_timestamp(df["timestamp"].iloc[i])
         ts_iso = ts.isoformat()
-        close = float(closes[i])
-        signal = int(signals[i])
+
+        open_price = float(df["open"].iloc[i]) if has_open and pd.notna(df["open"].iloc[i]) else None
+        high_price = float(df["high"].iloc[i]) if has_high and pd.notna(df["high"].iloc[i]) else None
+        low_price = float(df["low"].iloc[i]) if has_low and pd.notna(df["low"].iloc[i]) else None
+        close = float(df["close"].iloc[i])
+        signal = int(df["signal"].iloc[i])
 
         current_atr: float | None = None
         if normalized_exit_mode == "atr":
-            atr_raw = atr_values[i] if atr_values is not None else None
+            atr_raw = df["atr"].iloc[i]
             if pd.notna(atr_raw):
                 current_atr = float(atr_raw)
 
@@ -172,338 +192,456 @@ def run_signal_backed_loop(
             trade_day = day_key
             trades_today = 0
 
+        mark_price = derive_mark_price(
+            close=close,
+            high=high_price,
+            low=low_price,
+            open_price=open_price,
+            source=mark_price_source,
+        )
+
         current_equity = float(engine.mark_equity(state, market_type, close))
         peak_equity = max(peak_equity, current_equity)
 
-        # 1) Hard liquidation guard first
+        current_margin_snapshot: MarginSnapshot | None = None
         if (
-            engine.compute_liquidation_price(
+            str(market_type or "spot").lower() == "futures"
+            and state.position_qty != 0.0
+            and use_mark_price_for_liquidation
+        ):
+            current_margin_snapshot = evaluate_position_margin(
                 state=state,
                 market_type=market_type,
-                market_price=close,
+                mark_price=mark_price,
                 leverage=leverage,
+                margin_mode=state.margin_mode,
+                resolver=resolver,
+                maintenance_margin_override=maintenance_margin_override,
             )
-            and state.position_qty != 0.0
-        ):
-            state, fill = engine.liquidate(ts_iso, state, close, market_type, trade_id)
-            if fill:
-                trades.append(fill.__dict__)
-                liquidated = True
-                open_trade_equity_baseline = float(state.cash)
-                last_exit_ts = getattr(fill, "timestamp", None) or ts_iso
+            engine.apply_margin_snapshot(state, current_margin_snapshot)
+            last_margin_snapshot = _snapshot_to_dict(current_margin_snapshot)
 
-                active_atr_value = None
-                active_stop_price = None
-                active_take_price = None
+            if current_margin_snapshot is not None and current_margin_snapshot.margin_ratio is not None:
+                ratio = current_margin_snapshot.margin_ratio
+                if ratio is not None and math.isfinite(ratio):
+                    max_margin_ratio = ratio if max_margin_ratio is None else max(max_margin_ratio, ratio)
 
-                risk_events.append(
-                    {
-                        "timestamp": ts_iso,
-                        "event": "liquidation",
-                        "reason": "maintenance_margin",
-                        "meta": {
-                            "market_price": close,
-                            "maintenance_margin_check": True,
-                        },
-                    }
-                )
-                trade_id += 1
-
-        # 2) Risk exit (static or ATR)
-        if state.position_qty > 0.0:
-            atr_for_exit: float | None = current_atr
             if (
-                normalized_exit_mode == "atr"
-                and normalized_atr_reference_mode == "entry"
+                current_margin_snapshot is not None
+                and current_margin_snapshot.liquidation_price is not None
+                and current_margin_snapshot.mark_price > 0.0
             ):
-                atr_for_exit = active_atr_value
+                dist_pct = (
+                    abs(current_margin_snapshot.mark_price - current_margin_snapshot.liquidation_price)
+                    / current_margin_snapshot.mark_price
+                    * 100.0
+                )
+                if math.isfinite(dist_pct):
+                    closest_liquidation_distance_pct = (
+                        dist_pct
+                        if closest_liquidation_distance_pct is None
+                        else min(closest_liquidation_distance_pct, dist_pct)
+                    )
 
-            exit_signal = risk_engine.evaluate_long_exit(
-                entry_price=state.entry_price,
-                market_price=close,
-                stop_loss_pct=stop_loss_pct,
-                take_profit_pct=take_profit_pct,
-                exit_mode=normalized_exit_mode,
-                atr_value=atr_for_exit,
-                atr_stop_mult=atr_stop_mult,
-                atr_take_mult=atr_take_mult,
-            )
+        # 1) Hard liquidation guard first
+        if (
+            enable_liquidation
+            and str(market_type or "spot").lower() == "futures"
+            and state.position_qty != 0.0
+            and current_margin_snapshot is not None
+            and current_margin_snapshot.liquidation_price is not None
+        ):
+            liq_px = float(current_margin_snapshot.liquidation_price)
+            side = str(state.side or "long").lower()
 
-            if exit_signal.meta is None:
-                exit_signal.meta = {}
+            if side == "short":
+                breached = high_price is not None and high_price >= liq_px
+            else:
+                breached = low_price is not None and low_price <= liq_px
 
-            exit_signal.meta["atr_reference_mode"] = normalized_atr_reference_mode
-            exit_signal.meta["atr_active_value"] = atr_for_exit
-            exit_signal.meta["atr_entry_value"] = active_atr_value
-            exit_signal.meta["active_stop_price"] = active_stop_price
-            exit_signal.meta["active_take_price"] = active_take_price
-
-            if exit_signal.should_exit:
-                trade_id += 1
-                state, fill = engine.exit_long(
-                    ts_iso, state, close, market_type, trade_id
+            if current_margin_snapshot.should_liquidate or breached:
+                state, fill = engine.liquidate(
+                    ts_iso,
+                    state,
+                    close,
+                    market_type,
+                    trade_id,
+                    exec_price=liq_px,
+                    mark_price=mark_price,
+                    margin_snapshot=current_margin_snapshot,
                 )
                 if fill:
-                    realized_pnl = float(fill.equity_after) - float(
-                        open_trade_equity_baseline
-                    )
-                    fill.pnl = realized_pnl
                     trades.append(fill.__dict__)
-                    open_trade_equity_baseline = float(fill.equity_after)
+                    liquidated = True
+                    liquidation_count += 1
+                    open_trade_equity_baseline = float(state.cash)
                     last_exit_ts = getattr(fill, "timestamp", None) or ts_iso
-                    active_atr_value = None
-                    active_stop_price = None
-                    active_take_price = None
                     risk_events.append(
                         {
                             "timestamp": ts_iso,
-                            "event": "risk_event",
-                            "reason": exit_signal.reason,
-                            "meta": exit_signal.meta or {},
+                            "event": "liquidation",
+                            "reason": "maintenance_margin",
+                            "meta": {
+                                "mark_price": mark_price,
+                                "close": close,
+                                "high": high_price,
+                                "low": low_price,
+                                "liquidation_price": liq_px,
+                                "margin_snapshot": _snapshot_to_dict(current_margin_snapshot),
+                            },
                         }
                     )
-
-        # 3) Entry
-        if signal == 1 and state.position_qty == 0.0:
-            if (
-                normalized_exit_mode == "atr"
-                and normalized_atr_reference_mode == "entry"
-                and (current_atr is None or current_atr <= 0.0)
-            ):
-                risk_events.append(
-                    {
-                        "timestamp": ts_iso,
-                        "event": "entry_blocked",
-                        "reason": "atr_not_ready",
-                        "meta": {
-                            "exit_mode": normalized_exit_mode,
-                            "atr_reference_mode": normalized_atr_reference_mode,
-                            "atr_value": current_atr,
-                            "atr_period": atr_period,
-                        },
-                    }
-                )
-            else:
-                gate = risk_engine.evaluate_entry_gate(
-                    now_ts=ts,
-                    current_equity=current_equity,
-                    peak_equity=peak_equity,
-                    trades_today=trades_today,
-                    last_exit_ts=last_exit_ts,
-                    max_drawdown_pct=max_drawdown_pct,
-                    max_trades_per_day=max_trades_per_day,
-                    cooldown_seconds=cooldown_seconds,
-                )
-
-                if gate.allowed:
-                    qty_override = risk_engine.compute_entry_qty(
-                        state=state,
-                        market_type=market_type,
-                        entry_price=close,
-                        leverage=leverage,
-                        fee_rate=engine.fee_rate,
-                        max_leverage=engine.max_leverage,
-                        max_qty=engine.max_qty,
-                        sizing_mode=position_sizing_mode,
-                        sizing_value=position_size_value,
-                    )
-
                     trade_id += 1
-                    state, fill = engine.enter_long(
+                    eq = engine.mark_equity(state, market_type, close)
+                    peak_equity = max(peak_equity, float(eq))
+                    if include_equity:
+                        if equity_stride <= 1 or (i % equity_stride == 0):
+                            equity_curve.append(
+                                {
+                                    "timestamp": ts_iso,
+                                    "equity": float(eq),
+                                    "mark_price": float(mark_price),
+                                    "margin_ratio": None,
+                                    "liquidation_price": None,
+                                }
+                            )
+                    continue
+
+        # 2) Risk exit (static or ATR)
+        if state.position_qty > 0.0:
+            side = str(state.side or "long").lower()
+
+            if side == "short":
+                short_entry_price = float(state.entry_price) if state.entry_price is not None else close
+                synthetic_market_price = (2.0 * short_entry_price) - close
+
+                exit_signal = risk_engine.evaluate_long_exit(
+                    entry_price=short_entry_price,
+                    market_price=synthetic_market_price,
+                    stop_loss_pct=stop_loss_pct,
+                    take_profit_pct=take_profit_pct,
+                    exit_mode=normalized_exit_mode,
+                    atr_value=current_atr,
+                    atr_stop_mult=atr_stop_mult,
+                    atr_take_mult=atr_take_mult,
+                )
+
+                if exit_signal.should_exit:
+                    trade_id += 1
+                    state, fill = engine.exit_short(
                         ts_iso,
                         state,
                         close,
                         market_type,
-                        leverage,
                         trade_id,
-                        qty_override=qty_override,
+                        exit_reason=str(exit_signal.reason or "risk_exit"),
+                        mark_price=mark_price if str(market_type or "spot").lower() == "futures" else None,
+                        liquidation_price=(
+                            current_margin_snapshot.liquidation_price
+                            if current_margin_snapshot is not None
+                            else None
+                        ),
+                        maintenance_margin=(
+                            current_margin_snapshot.maintenance_margin
+                            if current_margin_snapshot is not None
+                            else None
+                        ),
+                        margin_balance=(
+                            current_margin_snapshot.margin_balance
+                            if current_margin_snapshot is not None
+                            else None
+                        ),
+                        margin_ratio=(
+                            current_margin_snapshot.margin_ratio
+                            if current_margin_snapshot is not None
+                            else None
+                        ),
                     )
-
                     if fill:
+                        realized_pnl = float(fill.equity_after) - float(open_trade_equity_baseline)
+                        fill.pnl = realized_pnl
                         trades.append(fill.__dict__)
-                        open_trade_equity_baseline = float(
-                            engine.mark_equity(state, market_type, close)
+                        open_trade_equity_baseline = float(fill.equity_after)
+                        last_exit_ts = getattr(fill, "timestamp", None) or ts_iso
+                        risk_events.append(
+                            {
+                                "timestamp": ts_iso,
+                                "event": "risk_event",
+                                "reason": exit_signal.reason,
+                                "meta": exit_signal.meta or {},
+                            }
                         )
-                        trades_today += 1
 
-                        if normalized_exit_mode == "atr":
-                            if normalized_atr_reference_mode == "entry":
-                                active_atr_value = (
-                                    float(current_atr)
-                                    if current_atr is not None
-                                    else None
-                                )
-                            else:
-                                active_atr_value = None
-
-                            entry_levels = risk_engine.resolve_long_exit_levels(
-                                entry_price=state.entry_price,
-                                stop_loss_pct=stop_loss_pct,
-                                take_profit_pct=take_profit_pct,
-                                exit_mode=normalized_exit_mode,
-                                atr_value=(
-                                    active_atr_value
-                                    if normalized_atr_reference_mode == "entry"
-                                    else current_atr
-                                ),
-                                atr_stop_mult=atr_stop_mult,
-                                atr_take_mult=atr_take_mult,
-                            )
-                            active_stop_price = entry_levels.stop_price
-                            active_take_price = entry_levels.take_price
-
-                            trades[-1]["atr_reference_mode"] = (
-                                normalized_atr_reference_mode
-                            )
-                            trades[-1]["atr_entry_value"] = active_atr_value
-                            trades[-1]["stop_price"] = active_stop_price
-                            trades[-1]["take_price"] = active_take_price
-                else:
-                    risk_events.append(
-                        {
-                            "timestamp": ts_iso,
-                            "event": "entry_blocked",
-                            "reason": gate.reason,
-                            "meta": gate.meta or {},
-                        }
+            else:
+                exit_signal = risk_engine.evaluate_long_exit(
+                    entry_price=state.entry_price,
+                    market_price=close,
+                    stop_loss_pct=stop_loss_pct,
+                    take_profit_pct=take_profit_pct,
+                    exit_mode=normalized_exit_mode,
+                    atr_value=current_atr,
+                    atr_stop_mult=atr_stop_mult,
+                    atr_take_mult=atr_take_mult,
+                )
+                if exit_signal.should_exit:
+                    trade_id += 1
+                    state, fill = engine.exit_long(
+                        ts_iso,
+                        state,
+                        close,
+                        market_type,
+                        trade_id,
+                        exit_reason=str(exit_signal.reason or "risk_exit"),
+                        mark_price=mark_price if str(market_type or "spot").lower() == "futures" else None,
+                        liquidation_price=(
+                            current_margin_snapshot.liquidation_price
+                            if current_margin_snapshot is not None
+                            else None
+                        ),
+                        maintenance_margin=(
+                            current_margin_snapshot.maintenance_margin
+                            if current_margin_snapshot is not None
+                            else None
+                        ),
+                        margin_balance=(
+                            current_margin_snapshot.margin_balance
+                            if current_margin_snapshot is not None
+                            else None
+                        ),
+                        margin_ratio=(
+                            current_margin_snapshot.margin_ratio
+                            if current_margin_snapshot is not None
+                            else None
+                        ),
                     )
+                    if fill:
+                        realized_pnl = float(fill.equity_after) - float(open_trade_equity_baseline)
+                        fill.pnl = realized_pnl
+                        trades.append(fill.__dict__)
+                        open_trade_equity_baseline = float(fill.equity_after)
+                        last_exit_ts = getattr(fill, "timestamp", None) or ts_iso
+                        risk_events.append(
+                            {
+                                "timestamp": ts_iso,
+                                "event": "risk_event",
+                                "reason": exit_signal.reason,
+                                "meta": exit_signal.meta or {},
+                            }
+                        )
+
+        # 3) Entry
+        if signal == 1 and state.position_qty == 0.0:
+            gate = risk_engine.evaluate_entry_gate(
+                now_ts=ts,
+                current_equity=current_equity,
+                peak_equity=peak_equity,
+                trades_today=trades_today,
+                last_exit_ts=last_exit_ts,
+                max_drawdown_pct=max_drawdown_pct,
+                max_trades_per_day=max_trades_per_day,
+                cooldown_seconds=cooldown_seconds,
+            )
+            if gate.allowed:
+                qty_override = risk_engine.compute_entry_qty(
+                    state=state,
+                    market_type=market_type,
+                    entry_price=close,
+                    leverage=leverage,
+                    fee_rate=engine.fee_rate,
+                    max_leverage=engine.max_leverage,
+                    max_qty=engine.max_qty,
+                    sizing_mode=position_sizing_mode,
+                    sizing_value=position_size_value,
+                )
+                trade_id += 1
+                state, fill = engine.enter_long(
+                    ts_iso,
+                    state,
+                    close,
+                    market_type,
+                    leverage,
+                    trade_id,
+                    qty_override=qty_override,
+                )
+                if fill:
+                    trades.append(fill.__dict__)
+                    open_trade_equity_baseline = float(engine.mark_equity(state, market_type, close))
+                    trades_today += 1
+            else:
+                risk_events.append(
+                    {
+                        "timestamp": ts_iso,
+                        "event": "entry_blocked",
+                        "reason": gate.reason,
+                        "meta": gate.meta or {},
+                    }
+                )
+
+        elif (
+            signal == -1
+            and state.position_qty == 0.0
+            and str(market_type or "spot").lower() == "futures"
+            and bool(getattr(risk_engine, "_allow_short_override", True))
+        ):
+            gate = risk_engine.evaluate_entry_gate(
+                now_ts=ts,
+                current_equity=current_equity,
+                peak_equity=peak_equity,
+                trades_today=trades_today,
+                last_exit_ts=last_exit_ts,
+                max_drawdown_pct=max_drawdown_pct,
+                max_trades_per_day=max_trades_per_day,
+                cooldown_seconds=cooldown_seconds,
+            )
+            if gate.allowed:
+                qty_override = risk_engine.compute_entry_qty(
+                    state=state,
+                    market_type=market_type,
+                    entry_price=close,
+                    leverage=leverage,
+                    fee_rate=engine.fee_rate,
+                    max_leverage=engine.max_leverage,
+                    max_qty=engine.max_qty,
+                    sizing_mode=position_sizing_mode,
+                    sizing_value=position_size_value,
+                )
+                trade_id += 1
+                state, fill = engine.enter_short(
+                    ts_iso,
+                    state,
+                    close,
+                    market_type,
+                    leverage,
+                    trade_id,
+                    qty_override=qty_override,
+                )
+                if fill:
+                    trades.append(fill.__dict__)
+                    open_trade_equity_baseline = float(engine.mark_equity(state, market_type, close))
+                    trades_today += 1
+            else:
+                risk_events.append(
+                    {
+                        "timestamp": ts_iso,
+                        "event": "entry_blocked",
+                        "reason": gate.reason,
+                        "meta": gate.meta or {},
+                    }
+                )
 
         # 4) Strategy exit
-        elif signal == -1 and state.position_qty > 0.0:
+        elif signal == -1 and state.position_qty > 0.0 and str(state.side or "long").lower() == "long":
             trade_id += 1
-            state, fill = engine.exit_long(ts_iso, state, close, market_type, trade_id)
+            state, fill = engine.exit_long(
+                ts_iso,
+                state,
+                close,
+                market_type,
+                trade_id,
+                exit_reason="signal_exit",
+                mark_price=mark_price if str(market_type or "spot").lower() == "futures" else None,
+                liquidation_price=(
+                    current_margin_snapshot.liquidation_price
+                    if current_margin_snapshot is not None
+                    else None
+                ),
+                maintenance_margin=(
+                    current_margin_snapshot.maintenance_margin
+                    if current_margin_snapshot is not None
+                    else None
+                ),
+                margin_balance=(
+                    current_margin_snapshot.margin_balance
+                    if current_margin_snapshot is not None
+                    else None
+                ),
+                margin_ratio=(
+                    current_margin_snapshot.margin_ratio
+                    if current_margin_snapshot is not None
+                    else None
+                ),
+            )
             if fill:
-                realized_pnl = float(fill.equity_after) - float(
-                    open_trade_equity_baseline
-                )
+                realized_pnl = float(fill.equity_after) - float(open_trade_equity_baseline)
                 fill.pnl = realized_pnl
                 trades.append(fill.__dict__)
                 open_trade_equity_baseline = float(fill.equity_after)
                 last_exit_ts = getattr(fill, "timestamp", None) or ts_iso
-                active_atr_value = None
-                active_stop_price = None
-                active_take_price = None
+
+        elif signal == 1 and state.position_qty > 0.0 and str(state.side or "").lower() == "short":
+            trade_id += 1
+            state, fill = engine.exit_short(
+                ts_iso,
+                state,
+                close,
+                market_type,
+                trade_id,
+                exit_reason="signal_exit",
+                mark_price=mark_price if str(market_type or "spot").lower() == "futures" else None,
+                liquidation_price=(
+                    current_margin_snapshot.liquidation_price
+                    if current_margin_snapshot is not None
+                    else None
+                ),
+                maintenance_margin=(
+                    current_margin_snapshot.maintenance_margin
+                    if current_margin_snapshot is not None
+                    else None
+                ),
+                margin_balance=(
+                    current_margin_snapshot.margin_balance
+                    if current_margin_snapshot is not None
+                    else None
+                ),
+                margin_ratio=(
+                    current_margin_snapshot.margin_ratio
+                    if current_margin_snapshot is not None
+                    else None
+                ),
+            )
+            if fill:
+                realized_pnl = float(fill.equity_after) - float(open_trade_equity_baseline)
+                fill.pnl = realized_pnl
+                trades.append(fill.__dict__)
+                open_trade_equity_baseline = float(fill.equity_after)
+                last_exit_ts = getattr(fill, "timestamp", None) or ts_iso
 
         eq = engine.mark_equity(state, market_type, close)
         peak_equity = max(peak_equity, float(eq))
 
         if include_equity:
-            if safe_equity_stride <= 1 or (i % safe_equity_stride == 0):
+            if equity_stride <= 1 or (i % equity_stride == 0):
                 point = {
                     "timestamp": ts_iso,
                     "equity": float(eq),
                 }
-
-                if normalized_exit_mode == "atr" and debug_risk_telemetry:
-                    point["atr"] = (
-                        float(current_atr) if current_atr is not None else None
-                    )
-                    point["atr_reference_mode"] = normalized_atr_reference_mode
-                    point["atr_active_value"] = (
-                        float(active_atr_value)
-                        if active_atr_value is not None
+                if normalized_exit_mode == "atr":
+                    point["atr"] = float(current_atr) if current_atr is not None else None
+                if str(market_type or "spot").lower() == "futures":
+                    point["mark_price"] = float(mark_price)
+                    point["margin_ratio"] = (
+                        current_margin_snapshot.margin_ratio
+                        if current_margin_snapshot is not None
                         else None
                     )
-                    point["active_stop_price"] = active_stop_price
-                    point["active_take_price"] = active_take_price
-
+                    point["liquidation_price"] = (
+                        current_margin_snapshot.liquidation_price
+                        if current_margin_snapshot is not None
+                        else None
+                    )
                 equity_curve.append(point)
 
-    final_equity = float(engine.mark_equity(state, market_type, float(closes[-1])))
-
-    returned_trades = trades if include_trades else []
-    returned_risk_events = risk_events if include_risk_events else []
-
-    if max_trades_returned is not None and max_trades_returned >= 0:
-        returned_trades = returned_trades[-max_trades_returned:]
-
-    if max_risk_events_returned is not None and max_risk_events_returned >= 0:
-        returned_risk_events = returned_risk_events[-max_risk_events_returned:]
-
-    closed_trades = [
-        t
-        for t in trades
-        if str(t.get("type", "")).upper() == "EXIT" and t.get("pnl") is not None
-    ]
-
-    total_trades = len(closed_trades)
-    wins = sum(1 for t in closed_trades if float(t.get("pnl", 0.0)) > 0.0)
-    losses = sum(1 for t in closed_trades if float(t.get("pnl", 0.0)) < 0.0)
-
-    gross_profit = sum(
-        float(t.get("pnl", 0.0))
-        for t in closed_trades
-        if float(t.get("pnl", 0.0)) > 0.0
-    )
-    gross_loss = abs(
-        sum(
-            float(t.get("pnl", 0.0))
-            for t in closed_trades
-            if float(t.get("pnl", 0.0)) < 0.0
-        )
-    )
-
-    win_rate = (wins / total_trades) if total_trades > 0 else 0.0
-    avg_pnl = (
-        sum(float(t.get("pnl", 0.0)) for t in closed_trades) / total_trades
-        if total_trades > 0
-        else 0.0
-    )
-    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else None
-
-    starting_equity = initial_balance
-    peak_seen = starting_equity
-    max_drawdown_pct_seen = 0.0
-
-    if equity_curve:
-        equity_scan_source = equity_curve
-    else:
-        equity_scan_source = [{"equity": starting_equity}]
-        for t in trades:
-            eq_after = t.get("equity_after")
-            if eq_after is not None:
-                equity_scan_source.append({"equity": float(eq_after)})
-        equity_scan_source.append({"equity": final_equity})
-
-    for point in equity_scan_source:
-        eq_val = float(point.get("equity", final_equity))
-        if eq_val > peak_seen:
-            peak_seen = eq_val
-        if peak_seen > 0:
-            dd = (peak_seen - eq_val) / peak_seen
-            if dd > max_drawdown_pct_seen:
-                max_drawdown_pct_seen = dd
-
-    metrics = {
-        "bar_count": row_count,
-        "trade_count": total_trades,
-        "win_count": wins,
-        "loss_count": losses,
-        "win_rate": win_rate,
-        "gross_profit": gross_profit,
-        "gross_loss": gross_loss,
-        "avg_pnl": avg_pnl,
-        "profit_factor": profit_factor,
-        "final_equity": final_equity,
-        "return_pct": (
-            ((final_equity - starting_equity) / starting_equity) * 100.0
-            if starting_equity > 0.0
-            else 0.0
-        ),
-        "max_drawdown_pct": max_drawdown_pct_seen * 100.0,
-        "liquidated": liquidated,
-        "returned_trade_count": len(returned_trades),
-        "returned_risk_event_count": len(returned_risk_events),
-        "returned_equity_point_count": len(equity_curve),
-        "equity_stride_used": safe_equity_stride,
-    }
+    final_equity = float(engine.mark_equity(state, market_type, float(df["close"].iloc[-1])))
 
     return RunOutput(
         state=state,
-        trades=returned_trades,
+        trades=trades,
         equity_curve=equity_curve,
         final_equity=final_equity,
         liquidated=liquidated,
-        risk_events=returned_risk_events,
-        metrics=metrics,
+        risk_events=risk_events,
+        liquidation_count=liquidation_count,
+        max_margin_ratio=max_margin_ratio,
+        closest_liquidation_distance_pct=closest_liquidation_distance_pct,
+        last_margin_snapshot=last_margin_snapshot,
     )
