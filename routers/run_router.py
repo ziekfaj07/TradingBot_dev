@@ -69,8 +69,9 @@ class ConfigureBody(BaseModel):
 
     stop_loss_pct: float | None = None
     take_profit_pct: float | None = None
-
+    exit_on_signal: bool | None = None
     exit_mode: str | None = None
+
     atr_period: int | None = None
     atr_stop_mult: float | None = None
     atr_take_mult: float | None = None

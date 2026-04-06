@@ -114,6 +114,7 @@ def run_signal_backed_loop(
     cooldown_seconds: int = 0,
     stop_loss_pct: float | None = None,
     take_profit_pct: float | None = None,
+    exit_on_signal: bool = True,    
     exit_mode: str = "static",
     atr_period: int = 14,
     atr_stop_mult: float | None = 1.5,
@@ -530,7 +531,12 @@ def run_signal_backed_loop(
                 )
 
         # 4) Strategy exit
-        elif signal == -1 and state.position_qty > 0.0 and str(state.side or "long").lower() == "long":
+        elif (
+            exit_on_signal
+            and signal == -1
+            and state.position_qty > 0.0
+            and str(state.side or "long").lower() == "long"
+        ):            
             trade_id += 1
             state, fill = engine.exit_long(
                 ts_iso,
@@ -568,7 +574,12 @@ def run_signal_backed_loop(
                 open_trade_equity_baseline = float(fill.equity_after)
                 last_exit_ts = getattr(fill, "timestamp", None) or ts_iso
 
-        elif signal == 1 and state.position_qty > 0.0 and str(state.side or "").lower() == "short":
+        elif (
+            exit_on_signal
+            and signal == 1
+            and state.position_qty > 0.0
+            and str(state.side or "").lower() == "short"
+        ):            
             trade_id += 1
             state, fill = engine.exit_short(
                 ts_iso,

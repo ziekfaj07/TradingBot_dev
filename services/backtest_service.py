@@ -32,6 +32,7 @@ class BacktestService:
         position_size_value: float | None,
         stop_loss_pct: float | None,
         take_profit_pct: float | None,
+        exit_on_signal: bool | None = None,
         exit_mode: str,
         atr_period: int,
         atr_stop_mult: float | None,
@@ -70,6 +71,8 @@ class BacktestService:
             return "stop_loss_pct must be > 0"
         if take_profit_pct is not None and float(take_profit_pct) <= 0.0:
             return "take_profit_pct must be > 0"
+        if not isinstance(exit_on_signal, bool):
+            return "exit_on_signal must be true or false"        
 
         normalized_exit_mode = str(exit_mode or "static").strip().lower()
         if normalized_exit_mode not in {"static", "atr"}:
@@ -125,6 +128,7 @@ class BacktestService:
         cooldown_seconds: int = 0,
         stop_loss_pct: float | None = None,
         take_profit_pct: float | None = None,
+        exit_on_signal: bool = True,
         exit_mode: str = "static",
         atr_period: int = 14,
         atr_stop_mult: float | None = None,
@@ -147,7 +151,15 @@ class BacktestService:
             enable_liquidation = False
             use_mark_price_for_liquidation = False
             mark_price_source = "close"
-
+        if market_type == "spot":
+            leverage = 1.0
+            allow_short = False
+            margin_mode = "isolated"
+            enable_liquidation = False
+            use_mark_price_for_liquidation = False
+            mark_price_source = "close"
+            exit_on_signal = True
+            
         validation_error = self._validate_backtest_config(
             market_type=market_type,
             allow_short=allow_short,
@@ -162,6 +174,7 @@ class BacktestService:
             position_size_value=position_size_value,
             stop_loss_pct=stop_loss_pct,
             take_profit_pct=take_profit_pct,
+            exit_on_signal=exit_on_signal,            
             exit_mode=exit_mode,
             atr_period=atr_period,
             atr_stop_mult=atr_stop_mult,
@@ -216,6 +229,7 @@ class BacktestService:
             cooldown_seconds=cooldown_seconds,
             stop_loss_pct=stop_loss_pct,
             take_profit_pct=take_profit_pct,
+            exit_on_signal=exit_on_signal,            
             exit_mode=exit_mode,
             atr_period=atr_period,
             atr_stop_mult=atr_stop_mult,
@@ -265,6 +279,7 @@ class BacktestService:
                 "cooldown_seconds": cooldown_seconds,
                 "stop_loss_pct": stop_loss_pct,
                 "take_profit_pct": take_profit_pct,
+                "exit_on_signal": exit_on_signal,                
                 "exit_mode": exit_mode,
                 "atr_period": atr_period,
                 "atr_stop_mult": atr_stop_mult,

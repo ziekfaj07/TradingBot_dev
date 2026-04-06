@@ -79,8 +79,9 @@ class RunConfig:
 
     stop_loss_pct: float | None = None
     take_profit_pct: float | None = None
-
+    exit_on_signal: bool = True
     exit_mode: str = "static"   # "static" | "atr"
+    
     atr_period: int = 14
     atr_stop_mult: float = 1.5
     atr_take_mult: float = 2.5
@@ -477,6 +478,7 @@ class ModeController:
                 cooldown_seconds=cfg.cooldown_seconds,
                 stop_loss_pct=cfg.stop_loss_pct,
                 take_profit_pct=cfg.take_profit_pct,
+                exit_on_signal=cfg.exit_on_signal,                
                 exit_mode=cfg.exit_mode,
                 atr_period=cfg.atr_period,
                 atr_stop_mult=cfg.atr_stop_mult,
