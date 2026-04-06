@@ -32,6 +32,7 @@ class ConfigureBody(BaseModel):
     end: str | None = None
     initial_balance: float | None = None
     fee_rate: float | None = None
+    liquidation_fee_rate: float | None = None
     slippage_bps: float | None = None
     allow_short: bool | None = None
     leverage: float | None = None
@@ -82,7 +83,6 @@ class ConfigureBody(BaseModel):
     enable_liquidation: bool | None = None
     use_mark_price_for_liquidation: bool | None = None
     mark_price_source: str | None = None
-    liquidation_fee_rate: float | None = None
     maintenance_margin_override: float | None = None    
 
     @model_validator(mode="after")

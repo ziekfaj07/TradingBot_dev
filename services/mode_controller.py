@@ -88,11 +88,11 @@ class RunConfig:
     atr_reference_mode: str = "entry"  # "entry" | "floating"
 
     # v0.6.4 / v0.6.4.1 liquidation + margin config
-    margin_mode: str = "isolated"
+    margin_mode: str = "cross"
     enable_liquidation: bool = True
     use_mark_price_for_liquidation: bool = True
     mark_price_source: str = "close"
-    liquidation_fee_rate: float = 0.005
+    liquidation_fee_rate: float | None = None
     maintenance_margin_override: float | None = None    
 
     include_equity: bool = False
@@ -442,11 +442,11 @@ class ModeController:
 
             engine = ExecutionEngine(
                 fee_rate=cfg.fee_rate,
+                liquidation_fee_rate=cfg.liquidation_fee_rate,
                 slippage_bps=cfg.slippage_bps,
                 maintenance_margin=cfg.maintenance_margin,
                 max_leverage=cfg.max_leverage,
                 max_qty=cfg.max_qty,
-                liquidation_fee_rate=cfg.liquidation_fee_rate,
             )
 
             state = PortfolioState(
@@ -458,6 +458,8 @@ class ModeController:
                 liquidation_price=None,
                 realized_pnl=0.0,
                 active_trade_id=None,
+                margin=0.0,
+                borrowed=0.0,
                 margin_mode=cfg.margin_mode,
             )
 
@@ -1601,6 +1603,7 @@ class ModeController:
 
         self._engine = ExecutionEngine(
             fee_rate=cfg.fee_rate,
+            liquidation_fee_rate=cfg.liquidation_fee_rate,
             slippage_bps=cfg.slippage_bps,
             maintenance_margin=cfg.maintenance_margin,
             max_leverage=cfg.max_leverage,
@@ -1616,6 +1619,9 @@ class ModeController:
             liquidation_price=None,
             realized_pnl=0.0,
             active_trade_id=None,
+            margin=0.0,
+            borrowed=0.0,
+            margin_mode=cfg.margin_mode,
         )
 
     def _build_runtime_objects_from_existing_or_new(self) -> None:
@@ -1639,6 +1645,9 @@ class ModeController:
                 liquidation_price=None,
                 realized_pnl=0.0,
                 active_trade_id=None,
+                margin=0.0,
+                borrowed=0.0,
+                margin_mode=cfg.margin_mode,
             )
 
         if self._status.started_at is None:

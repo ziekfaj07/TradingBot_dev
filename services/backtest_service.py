@@ -133,7 +133,7 @@ class BacktestService:
         atr_period: int = 14,
         atr_stop_mult: float | None = None,
         atr_take_mult: float | None = None,
-        margin_mode: str = "isolated",
+        margin_mode: str = "cross",
         enable_liquidation: bool = True,
         use_mark_price_for_liquidation: bool = True,
         mark_price_source: str = "close",
@@ -159,7 +159,7 @@ class BacktestService:
             use_mark_price_for_liquidation = False
             mark_price_source = "close"
             exit_on_signal = True
-            
+
         validation_error = self._validate_backtest_config(
             market_type=market_type,
             allow_short=allow_short,
@@ -200,16 +200,16 @@ class BacktestService:
 
         engine = ExecutionEngine(
             fee_rate=fee_rate,
+            liquidation_fee_rate=liquidation_fee_rate,
             slippage_bps=slippage_bps,
             max_leverage=50.0,
             max_qty=10.0,
             maintenance_margin=maintenance_margin,
-            liquidation_fee_rate=liquidation_fee_rate,
         )
 
         state = PortfolioState(
             cash=float(initial_balance),
-            margin_mode=margin_mode,
+            margin_mode=str(margin_mode or "cross"),
         )
 
         out = run_signal_backed_loop(
