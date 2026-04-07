@@ -496,6 +496,7 @@ class ModeController:
                 atr_period=cfg.atr_period,
                 atr_stop_mult=cfg.atr_stop_mult,
                 atr_take_mult=cfg.atr_take_mult,
+                atr_reference_mode=cfg.atr_reference_mode,
                 margin_mode=cfg.margin_mode,
                 enable_liquidation=cfg.enable_liquidation,
                 use_mark_price_for_liquidation=cfg.use_mark_price_for_liquidation,

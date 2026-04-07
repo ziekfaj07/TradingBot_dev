@@ -42,6 +42,7 @@ class BacktestService:
         atr_period: int,
         atr_stop_mult: float | None,
         atr_take_mult: float | None,
+        atr_reference_mode: str = "entry",
     ) -> str | None:
         mt = str(market_type or "spot").strip().lower()
         if mt not in ("spot", "futures"):
@@ -123,9 +124,15 @@ class BacktestService:
         if normalized_exit_mode not in {"static", "atr"}:
             return "exit_mode must be 'static' or 'atr'"
 
-        if normalized_exit_mode == "atr":
+        normalized_atr_reference_mode = str(atr_reference_mode or "entry").strip().lower()
+        if normalized_atr_reference_mode not in {"entry", "floating"}:
+            return "atr_reference_mode must be 'entry' or 'floating'"
+
+        needs_atr = normalized_exit_mode == "atr" or bool(enable_volatility_scaling)
+
+        if needs_atr:
             if int(atr_period) <= 0:
-                return "atr_period must be > 0 for ATR exit mode"
+                return "atr_period must be > 0 when ATR is required"
             if atr_stop_mult is not None and float(atr_stop_mult) <= 0.0:
                 return "atr_stop_mult must be > 0 when provided"
             if atr_take_mult is not None and float(atr_take_mult) <= 0.0:
@@ -186,6 +193,7 @@ class BacktestService:
         atr_period: int = 14,
         atr_stop_mult: float | None = None,
         atr_take_mult: float | None = None,
+        atr_reference_mode: str = "entry",
         margin_mode: str = "cross",
         enable_liquidation: bool = True,
         use_mark_price_for_liquidation: bool = True,
@@ -237,6 +245,7 @@ class BacktestService:
             atr_period=atr_period,
             atr_stop_mult=atr_stop_mult,
             atr_take_mult=atr_take_mult,
+            atr_reference_mode=atr_reference_mode,
         )
         if validation_error:
             return {"error": validation_error}
@@ -297,6 +306,7 @@ class BacktestService:
             atr_period=atr_period,
             atr_stop_mult=atr_stop_mult,
             atr_take_mult=atr_take_mult,
+            atr_reference_mode=atr_reference_mode,
             margin_mode=margin_mode,
             enable_liquidation=enable_liquidation,
             use_mark_price_for_liquidation=use_mark_price_for_liquidation,
@@ -345,6 +355,7 @@ class BacktestService:
                 "atr_period": atr_period,
                 "atr_stop_mult": atr_stop_mult,
                 "atr_take_mult": atr_take_mult,
+                "atr_reference_mode": atr_reference_mode, 
                 "margin_mode": margin_mode,
                 "enable_liquidation": enable_liquidation,
                 "use_mark_price_for_liquidation": use_mark_price_for_liquidation,

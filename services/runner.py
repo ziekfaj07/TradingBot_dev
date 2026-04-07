@@ -318,11 +318,12 @@ def run_signal_backed_loop(
     trade_day: str | None = None
     position_peak_price: float | None = None
 
-    atr_series = (
-        _build_atr_series(df, atr_period)
-        if str(exit_mode or "static").strip().lower() == "atr"
-        else None
+    needs_atr = (
+        str(exit_mode or "static").strip().lower() == "atr"
+        or bool(enable_volatility_scaling)
     )
+
+    atr_series = _build_atr_series(df, atr_period) if needs_atr else None    
 
     for i in range(len(df)):
         bar_was_liquidated = False
