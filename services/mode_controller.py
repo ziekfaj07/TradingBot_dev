@@ -162,6 +162,7 @@ class ModeController:
         self._trade_day_key: str | None = None
         self._last_exit_ts: float | None = None
         self._risk_halt_reason: str | None = None
+        self._position_peak_price: float | None = None        
 
         self._recent_fill_keys: list[str] = []
         self._recent_fill_key_set: set[str] = set()
@@ -551,13 +552,7 @@ class ModeController:
                     "trades": output.trades,
                     "equity_curve": output.equity_curve,
                     "risk_events": output.risk_events,
-                    "metrics": self._build_backtest_metrics_from_output(
-                        initial_balance=cfg.initial_balance,
-                        final_equity=output.final_equity,
-                        trades=output.trades,
-                        equity_curve=output.equity_curve,
-                        liquidation_count=output.liquidation_count,
-                    ),                    
+                    "metrics": output.stats.to_dict(),                   
                 },
             }
 
@@ -1306,76 +1301,6 @@ class ModeController:
                 drawdown_pct=self._safe_float_value(point.get("drawdown_pct"), 0.0),
             )
 
-    def _build_backtest_metrics_from_output(
-        self,
-        *,
-        initial_balance: float,
-        final_equity: float,
-        trades: Sequence[Mapping[str, Any]],
-        equity_curve: Sequence[Mapping[str, Any]],
-        liquidation_count: int = 0,
-    ) -> dict:
-        initial_balance = float(initial_balance)
-        final_equity = float(final_equity)
-
-        total_return_pct = (
-            ((final_equity - initial_balance) / initial_balance) * 100.0
-            if initial_balance > 0.0
-            else 0.0
-        )
-
-        if equity_curve:
-            eq = [float(p.get("equity", initial_balance)) for p in equity_curve]
-        else:
-            eq = [initial_balance]
-            for t in trades:
-                if str(t.get("type", "")).upper() in {"EXIT", "LIQUIDATION"}:
-                    eq.append(float(t.get("equity_after", eq[-1])))
-
-        if not eq:
-            eq = [initial_balance]
-
-        peak = eq[0]
-        max_drawdown_pct = 0.0
-        for value in eq:
-            if value > peak:
-                peak = value
-            if peak > 0.0:
-                dd = ((peak - value) / peak) * 100.0
-                if dd > max_drawdown_pct:
-                    max_drawdown_pct = dd
-
-        exit_fills = [
-            t for t in trades
-            if str(t.get("type", "")).upper() in {"EXIT", "LIQUIDATION"}
-        ]
-
-        pnls = [float(t.get("pnl", 0.0) or 0.0) for t in exit_fills]
-        wins = [p for p in pnls if p > 0.0]
-        losses = [p for p in pnls if p < 0.0]
-
-        total_trades = len(pnls)
-        win_rate_pct = (len(wins) / total_trades * 100.0) if total_trades else 0.0
-
-        gross_profit = sum(wins)
-        gross_loss = abs(sum(losses))
-
-        if gross_loss > 0.0:
-            profit_factor = gross_profit / gross_loss
-        else:
-            profit_factor = gross_profit if gross_profit > 0.0 else 0.0
-
-        return {
-            "initial_balance": initial_balance,
-            "final_equity": final_equity,
-            "total_return_percent": total_return_pct,
-            "max_drawdown_percent": max_drawdown_pct,
-            "total_trades": total_trades,
-            "win_rate_percent": win_rate_pct,
-            "profit_factor": profit_factor,
-            "liquidation_count": int(liquidation_count),
-        }
-
     def _build_metrics_payload(self) -> dict:
         raw_fills = []
         if self._status.run_id:
@@ -1534,6 +1459,7 @@ class ModeController:
             ExecutionEngine(
                 fee_rate=self._status.config.fee_rate,
                 slippage_bps=self._status.config.slippage_bps,
+                liquidation_fee_rate=self.config.liquidation_fee_rate,
                 maintenance_margin=self._status.config.maintenance_margin,
                 max_leverage=self._status.config.max_leverage,
                 max_qty=self._status.config.max_qty,
@@ -1625,10 +1551,12 @@ class ModeController:
         )
 
     def _build_runtime_objects_from_existing_or_new(self) -> None:
+        cfg = self._status.config
+        
         if self._engine is None:
-            cfg = self._status.config
             self._engine = ExecutionEngine(
                 fee_rate=cfg.fee_rate,
+                liquidation_fee_rate=cfg.liquidation_fee_rate,
                 slippage_bps=cfg.slippage_bps,
                 maintenance_margin=cfg.maintenance_margin,
                 max_leverage=cfg.max_leverage,
@@ -1641,7 +1569,7 @@ class ModeController:
                 position_qty=0.0,
                 entry_price=None,
                 side=None,
-                equity=self._status.config.initial_balance,
+                equity=cfg.initial_balance,
                 liquidation_price=None,
                 realized_pnl=0.0,
                 active_trade_id=None,
@@ -1916,7 +1844,7 @@ class ModeController:
                                     },
                                 )
 
-                        elif signal < 0 and float(self._state.position_qty) > 0.0:
+                        elif cfg.exit_on_signal and signal < 0 and float(self._state.position_qty) > 0.0:
                             self._state, fill = self._engine.exit_long(
                                 ts_iso=str(int(processed_ts)),
                                 state=self._state,
@@ -2042,6 +1970,7 @@ class ModeController:
         self._risk_halt_reason = None
         starting_equity = float(self._status.config.initial_balance or 0.0)
         self._peak_equity = max(0.0, starting_equity)
+        self._position_peak_price = None
 
     def _update_peak_equity_locked(self, market_price: float | None = None) -> None:
         current_equity = self._current_equity_locked(market_price)
@@ -2054,9 +1983,14 @@ class ModeController:
         fill_type = str(getattr(fill, "type", "")).upper()
         if fill_type == "ENTRY":
             self._trades_today += 1
+            try:
+                self._position_peak_price = float(getattr(fill, "price", 0.0) or 0.0)
+            except Exception:
+                self._position_peak_price = None
 
         if fill_type in {"EXIT", "LIQUIDATION"}:
             self._last_exit_ts = fill_ts if fill_ts is not None else time.time()
+            self._position_peak_price = None
 
         try:
             eq_after = float(getattr(fill, "equity_after", 0.0) or 0.0)
@@ -2139,15 +2073,60 @@ class ModeController:
             "meta": result.meta or {},
         }
 
+    def _latest_atr_value_locked(self) -> float | None:
+        period = int(getattr(self._status.config, "atr_period", 14) or 14)
+        if period <= 0 or not self._bars:
+            return None
+
+        df = pd.DataFrame(self._bars).copy()
+        needed = {"high", "low", "close"}
+        if df.empty or not needed.issubset(df.columns):
+            return None
+
+        high = pd.to_numeric(df["high"], errors="coerce")
+        low = pd.to_numeric(df["low"], errors="coerce")
+        close = pd.to_numeric(df["close"], errors="coerce")
+        prev_close = close.shift(1)
+
+        tr = pd.concat(
+            [
+                (high - low).abs(),
+                (high - prev_close).abs(),
+                (low - prev_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+
+        atr = tr.rolling(window=period, min_periods=period).mean()
+        if atr.empty or pd.isna(atr.iloc[-1]):
+            return None
+
+        try:
+            value = float(atr.iloc[-1])
+            return value if value > 0.0 else None
+        except Exception:
+            return None
+
     def _check_static_exit_locked(self, market_price: float) -> dict:
         if self._state is None or self._state.position_qty <= 0:
             return {"should_exit": False, "reason": None, "meta": {}}
+
+        if self._position_peak_price is None:
+            self._position_peak_price = float(market_price)
+        else:
+            self._position_peak_price = max(float(self._position_peak_price), float(market_price))
 
         result = self._risk_engine.evaluate_long_exit(
             entry_price=self._state.entry_price,
             market_price=market_price,
             stop_loss_pct=self._status.config.stop_loss_pct,
             take_profit_pct=self._status.config.take_profit_pct,
+            exit_mode=self._status.config.exit_mode,
+            atr_value=self._latest_atr_value_locked(),
+            atr_stop_mult=self._status.config.atr_stop_mult,
+            atr_take_mult=self._status.config.atr_take_mult,
+            atr_reference_mode=self._status.config.atr_reference_mode,
+            peak_price_since_entry=self._position_peak_price,
         )
         return {
             "should_exit": result.should_exit,

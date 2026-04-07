@@ -1,22 +1,18 @@
 import math
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
-from core.execution_models import PortfolioState, Fill
+from core.execution_models import Fill, PortfolioState
 
 
 class ExecutionEngine:
     """
     Reusable execution/fill engine for:
-    - backtests (bar-by-bar simulation)
-    - paper trading (same simulation on live bars)
-    - live trading (later: swap to real broker, reuse sizing/risk parts)
+    - backtests
+    - paper trading
+    - live trading later
 
-    IMPORTANT:
-    This implementation uses:
-    - Spot: simple cash + position model
-    - Futures: linear USDT-margined model
-        equity = wallet_cash + qty * (mark_price - entry_price)
-      (No 'borrowed'/'margin loan' model; that was the source of exploding equity)
+    Futures model:
+    equity = wallet_cash + qty * (mark_price - entry_price)
     """
 
     def __init__(
@@ -27,6 +23,8 @@ class ExecutionEngine:
         max_leverage: float = 50.0,
         max_qty: float = 10.0,
         maintenance_margin: float = 0.005,
+        min_order_notional: float = 5.0,
+        min_qty: float = 0.0,
     ):
         self.fee_rate = float(fee_rate)
         self.liquidation_fee_rate = float(
@@ -36,11 +34,11 @@ class ExecutionEngine:
         self.max_leverage = float(max_leverage)
         self.max_qty = float(max_qty)
         self.maintenance_margin = float(maintenance_margin)
+        self.min_order_notional = float(min_order_notional)
+        self.min_qty = float(min_qty)
 
     _NUMERIC_EPSILON = 1e-12
     _MONEY_EPSILON = 1e-9
-
-    # ---------- Pricing helpers ----------
 
     def apply_slippage(self, price: float, is_buy: bool) -> float:
         slip = self.slippage_bps / 10000.0
@@ -64,29 +62,51 @@ class ExecutionEngine:
     def _clean_money(self, value: float) -> float:
         return float(round(self._clean_float(value, eps=self._MONEY_EPSILON), 12))
 
+    def _margin_mode(self, state: PortfolioState) -> str:
+        mode = str(getattr(state, "margin_mode", "cross") or "cross").strip().lower()
+        return "isolated" if mode == "isolated" else "cross"
+
+    def _get_isolated_margin(self, state: PortfolioState) -> float:
+        try:
+            return self._clean_money(float(getattr(state, "isolated_margin", 0.0) or 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _set_isolated_margin(self, state: PortfolioState, value: float) -> None:
+        try:
+            setattr(state, "isolated_margin", self._clean_money(value))
+        except Exception:
+            pass
+
+    def _passes_entry_floor(self, price: float, qty: float) -> bool:
+        px = self._clean_float(price)
+        q = self._clean_float(qty)
+        if px <= 0.0 or q <= 0.0:
+            return False
+        if self.min_qty > 0.0 and q < self.min_qty:
+            return False
+        if self.min_order_notional > 0.0 and (px * q) < self.min_order_notional:
+            return False
+        return True
+
     def mark_equity(self, state: PortfolioState, market_type: str, market_price: float) -> float:
         mt = (market_type or "spot").lower()
 
         if mt == "spot":
             return self._clean_money(float(state.cash + state.position_qty * market_price))
 
-        # Futures (linear USDT-margined):
-        # equity = wallet + unrealized PnL
+        base_cash = float(state.cash)
+        if self._margin_mode(state) == "isolated":
+            base_cash += float(self._get_isolated_margin(state))
+
         if state.position_qty == 0.0 or state.entry_price is None:
-            return self._clean_money(float(state.cash))
+            return self._clean_money(base_cash)
 
         return self._clean_money(
-            float(state.cash + state.position_qty * (market_price - state.entry_price))
+            float(base_cash + state.position_qty * (market_price - state.entry_price))
         )
 
-    # ---------- Internal helpers ----------
-
     def _set_active_trade_id(self, state: PortfolioState, trade_id: int) -> None:
-        """
-        Best-effort persistence of the currently open trade ID on state.
-        This keeps ENTRY and EXIT/LIQUIDATION tied to the same trade_id
-        even if the caller accidentally increments per fill.
-        """
         try:
             setattr(state, "active_trade_id", int(trade_id))
         except Exception:
@@ -108,9 +128,6 @@ class ExecutionEngine:
             pass
 
     def _add_realized_pnl(self, state: PortfolioState, pnl: float) -> None:
-        """
-        Best-effort accumulation onto state.realized_pnl if the field exists.
-        """
         try:
             current = getattr(state, "realized_pnl", 0.0)
             setattr(state, "realized_pnl", self._clean_money(float(current) + float(pnl)))
@@ -118,19 +135,6 @@ class ExecutionEngine:
             pass
 
     def _estimate_entry_fee(self, entry_px: float, qty: float, market_type: str) -> float:
-        """
-        Reconstruct entry fee from current position info.
-
-        Spot entry logic currently does:
-            starting_cash -> pay entry fee first -> buy asset with remaining cash
-
-        So for spot:
-            qty * entry_px = notional_after_fee
-            entry_fee = notional_after_fee * fee_rate / (1 - fee_rate)
-
-        Futures entry logic currently does:
-            entry_fee = entry_notional * fee_rate = qty * entry_px * fee_rate
-        """
         mt = (market_type or "spot").lower()
         gross_cost_after_fee = float(abs(qty) * entry_px)
 
@@ -144,7 +148,29 @@ class ExecutionEngine:
 
         return self._clean_money(gross_cost_after_fee * self.fee_rate)
 
-    # ---------- Risk / liquidation ----------
+    def apply_margin_snapshot(self, state: PortfolioState, snapshot: Any) -> None:
+        if snapshot is None:
+            return
+
+        field_map = {
+            "mark_price": "mark_price",
+            "liquidation_price": "liquidation_price",
+            "maintenance_margin": "maintenance_margin",
+            "maintenance_margin_rate": "maintenance_margin_rate",
+            "maintenance_amount": "maintenance_amount",
+            "margin_balance": "margin_balance",
+            "margin_ratio": "margin_ratio",
+            "bankruptcy_price": "bankruptcy_price",
+            "margin": "margin",
+            "borrowed": "borrowed",
+        }
+
+        for src, dest in field_map.items():
+            if hasattr(snapshot, src):
+                try:
+                    setattr(state, dest, getattr(snapshot, src))
+                except Exception:
+                    pass
 
     def compute_liquidation_price(
         self,
@@ -168,12 +194,7 @@ class ExecutionEngine:
             return False
 
         eq = self.mark_equity(state, mt, market_price)
-
-        # Simple guard:
-        # liquidate when equity <= maintenance_margin * notional
         return eq <= (self.maintenance_margin * notional)
-
-    # ---------- Actions (Long only; shorts can be added similarly) ----------
 
     def enter_long(
         self,
@@ -188,7 +209,6 @@ class ExecutionEngine:
         mt = (market_type or "spot").lower()
         buy_px = self.apply_slippage(close, is_buy=True)
 
-        # PRICE SAFETY
         if buy_px <= 0 or not math.isfinite(buy_px):
             return state, None
 
@@ -207,7 +227,6 @@ class ExecutionEngine:
 
         if mt == "spot":
             if requested_qty is None:
-                # Spend all cash (legacy all-in behavior)
                 notional = float(state.cash)
                 fee = self._clean_money(notional * self.fee_rate)
                 notional_after_fee = max(0.0, notional - fee)
@@ -226,8 +245,8 @@ class ExecutionEngine:
                     return state, None
                 remaining_cash = self._clean_money(max(0.0, float(state.cash) - total_cash_needed))
 
-            # QTY SAFETY
-            if (not math.isfinite(qty)) or qty <= 0.0 or abs(qty) > self.max_qty:
+            qty = min(float(qty), self.max_qty) if self.max_qty > 0 else float(qty)
+            if (not math.isfinite(qty)) or qty <= 0.0 or not self._passes_entry_floor(buy_px, qty):
                 return state, None
 
             state.position_qty = self._clean_float(float(qty))
@@ -236,27 +255,53 @@ class ExecutionEngine:
             state.side = "long"
 
         else:
-            # Futures (linear):
-            # Notional exposure = wallet_cash * leverage
             lev = min(max(float(leverage), 1.0), self.max_leverage)
+            margin_mode = self._margin_mode(state)
+            available_cash = max(0.0, float(state.cash))
 
-            if requested_qty is None:
-                notional = float(state.cash) * lev
-                fee = self._clean_money(notional * self.fee_rate)
-                qty = notional / buy_px
-            else:
-                qty = float(requested_qty)
-                notional = qty * buy_px
-                fee = self._clean_money(notional * self.fee_rate)
-                if fee > float(state.cash) + 1e-12:
+            if margin_mode == "isolated":
+                if requested_qty is None:
+                    denom = buy_px * ((1.0 / lev) + self.fee_rate)
+                    if denom <= 0.0 or not math.isfinite(denom):
+                        return state, None
+                    qty = available_cash / denom
+                else:
+                    qty = float(requested_qty)
+
+                qty = min(float(qty), self.max_qty) if self.max_qty > 0 else float(qty)
+                if (not math.isfinite(qty)) or qty <= 0.0 or not self._passes_entry_floor(buy_px, qty):
                     return state, None
 
-            # QTY SAFETY
-            if (not math.isfinite(qty)) or qty <= 0.0 or abs(qty) > self.max_qty:
-                return state, None
+                notional = qty * buy_px
+                initial_margin = self._clean_money(notional / lev)
+                fee = self._clean_money(notional * self.fee_rate)
+                wallet_needed = self._clean_money(initial_margin + fee)
+                if wallet_needed > available_cash + 1e-12:
+                    return state, None
 
-            # Pay fee from wallet
-            state.cash = self._clean_money(max(0.0, float(state.cash) - fee))
+                state.cash = self._clean_money(max(0.0, available_cash - wallet_needed))
+                self._set_isolated_margin(state, initial_margin)
+                state.margin = initial_margin
+            else:
+                if requested_qty is None:
+                    notional = available_cash * lev
+                    fee = self._clean_money(notional * self.fee_rate)
+                    qty = notional / buy_px
+                else:
+                    qty = float(requested_qty)
+                    notional = qty * buy_px
+                    fee = self._clean_money(notional * self.fee_rate)
+                    if fee > available_cash + 1e-12:
+                        return state, None
+
+                qty = min(float(qty), self.max_qty) if self.max_qty > 0 else float(qty)
+                if (not math.isfinite(qty)) or qty <= 0.0 or not self._passes_entry_floor(buy_px, qty):
+                    return state, None
+
+                state.cash = self._clean_money(max(0.0, available_cash - fee))
+                self._set_isolated_margin(state, 0.0)
+                state.margin = 0.0
+
             state.position_qty = self._clean_float(float(qty))
             state.entry_price = self._clean_money(float(buy_px))
             state.side = "long"
@@ -294,7 +339,6 @@ class ExecutionEngine:
         exit_trade_id = self._get_active_trade_id(state, trade_id)
         sell_px = self.apply_slippage(close, is_buy=False)
 
-        # PRICE SAFETY
         if sell_px <= 0 or not math.isfinite(sell_px):
             return state, None
 
@@ -309,22 +353,24 @@ class ExecutionEngine:
             gross_pnl = self._clean_money(float(exit_qty) * (float(sell_px) - entry_px))
             net_pnl = self._clean_money(float(gross_pnl - entry_fee - fee))
 
-            # Keep any residual idle cash from partial/fixed-size entries.
             state.cash = self._clean_money(float(state.cash) + float(notional - fee))
 
         else:
-            # Futures (linear): realize PnL into wallet, then pay exit fee
             gross_pnl = self._clean_money(float(exit_qty) * (float(sell_px) - entry_px))
-
             notional = abs(exit_qty) * sell_px
             fee = self._clean_money(notional * self.fee_rate)
             net_pnl = self._clean_money(float(gross_pnl - fee))
 
-            state.cash = self._clean_money(float(state.cash) + gross_pnl - float(fee))
+            if self._margin_mode(state) == "isolated":
+                released_margin = self._get_isolated_margin(state)
+                state.cash = self._clean_money(float(state.cash) + released_margin + gross_pnl - float(fee))
+                self._set_isolated_margin(state, 0.0)
+                state.margin = 0.0
+            else:
+                state.cash = self._clean_money(float(state.cash) + gross_pnl - float(fee))
 
         self._add_realized_pnl(state, net_pnl)
 
-        # reset position before computing ending equity
         state.position_qty = 0.0
         state.entry_price = None
         state.side = None
@@ -355,20 +401,26 @@ class ExecutionEngine:
         close: float,
         market_type: str,
         trade_id: int,
+        exec_price: float | None = None,
+        mark_price: float | None = None,
+        margin_snapshot: Any | None = None,
     ) -> Tuple[PortfolioState, Optional[Fill]]:
         mt = (market_type or "spot").lower()
         if state.position_qty == 0.0:
             return state, None
 
+        if margin_snapshot is not None:
+            self.apply_margin_snapshot(state, margin_snapshot)
+
         liquidation_trade_id = self._get_active_trade_id(state, trade_id)
         position_side = state.side or "long"
 
-        # For long liquidation, we SELL to close
-        exit_px = self.apply_slippage(close, is_buy=False)
+        if exec_price is not None and math.isfinite(float(exec_price)) and float(exec_price) > 0.0:
+            exit_px = float(exec_price)
+        else:
+            exit_px = self.apply_slippage(close, is_buy=False)
 
-        # PRICE SAFETY
         if exit_px <= 0 or not math.isfinite(exit_px):
-            # emergency reset
             state.position_qty = 0.0
             state.entry_price = None
             state.side = None
@@ -379,31 +431,34 @@ class ExecutionEngine:
         entry_px = float(state.entry_price) if state.entry_price is not None else float(exit_px)
 
         notional = abs(exit_qty) * exit_px
-        fee = notional * self.lquidation_fee_rate
+        fee = self._clean_money(notional * self.liquidation_fee_rate)
 
         if mt == "spot":
             entry_fee = self._estimate_entry_fee(entry_px, exit_qty, mt)
             gross_pnl = self._clean_money(float(exit_qty) * (float(exit_px) - entry_px))
             net_pnl = self._clean_money(float(gross_pnl - entry_fee - fee))
-
-            # Keep any residual idle cash from partial/fixed-size entries.
             state.cash = self._clean_money(float(state.cash) + float(notional - fee))
         else:
-            # Futures linear: realize pnl and pay fee
             gross_pnl = self._clean_money(float(exit_qty) * (float(exit_px) - entry_px))
             net_pnl = self._clean_money(float(gross_pnl - fee))
 
-            state.cash = self._clean_money(float(state.cash) + gross_pnl - float(fee))
+            if self._margin_mode(state) == "isolated":
+                released_margin = self._get_isolated_margin(state)
+                state.cash = self._clean_money(float(state.cash) + released_margin + gross_pnl - float(fee))
+                self._set_isolated_margin(state, 0.0)
+                state.margin = 0.0
+            else:
+                state.cash = self._clean_money(float(state.cash) + gross_pnl - float(fee))
 
         self._add_realized_pnl(state, net_pnl)
 
-        # reset
         state.position_qty = 0.0
         state.entry_price = None
         state.side = None
         self._clear_active_trade_id(state)
 
-        eq_after = self._clean_money(self.mark_equity(state, mt, close))
+        eq_mark_price = float(mark_price) if mark_price is not None else float(close)
+        eq_after = self._clean_money(self.mark_equity(state, mt, eq_mark_price))
 
         fill = Fill(
             timestamp=ts_iso,

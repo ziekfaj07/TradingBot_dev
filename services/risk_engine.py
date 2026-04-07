@@ -409,49 +409,101 @@ class RiskEngine:
         *,
         entry_price: float | None,
         market_price: float,
-        stop_loss_pct: float | None = None,
-        take_profit_pct: float | None = None,
+        stop_loss_pct: float | None,
+        take_profit_pct: float | None,
         exit_mode: str = "static",
         atr_value: float | None = None,
         atr_stop_mult: float | None = None,
         atr_take_mult: float | None = None,
+        atr_reference_mode: str = "entry",
+        peak_price_since_entry: float | None = None,
     ) -> ExitSignal:
         ep = self._safe_float(entry_price, 0.0)
         mp = self._safe_float(market_price, 0.0)
-
         if ep <= 0.0 or mp <= 0.0:
             return ExitSignal(should_exit=False)
 
-        levels = self.resolve_long_exit_levels(
-            entry_price=ep,
-            stop_loss_pct=stop_loss_pct,
-            take_profit_pct=take_profit_pct,
-            exit_mode=exit_mode,
-            atr_value=atr_value,
-            atr_stop_mult=atr_stop_mult,
-            atr_take_mult=atr_take_mult,
-        )
+        mode = str(exit_mode or "static").strip().lower()
 
-        meta: dict[str, Any] = {
-            "entry_price": ep,
-            "market_price": mp,
-            "stop_price": levels.stop_price,
-            "take_price": levels.take_price,
-            "exit_family": levels.exit_family,
-        }
+        if mode == "atr":
+            atr = self._safe_float(atr_value, 0.0)
+            stop_mult = self._safe_float(atr_stop_mult, 0.0)
+            take_mult = self._safe_float(atr_take_mult, 0.0)
+            ref_mode = str(atr_reference_mode or "entry").strip().lower()
 
-        if levels.exit_family == "static":
-            meta["stop_loss_pct"] = self._safe_float(stop_loss_pct, 0.0)
-            meta["take_profit_pct"] = self._safe_float(take_profit_pct, 0.0)
-        elif levels.exit_family == "atr":
-            meta["atr_value"] = self._safe_float(atr_value, 0.0)
-            meta["atr_stop_mult"] = self._safe_float(atr_stop_mult, 0.0)
-            meta["atr_take_mult"] = self._safe_float(atr_take_mult, 0.0)
+            if atr <= 0.0:
+                return ExitSignal(should_exit=False)
 
-        if levels.stop_price is not None and mp <= levels.stop_price:
-            return ExitSignal(should_exit=True, reason="stop_loss", meta=meta)
+            peak = self._safe_float(peak_price_since_entry, ep)
+            if ref_mode == "floating":
+                stop_anchor = max(ep, peak)
+            else:
+                stop_anchor = ep
 
-        if levels.take_price is not None and mp >= levels.take_price:
-            return ExitSignal(should_exit=True, reason="take_profit", meta=meta)
+            if stop_mult > 0.0:
+                stop_price = stop_anchor - (atr * stop_mult)
+                if mp <= stop_price:
+                    return ExitSignal(
+                        should_exit=True,
+                        reason="atr_stop_loss",
+                        meta={
+                            "entry_price": ep,
+                            "market_price": mp,
+                            "atr_value": atr,
+                            "atr_stop_mult": stop_mult,
+                            "atr_reference_mode": ref_mode,
+                            "peak_price_since_entry": peak,
+                            "stop_anchor": stop_anchor,
+                            "stop_price": stop_price,
+                        },
+                    )
 
-        return ExitSignal(should_exit=False, meta=meta)
+            if take_mult > 0.0:
+                take_price = ep + (atr * take_mult)
+                if mp >= take_price:
+                    return ExitSignal(
+                        should_exit=True,
+                        reason="atr_take_profit",
+                        meta={
+                            "entry_price": ep,
+                            "market_price": mp,
+                            "atr_value": atr,
+                            "atr_take_mult": take_mult,
+                            "take_price": take_price,
+                        },
+                    )
+
+            return ExitSignal(should_exit=False)
+
+        sl = self._safe_float(stop_loss_pct, 0.0)
+        tp = self._safe_float(take_profit_pct, 0.0)
+
+        if sl > 0.0:
+            stop_price = ep * (1.0 - sl / 100.0)
+            if mp <= stop_price:
+                return ExitSignal(
+                    should_exit=True,
+                    reason="stop_loss",
+                    meta={
+                        "entry_price": ep,
+                        "market_price": mp,
+                        "stop_loss_pct": sl,
+                        "stop_price": stop_price,
+                    },
+                )
+
+        if tp > 0.0:
+            take_price = ep * (1.0 + tp / 100.0)
+            if mp >= take_price:
+                return ExitSignal(
+                    should_exit=True,
+                    reason="take_profit",
+                    meta={
+                        "entry_price": ep,
+                        "market_price": mp,
+                        "take_profit_pct": tp,
+                        "take_price": take_price,
+                    },
+                )
+
+        return ExitSignal(should_exit=False)

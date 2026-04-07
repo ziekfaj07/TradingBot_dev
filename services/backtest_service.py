@@ -247,14 +247,7 @@ class BacktestService:
         final_equity = out.final_equity
         risk_events = out.risk_events
 
-        metrics = self._metrics(
-            initial_balance,
-            final_equity,
-            equity_curve,
-            trades,
-            include_equity=include_equity,
-            liquidation_count=out.liquidation_count,
-        )
+        metrics = out.stats.to_dict()
 
         resp = {
             "symbol": symbol.upper(),
@@ -292,7 +285,7 @@ class BacktestService:
             },
             "results": metrics,
             "liquidated": liquidated,
-            "liquidation_count": out.liquidation_count,
+            "liquidation_count": out.stats.liquidation_count,
             "max_margin_ratio": out.max_margin_ratio,
             "closest_liquidation_distance_pct": out.closest_liquidation_distance_pct,
             "last_margin_snapshot": out.last_margin_snapshot,

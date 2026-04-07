@@ -14,6 +14,7 @@ class PortfolioState:
     active_trade_id: Optional[int] = None
     margin: float = 0.0
     borrowed: float = 0.0
+    isolated_margin: float = 0.0
     margin_mode: str = "cross"
 
     def to_dict(self) -> dict:
@@ -34,6 +35,7 @@ class PortfolioState:
             active_trade_id=data.get("active_trade_id"),
             margin=float(data.get("margin", 0.0)),
             borrowed=float(data.get("borrowed", 0.0)),
+            isolated_margin=float(data.get("isolated_margin", 0.0)),
             margin_mode=str(data.get("margin_mode", "cross") or "cross"),
         )
 
