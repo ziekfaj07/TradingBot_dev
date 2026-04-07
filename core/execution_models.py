@@ -53,6 +53,15 @@ class Fill:
     exit_price: Optional[float] = None
     trade_id: Optional[int] = None
     pnl: Optional[float] = None
+    exchange: Optional[str] = None
+    symbol: Optional[str] = None
+    market_type: Optional[str] = None
+    order_id: Optional[str] = None
+    client_order_id: Optional[str] = None
+    order_status: Optional[str] = None
+    execution_source: Optional[str] = None
+    reduce_only: Optional[bool] = None
+    dry_run: Optional[bool] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -73,4 +82,13 @@ class Fill:
             exit_price=data.get("exit_price"),
             trade_id=data.get("trade_id"),
             pnl=data.get("pnl"),
+            exchange=data.get("exchange"),
+            symbol=data.get("symbol"),
+            market_type=data.get("market_type"),
+            order_id=data.get("order_id"),
+            client_order_id=data.get("client_order_id"),
+            order_status=data.get("order_status"),
+            execution_source=data.get("execution_source"),
+            reduce_only=data.get("reduce_only"),
+            dry_run=data.get("dry_run"),
         )

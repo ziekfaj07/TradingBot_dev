@@ -88,7 +88,20 @@ class ConfigureBody(BaseModel):
     enable_liquidation: bool | None = None
     use_mark_price_for_liquidation: bool | None = None
     mark_price_source: str | None = None
-    maintenance_margin_override: float | None = None    
+    maintenance_margin_override: float | None = None
+
+    exchange_name: str | None = None
+    exchange_api_key_env: str | None = None
+    exchange_api_secret_env: str | None = None
+    exchange_api_passphrase_env: str | None = None
+    exchange_testnet: bool | None = None
+    exchange_settle_currency: str | None = None
+    enable_live_trading: bool | None = None
+    live_dry_run: bool | None = None
+    sync_positions_on_start: bool | None = None
+    cancel_open_orders_on_stop: bool | None = None
+    client_order_id_prefix: str | None = None
+    live_poll_seconds: float | None = None
 
     @model_validator(mode="after")
     def validate_strategy_block(self) -> "ConfigureBody":
@@ -102,8 +115,32 @@ class ConfigureBody(BaseModel):
 
         self.strategy_name = canonical_name
         self.strategy_params = normalized_params
-        return self
 
+        if self.exchange_name is not None:
+            raw_exchange = str(self.exchange_name).strip().lower()
+            aliases = {"gate": "gateio", "gate.io": "gateio", "gateio": "gateio"}
+            normalized_exchange = aliases.get(raw_exchange)
+            if normalized_exchange is None:
+                raise ValueError("exchange_name must currently be Gate.io / gateio")
+            self.exchange_name = normalized_exchange
+
+        if self.market_type is not None:
+            raw_market_type = str(self.market_type).strip().lower()
+            aliases = {
+                "spot": "spot",
+                "cash": "spot",
+                "swap": "swap",
+                "future": "swap",
+                "futures": "swap",
+                "perp": "swap",
+                "perpetual": "swap",
+            }
+            normalized_market_type = aliases.get(raw_market_type)
+            if normalized_market_type is None:
+                raise ValueError("market_type must be 'spot' or 'swap'")
+            self.market_type = normalized_market_type
+
+        return self
 
 class DevActionBody(BaseModel):
     price: float | None = None

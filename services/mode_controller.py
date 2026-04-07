@@ -32,6 +32,7 @@ from core.database import (
 from core.execution_models import Fill, PortfolioState
 from core.run_naming import make_run_id
 from services.execution_engine import ExecutionEngine
+from services.exchange_service import validate_live_config
 from services.margin_engine import evaluate_position_margin
 from services.market_data_service import CoinGeckoService, GateIOService
 from services.risk_engine import RiskEngine
@@ -123,6 +124,19 @@ class RunConfig:
 
     candle_limit: int = 300
     debug_stream: bool = True
+
+    exchange_name: str = "gateio"
+    exchange_api_key_env: str = "GATEIO_API_KEY"
+    exchange_api_secret_env: str = "GATEIO_API_SECRET"
+    exchange_api_passphrase_env: str | None = "GATEIO_API_PASSPHRASE"
+    exchange_testnet: bool = False
+    exchange_settle_currency: str = "usdt"
+    enable_live_trading: bool = False
+    live_dry_run: bool = True
+    sync_positions_on_start: bool = True
+    cancel_open_orders_on_stop: bool = False
+    client_order_id_prefix: str = "tb"
+    live_poll_seconds: float = 3.0
 
 
 @dataclass
@@ -333,7 +347,26 @@ class ModeController:
             if self._status.mode == Mode.BACKTEST:
                 raise RuntimeError("Use run_backtest() for backtest mode.")
 
+            if self._status.mode == Mode.LIVE:
+                live_validation = validate_live_config(
+                    exchange_name=self._status.config.exchange_name,
+                    market_type=self._status.config.market_type,
+                    symbol=self._status.config.symbol,
+                    enable_live_trading=self._status.config.enable_live_trading,
+                    dry_run_live=self._status.config.live_dry_run,
+                    api_key_env=self._status.config.exchange_api_key_env,
+                    api_secret_env=self._status.config.exchange_api_secret_env,
+                    api_passphrase_env=self._status.config.exchange_api_passphrase_env,
+                )
+                if not live_validation.get("ok"):
+                    errors = "; ".join(live_validation.get("errors", [])) or "live config invalid"
+                    raise RuntimeError(f"Live startup blocked: {errors}")
+                raise RuntimeError(
+                    "v0.7.0 / v0.7.1 only wires the Gate.io adapter and safety rails. Real live order execution starts in v0.7.2."
+                )
+
             self._status.state = EngineState.STARTING
+
             self._status.started_at = time.time()
             self._status.stopped_at = None
             self._status.last_error = None
@@ -600,6 +633,15 @@ class ModeController:
             "reconnect_attempts": self._reconnect_attempts,
             "last_fetch_error": self._last_fetch_error,
             "risk": self._build_risk_payload(),
+            "live": {
+                "exchange_name": cfg.get("exchange_name"),
+                "exchange_testnet": cfg.get("exchange_testnet"),
+                "enable_live_trading": cfg.get("enable_live_trading"),
+                "live_dry_run": cfg.get("live_dry_run"),
+                "sync_positions_on_start": cfg.get("sync_positions_on_start"),
+                "cancel_open_orders_on_stop": cfg.get("cancel_open_orders_on_stop"),
+                "client_order_id_prefix": cfg.get("client_order_id_prefix"),
+            },
         }
 
         return {
