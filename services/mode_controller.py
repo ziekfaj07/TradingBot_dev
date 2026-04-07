@@ -73,6 +73,11 @@ class RunConfig:
     position_sizing_mode: str = "all_in"
     position_size_value: float | None = None
 
+    enable_volatility_scaling: bool = False
+    volatility_target_pct: float | None = None
+    min_volatility_scale: float | None = 0.50
+    max_volatility_scale: float | None = 1.50    
+
     max_drawdown_pct: float | None = None
     max_trades_per_day: int | None = None
     cooldown_seconds: int = 0
@@ -476,6 +481,11 @@ class ModeController:
                 risk_engine=self._risk_engine,
                 position_sizing_mode=cfg.position_sizing_mode,
                 position_size_value=cfg.position_size_value,
+                enable_volatility_scaling=cfg.enable_volatility_scaling,
+                volatility_target_pct=cfg.volatility_target_pct,
+                min_volatility_scale=cfg.min_volatility_scale,
+                max_volatility_scale=cfg.max_volatility_scale,
+                debug_risk_telemetry=cfg.debug_risk_telemetry,
                 max_drawdown_pct=cfg.max_drawdown_pct,
                 max_trades_per_day=cfg.max_trades_per_day,
                 cooldown_seconds=cfg.cooldown_seconds,
@@ -524,6 +534,10 @@ class ModeController:
                     "risk": {
                         "position_sizing_mode": cfg.position_sizing_mode,
                         "position_size_value": cfg.position_size_value,
+                        "enable_volatility_scaling": cfg.enable_volatility_scaling,
+                        "volatility_target_pct": cfg.volatility_target_pct,
+                        "min_volatility_scale": cfg.min_volatility_scale,
+                        "max_volatility_scale": cfg.max_volatility_scale,
                         "max_drawdown_pct": cfg.max_drawdown_pct,
                         "max_trades_per_day": cfg.max_trades_per_day,
                         "cooldown_seconds": cfg.cooldown_seconds,

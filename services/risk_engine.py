@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
+import copy
 
 from core.execution_models import PortfolioState
 
@@ -112,6 +113,12 @@ class RiskEngine:
             "fixedpct": "fixed_pct",
             "fixed-percent": "fixed_pct",
             "fixed_percentage": "fixed_pct",
+            "equitypct": "equity_pct",
+            "equity-percent": "equity_pct",
+            "equity_percentage": "equity_pct",
+            "riskpct": "risk_pct",
+            "risk-percent": "risk_pct",
+            "risk_percentage": "risk_pct",
         }
         return aliases.get(mode, mode)
 
@@ -204,6 +211,324 @@ class RiskEngine:
 
         return None
 
+    def _safe_scale(
+        self,
+        value: float,
+        *,
+        floor: float | None = None,
+        ceiling: float | None = None,
+    ) -> float:
+        out = self._safe_float(value, 1.0)
+        if floor is not None:
+            out = max(self._safe_float(floor, 0.0), out)
+        if ceiling is not None and self._safe_float(ceiling, 0.0) > 0.0:
+            out = min(self._safe_float(ceiling, out), out)
+        return out
+
+    def _resolve_stop_distance(
+        self,
+        *,
+        entry_price: float,
+        stop_loss_pct: float | None,
+        exit_mode: str,
+        atr_value: float | None,
+        atr_stop_mult: float | None,
+    ) -> float | None:
+        px = self._safe_float(entry_price, 0.0)
+        if px <= 0.0 or not math.isfinite(px):
+            return None
+
+        normalized_exit_mode = self._normalize_exit_mode(exit_mode)
+
+        if normalized_exit_mode == "atr":
+            atr = self._safe_float(atr_value, 0.0)
+            stop_mult = self._safe_float(atr_stop_mult, 0.0)
+            dist = atr * stop_mult
+            if dist > 0.0 and math.isfinite(dist):
+                return dist
+            return None
+
+        sl_pct = self._safe_float(stop_loss_pct, 0.0)
+        if sl_pct <= 0.0:
+            return None
+
+        dist = px * (sl_pct / 100.0)
+        if dist > 0.0 and math.isfinite(dist):
+            return dist
+        return None
+
+    def _resolve_volatility_scale(
+        self,
+        *,
+        entry_price: float,
+        atr_value: float | None,
+        enable_volatility_scaling: bool,
+        volatility_target_pct: float | None,
+        min_volatility_scale: float | None,
+        max_volatility_scale: float | None,
+    ) -> float:
+        if not enable_volatility_scaling:
+            return 1.0
+
+        px = self._safe_float(entry_price, 0.0)
+        atr = self._safe_float(atr_value, 0.0)
+        target_pct = self._safe_float(volatility_target_pct, 0.0)
+
+        if px <= 0.0 or atr <= 0.0 or target_pct <= 0.0:
+            return 1.0
+
+        realized_atr_pct = (atr / px) * 100.0
+        if realized_atr_pct <= 0.0 or not math.isfinite(realized_atr_pct):
+            return 1.0
+
+        raw_scale = target_pct / realized_atr_pct
+        return self._safe_scale(
+            raw_scale,
+            floor=min_volatility_scale,
+            ceiling=max_volatility_scale,
+        )    
+
+    def _clean_telemetry_value(self, value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            v = float(value)
+            if not math.isfinite(v):
+                return None
+            return round(v, 12)
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            return [self._clean_telemetry_value(v) for v in value]
+        if isinstance(value, dict):
+            return {str(k): self._clean_telemetry_value(v) for k, v in value.items()}
+        return value
+
+    def _finalize_entry_sizing_telemetry(self, telemetry: dict[str, Any]) -> dict[str, Any]:
+        return {str(k): self._clean_telemetry_value(v) for k, v in telemetry.items()}
+
+    def compute_entry_qty_with_meta(
+        self,
+        *,
+        state: PortfolioState,
+        market_type: str,
+        entry_price: float,
+        leverage: float,
+        fee_rate: float,
+        max_leverage: float,
+        max_qty: float,
+        sizing_mode: str,
+        sizing_value: float | None,
+        current_equity: float | None = None,
+        stop_loss_pct: float | None = None,
+        exit_mode: str = "static",
+        atr_value: float | None = None,
+        atr_stop_mult: float | None = None,
+        enable_volatility_scaling: bool = False,
+        volatility_target_pct: float | None = None,
+        min_volatility_scale: float | None = None,
+        max_volatility_scale: float | None = None,
+    ) -> tuple[float | None, dict[str, Any]]:
+        px = self._safe_float(entry_price)
+        mode = self._normalize_mode(sizing_mode)
+        mt = str(market_type or "spot").strip().lower()
+        cash = max(0.0, self._safe_float(state.cash))
+        equity = max(cash, self._safe_float(current_equity, cash))
+        fee_rate_safe = max(0.0, self._safe_float(fee_rate))
+        max_qty_safe = max(0.0, self._safe_float(max_qty))
+        lev = min(
+            max(self._safe_float(leverage, 1.0), 1.0),
+            max(self._safe_float(max_leverage, 1.0), 1.0),
+        )
+        value = self._safe_float(sizing_value, 0.0)
+        realized_atr_pct = None
+        if px > 0.0:
+            atr_safe = self._safe_float(atr_value, 0.0)
+            if atr_safe > 0.0:
+                realized_atr_pct = (atr_safe / px) * 100.0
+
+        telemetry: dict[str, Any] = {
+            "entry_price": px,
+            "market_type": mt,
+            "cash": cash,
+            "current_equity": equity,
+            "sizing_mode": mode,
+            "sizing_value": value if value > 0.0 else None,
+            "fee_rate": fee_rate_safe,
+            "max_qty": max_qty_safe,
+            "leverage": lev,
+            "max_leverage": self._safe_float(max_leverage, 1.0),
+            "stop_loss_pct": self._safe_float_or_none(stop_loss_pct),
+            "exit_mode": self._normalize_exit_mode(exit_mode),
+            "atr_value": self._safe_float_or_none(atr_value),
+            "atr_stop_mult": self._safe_float_or_none(atr_stop_mult),
+            "enable_volatility_scaling": bool(enable_volatility_scaling),
+            "volatility_target_pct": self._safe_float_or_none(volatility_target_pct),
+            "min_volatility_scale": self._safe_float_or_none(min_volatility_scale),
+            "max_volatility_scale": self._safe_float_or_none(max_volatility_scale),
+            "realized_atr_pct": realized_atr_pct,
+            "volatility_scale": 1.0,
+            "stop_distance": None,
+            "risk_budget": None,
+            "budget_before_vol_scale": None,
+            "budget_after_vol_scale": None,
+            "computed_qty_before_clamps": None,
+            "computed_qty_after_clamps": None,
+            "clamps": [],
+            "rejected": False,
+            "rejection_reason": None,
+        }
+
+        if px <= 0.0 or not math.isfinite(px):
+            telemetry["rejected"] = True
+            telemetry["rejection_reason"] = "invalid_entry_price"
+            return None, self._finalize_entry_sizing_telemetry(telemetry)
+
+        if mode == "all_in":
+            telemetry["rejected"] = True
+            telemetry["rejection_reason"] = "all_in_uses_engine_default"
+            return None, self._finalize_entry_sizing_telemetry(telemetry)
+
+        if value <= 0.0:
+            telemetry["rejected"] = True
+            telemetry["rejection_reason"] = "invalid_sizing_value"
+            return None, self._finalize_entry_sizing_telemetry(telemetry)
+
+        budget = 0.0
+
+        if mode == "fixed_usdt":
+            budget = value
+            telemetry["budget_before_vol_scale"] = budget
+
+        elif mode == "fixed_pct":
+            budget = cash * (value / 100.0)
+            telemetry["budget_before_vol_scale"] = budget
+
+        elif mode == "equity_pct":
+            budget = equity * (value / 100.0)
+            telemetry["budget_before_vol_scale"] = budget
+
+        elif mode == "risk_pct":
+            stop_distance = self._resolve_stop_distance(
+                entry_price=px,
+                stop_loss_pct=stop_loss_pct,
+                exit_mode=exit_mode,
+                atr_value=atr_value,
+                atr_stop_mult=atr_stop_mult,
+            )
+            telemetry["stop_distance"] = stop_distance
+
+            if stop_distance is None or stop_distance <= 0.0:
+                telemetry["rejected"] = True
+                telemetry["rejection_reason"] = "invalid_stop_distance"
+                return None, self._finalize_entry_sizing_telemetry(telemetry)
+
+            risk_budget = equity * (value / 100.0)
+            telemetry["risk_budget"] = risk_budget
+
+            if risk_budget <= 0.0:
+                telemetry["computed_qty_before_clamps"] = 0.0
+                telemetry["computed_qty_after_clamps"] = 0.0
+                return 0.0, self._finalize_entry_sizing_telemetry(telemetry)
+
+            qty = risk_budget / stop_distance
+            telemetry["computed_qty_before_clamps"] = qty
+
+            if not math.isfinite(qty) or qty <= 0.0:
+                telemetry["computed_qty_after_clamps"] = 0.0
+                return 0.0, self._finalize_entry_sizing_telemetry(telemetry)
+
+            vol_scale = self._resolve_volatility_scale(
+                entry_price=px,
+                atr_value=atr_value,
+                enable_volatility_scaling=enable_volatility_scaling,
+                volatility_target_pct=volatility_target_pct,
+                min_volatility_scale=min_volatility_scale,
+                max_volatility_scale=max_volatility_scale,
+            )
+            telemetry["volatility_scale"] = vol_scale
+            qty *= vol_scale
+
+            if mt == "spot":
+                max_affordable_budget = cash
+                desired_notional = qty * px
+                if desired_notional > max_affordable_budget:
+                    qty = max_affordable_budget / px if px > 0.0 else 0.0
+                    telemetry["clamps"].append("cash_cap")
+            else:
+                max_notional = cash * lev
+                desired_notional = qty * px
+                if desired_notional > max_notional and px > 0.0:
+                    qty = max_notional / px
+                    telemetry["clamps"].append("max_notional_cap")
+
+            if max_qty_safe > 0.0 and qty > max_qty_safe:
+                qty = max_qty_safe
+                telemetry["clamps"].append("max_qty_cap")
+
+            if not math.isfinite(qty) or qty <= 0.0:
+                telemetry["computed_qty_after_clamps"] = 0.0
+                return 0.0, self._finalize_entry_sizing_telemetry(telemetry)
+
+            telemetry["computed_qty_after_clamps"] = qty
+            return qty, self._finalize_entry_sizing_telemetry(telemetry)
+
+        else:
+            telemetry["rejected"] = True
+            telemetry["rejection_reason"] = "unsupported_sizing_mode"
+            return None, self._finalize_entry_sizing_telemetry(telemetry)
+
+        vol_scale = self._resolve_volatility_scale(
+            entry_price=px,
+            atr_value=atr_value,
+            enable_volatility_scaling=enable_volatility_scaling,
+            volatility_target_pct=volatility_target_pct,
+            min_volatility_scale=min_volatility_scale,
+            max_volatility_scale=max_volatility_scale,
+        )
+        telemetry["volatility_scale"] = vol_scale
+        budget *= vol_scale
+        telemetry["budget_after_vol_scale"] = budget
+
+        budget_cap = cash if mt == "spot" else equity
+        if budget > budget_cap:
+            telemetry["clamps"].append("budget_cap")
+        budget = max(0.0, min(budget, budget_cap))
+
+        if budget <= 0.0:
+            telemetry["computed_qty_before_clamps"] = 0.0
+            telemetry["computed_qty_after_clamps"] = 0.0
+            return 0.0, self._finalize_entry_sizing_telemetry(telemetry)
+
+        if mt == "spot":
+            notional_after_fee = max(0.0, budget * (1.0 - fee_rate_safe))
+            qty = notional_after_fee / px
+        else:
+            notional = budget * lev
+            fee = notional * fee_rate_safe
+            if fee >= cash:
+                telemetry["computed_qty_before_clamps"] = 0.0
+                telemetry["computed_qty_after_clamps"] = 0.0
+                telemetry["rejected"] = True
+                telemetry["rejection_reason"] = "futures_fee_exceeds_cash"
+                return 0.0, self._finalize_entry_sizing_telemetry(telemetry)
+            qty = notional / px
+
+        telemetry["computed_qty_before_clamps"] = qty
+
+        if max_qty_safe > 0.0 and qty > max_qty_safe:
+            qty = max_qty_safe
+            telemetry["clamps"].append("max_qty_cap")
+
+        if not math.isfinite(qty) or qty <= 0.0:
+            telemetry["computed_qty_after_clamps"] = 0.0
+            return 0.0, self._finalize_entry_sizing_telemetry(telemetry)
+
+        telemetry["computed_qty_after_clamps"] = qty
+        return qty, self._finalize_entry_sizing_telemetry(telemetry)
+
     def compute_entry_qty(
         self,
         *,
@@ -216,53 +541,37 @@ class RiskEngine:
         max_qty: float,
         sizing_mode: str,
         sizing_value: float | None,
+        current_equity: float | None = None,
+        stop_loss_pct: float | None = None,
+        exit_mode: str = "static",
+        atr_value: float | None = None,
+        atr_stop_mult: float | None = None,
+        enable_volatility_scaling: bool = False,
+        volatility_target_pct: float | None = None,
+        min_volatility_scale: float | None = None,
+        max_volatility_scale: float | None = None,
     ) -> float | None:
-        px = self._safe_float(entry_price)
-        if px <= 0.0 or not math.isfinite(px):
-            return None
-
-        mode = self._normalize_mode(sizing_mode)
-        if mode == "all_in":
-            return None
-
-        value = self._safe_float(sizing_value, 0.0)
-        if value <= 0.0:
-            return None
-
-        mt = str(market_type or "spot").strip().lower()
-        cash = max(0.0, self._safe_float(state.cash))
-        fee_rate_safe = max(0.0, self._safe_float(fee_rate))
-        max_qty_safe = max(0.0, self._safe_float(max_qty))
-        lev = min(
-            max(self._safe_float(leverage, 1.0), 1.0),
-            max(self._safe_float(max_leverage, 1.0), 1.0),
+        qty, _ = self.compute_entry_qty_with_meta(
+            state=state,
+            market_type=market_type,
+            entry_price=entry_price,
+            leverage=leverage,
+            fee_rate=fee_rate,
+            max_leverage=max_leverage,
+            max_qty=max_qty,
+            sizing_mode=sizing_mode,
+            sizing_value=sizing_value,
+            current_equity=current_equity,
+            stop_loss_pct=stop_loss_pct,
+            exit_mode=exit_mode,
+            atr_value=atr_value,
+            atr_stop_mult=atr_stop_mult,
+            enable_volatility_scaling=enable_volatility_scaling,
+            volatility_target_pct=volatility_target_pct,
+            min_volatility_scale=min_volatility_scale,
+            max_volatility_scale=max_volatility_scale,
         )
-
-        if mode == "fixed_usdt":
-            budget = value
-        elif mode == "fixed_pct":
-            budget = cash * (value / 100.0)
-        else:
-            return None
-
-        budget = max(0.0, min(budget, cash))
-        if budget <= 0.0:
-            return 0.0
-
-        if mt == "spot":
-            notional_after_fee = max(0.0, budget * (1.0 - fee_rate_safe))
-            qty = notional_after_fee / px
-        else:
-            notional = budget * lev
-            fee = notional * fee_rate_safe
-            if fee >= cash:
-                return 0.0
-            qty = notional / px
-
-        if not math.isfinite(qty) or qty <= 0.0:
-            return 0.0
-
-        return min(qty, max_qty_safe) if max_qty_safe > 0 else qty
+        return qty
 
     def evaluate_entry_gate(
         self,

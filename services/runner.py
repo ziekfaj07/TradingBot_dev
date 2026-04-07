@@ -276,9 +276,16 @@ def run_signal_backed_loop(
     include_equity: bool = False,
     equity_stride: int = 1,
     risk_engine: RiskEngine | None = None,
+    
     position_sizing_mode: str = "all-in",
     position_size_value: float | None = None,
-    max_drawdown_pct: float | None = None,
+    enable_volatility_scaling: bool = False,
+    volatility_target_pct: float | None = None,
+    min_volatility_scale: float | None = 0.50,
+    max_volatility_scale: float | None = 1.50,
+    debug_risk_telemetry: bool = False,
+    max_drawdown_pct: float | None = None,    
+
     max_trades_per_day: int | None = None,
     cooldown_seconds: int = 0,
     stop_loss_pct: float | None = None,
@@ -520,7 +527,7 @@ def run_signal_backed_loop(
                 cooldown_seconds=cooldown_seconds,
             )
             if gate.allowed:
-                qty_override = risk_engine.compute_entry_qty(
+                qty_override, sizing_meta = risk_engine.compute_entry_qty_with_meta(
                     state=state,
                     market_type=market_type,
                     entry_price=close,
@@ -530,6 +537,15 @@ def run_signal_backed_loop(
                     max_qty=engine.max_qty,
                     sizing_mode=position_sizing_mode,
                     sizing_value=position_size_value,
+                    current_equity=current_equity,
+                    stop_loss_pct=stop_loss_pct,
+                    exit_mode=exit_mode,
+                    atr_value=atr_value,
+                    atr_stop_mult=atr_stop_mult,
+                    enable_volatility_scaling=enable_volatility_scaling,
+                    volatility_target_pct=volatility_target_pct,
+                    min_volatility_scale=min_volatility_scale,
+                    max_volatility_scale=max_volatility_scale,
                 )
 
                 trade_id += 1
@@ -542,6 +558,7 @@ def run_signal_backed_loop(
                     trade_id,
                     qty_override=qty_override,
                 )
+
                 if fill:
                     fill.equity_after = _clean_money(getattr(fill, "equity_after", 0.0))
                     trades.append(_clean_fill_for_output(fill))
@@ -550,6 +567,21 @@ def run_signal_backed_loop(
                     )
                     position_peak_price = close
                     trades_today += 1
+
+                    if debug_risk_telemetry:
+                        sizing_meta_out = dict(sizing_meta or {})
+                        sizing_meta_out["filled_qty"] = _clean_money(getattr(fill, "qty", 0.0))
+                        sizing_meta_out["filled_price"] = _clean_money(getattr(fill, "price", close))
+                        sizing_meta_out["trade_id"] = getattr(fill, "trade_id", trade_id)
+                        risk_events.append(
+                            {
+                                "timestamp": ts_iso,
+                                "event": "entry_sizing",
+                                "reason": "entry_qty_computed",
+                                "meta": sizing_meta_out,
+                            }
+                        )
+
             else:
                 risk_events.append(
                     {

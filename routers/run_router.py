@@ -64,6 +64,11 @@ class ConfigureBody(BaseModel):
     position_sizing_mode: str | None = None
     position_size_value: float | None = None
 
+    enable_volatility_scaling: bool | None = None
+    volatility_target_pct: float | None = None
+    min_volatility_scale: float | None = None
+    max_volatility_scale: float | None = None    
+
     max_drawdown_pct: float | None = None
     max_trades_per_day: int | None = None
     cooldown_seconds: int | None = None

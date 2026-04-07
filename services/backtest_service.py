@@ -30,6 +30,11 @@ class BacktestService:
         maintenance_margin_override: float | None,
         position_sizing_mode: str,
         position_size_value: float | None,
+        enable_volatility_scaling: bool,
+        volatility_target_pct: float | None,
+        min_volatility_scale: float | None,
+        max_volatility_scale: float | None,
+        debug_risk_telemetry: bool,
         stop_loss_pct: float | None,
         take_profit_pct: float | None,
         exit_on_signal: bool | None = None,
@@ -63,9 +68,49 @@ class BacktestService:
                 return str(exc)
 
         sizing_mode = str(position_sizing_mode or "all_in").strip().lower()
-        if sizing_mode in {"fixed_usdt", "fixed_notional", "fixed_qty"}:
+
+        valid_sizing_modes = {
+            "all_in",
+            "fixed_usdt",
+            "fixed_pct",
+            "equity_pct",
+            "risk_pct",
+        }
+        if sizing_mode not in valid_sizing_modes:
+            return (
+                "position_sizing_mode must be one of: "
+                "all_in, fixed_usdt, fixed_pct, equity_pct, risk_pct"
+            )
+
+        if sizing_mode in {"fixed_usdt", "fixed_pct", "equity_pct", "risk_pct"}:
             if position_size_value is None or float(position_size_value) <= 0.0:
                 return f"position_size_value must be > 0 for sizing mode '{sizing_mode}'"
+
+        if sizing_mode == "risk_pct":
+            normalized_exit_mode = str(exit_mode or "static").strip().lower()
+            if normalized_exit_mode == "atr":
+                if atr_stop_mult is None or float(atr_stop_mult) <= 0.0:
+                    return "risk_pct requires atr_stop_mult > 0 when exit_mode='atr'"
+            else:
+                if stop_loss_pct is None or float(stop_loss_pct) <= 0.0:
+                    return "risk_pct requires stop_loss_pct > 0 when exit_mode='static'"
+
+        if enable_volatility_scaling:
+            if volatility_target_pct is None or float(volatility_target_pct) <= 0.0:
+                return "volatility_target_pct must be > 0 when enable_volatility_scaling=true"
+
+            if min_volatility_scale is not None and float(min_volatility_scale) <= 0.0:
+                return "min_volatility_scale must be > 0 when provided"
+
+            if max_volatility_scale is not None and float(max_volatility_scale) <= 0.0:
+                return "max_volatility_scale must be > 0 when provided"
+
+            if (
+                min_volatility_scale is not None
+                and max_volatility_scale is not None
+                and float(min_volatility_scale) > float(max_volatility_scale)
+            ):
+                return "min_volatility_scale cannot be greater than max_volatility_scale"
 
         if stop_loss_pct is not None and float(stop_loss_pct) <= 0.0:
             return "stop_loss_pct must be > 0"
@@ -103,6 +148,9 @@ class BacktestService:
         if mt == "futures":
             if leverage > 50.0:
                 return "leverage exceeds current engine max of 50"
+            
+        if not isinstance(debug_risk_telemetry, bool):
+            return "debug_risk_telemetry must be true or false"            
 
         return None
 
@@ -123,6 +171,11 @@ class BacktestService:
         equity_stride: int = 1,
         position_sizing_mode: str = "all_in",
         position_size_value: float | None = None,
+        enable_volatility_scaling: bool = False,
+        volatility_target_pct: float | None = None,
+        min_volatility_scale: float | None = 0.50,
+        max_volatility_scale: float | None = 1.50,
+        debug_risk_telemetry: bool = False,
         max_drawdown_pct: float | None = None,
         max_trades_per_day: int | None = None,
         cooldown_seconds: int = 0,
@@ -172,6 +225,11 @@ class BacktestService:
             maintenance_margin_override=maintenance_margin_override,
             position_sizing_mode=position_sizing_mode,
             position_size_value=position_size_value,
+            enable_volatility_scaling=enable_volatility_scaling,
+            volatility_target_pct=volatility_target_pct,
+            min_volatility_scale=min_volatility_scale,
+            max_volatility_scale=max_volatility_scale,
+            debug_risk_telemetry=debug_risk_telemetry,            
             stop_loss_pct=stop_loss_pct,
             take_profit_pct=take_profit_pct,
             exit_on_signal=exit_on_signal,            
@@ -224,6 +282,11 @@ class BacktestService:
             risk_engine=self.risk_engine,
             position_sizing_mode=position_sizing_mode,
             position_size_value=position_size_value,
+            enable_volatility_scaling=enable_volatility_scaling,
+            volatility_target_pct=volatility_target_pct,
+            min_volatility_scale=min_volatility_scale,
+            max_volatility_scale=max_volatility_scale,
+            debug_risk_telemetry=debug_risk_telemetry,
             max_drawdown_pct=max_drawdown_pct,
             max_trades_per_day=max_trades_per_day,
             cooldown_seconds=cooldown_seconds,
@@ -267,6 +330,11 @@ class BacktestService:
                 "equity_stride": equity_stride,
                 "position_sizing_mode": position_sizing_mode,
                 "position_size_value": position_size_value,
+                "enable_volatility_scaling": enable_volatility_scaling,
+                "volatility_target_pct": volatility_target_pct,
+                "min_volatility_scale": min_volatility_scale,
+                "max_volatility_scale": max_volatility_scale,
+                "debug_risk_telemetry": debug_risk_telemetry,                
                 "max_drawdown_pct": max_drawdown_pct,
                 "max_trades_per_day": max_trades_per_day,
                 "cooldown_seconds": cooldown_seconds,
