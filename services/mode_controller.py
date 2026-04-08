@@ -1994,7 +1994,7 @@ class ModeController:
 
     def _current_equity_locked(self, market_price: float | None = None) -> float:
         if self._state is None:
-            return 0.0
+            return float(self._status.config.initial_balance or 0.0)
 
         resolved_price = market_price
         if resolved_price is None and self._latest_bar and self._latest_bar.get("close") is not None:
@@ -2007,18 +2007,12 @@ class ModeController:
             resolved_price = float(self._state.entry_price)
 
         if self._engine is None or resolved_price is None:
-            return float(self._state.equity or self._state.cash)
-
-        try:
-            return float(
-                self._engine.mark_equity(
-                    state=self._state,
-                    market_price=float(resolved_price),
-                    market_type=self._status.config.market_type,
-                )
-            )
-        except Exception:
-            return float(self._state.equity or self._state.cash)
+            fallback_equity = self._state.equity
+            if fallback_equity is None:
+                fallback_equity = self._state.cash
+            if fallback_equity is None:
+                fallback_equity = self._status.config.initial_balance
+            return float(fallback_equity or 0.0)
 
     def _reset_risk_runtime_locked(self) -> None:
         self._trade_day_key = self._risk_day_key_now()
