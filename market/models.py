@@ -14,6 +14,7 @@ class ExchangeCapabilities:
     has_fetch_balance: bool
     has_fetch_ticker: bool
     has_fetch_open_orders: bool
+    has_fetch_order: bool
     has_fetch_positions: bool
     has_create_order: bool
     has_cancel_order: bool

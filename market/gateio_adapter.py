@@ -30,7 +30,6 @@ class GateIOAdapter:
     ) -> None:
         self.market_type = self._normalize_market_type(market_type)
         self.testnet = bool(testnet)
-
         self.credentials = ExchangeCredentials(
             api_key=(api_key or "").strip(),
             api_secret=(api_secret or "").strip(),
@@ -52,7 +51,7 @@ class GateIOAdapter:
         )
 
         if self.testnet:
-            self._apply_testnet_urls()
+            self._enable_testnet_mode()
 
     def _normalize_market_type(self, market_type: str) -> str:
         raw = str(market_type or "spot").strip().lower()
@@ -72,25 +71,31 @@ class GateIOAdapter:
             )
         return normalized
 
-    def _apply_testnet_urls(self) -> None:
-        urls = dict(getattr(self.client, "urls", {}) or {})
-        api_urls = dict(urls.get("api", {}) or {})
-        api_urls["public"] = "https://api-testnet.gateapi.io/api/v4"
-        api_urls["private"] = "https://api-testnet.gateapi.io/api/v4"
-        urls["api"] = api_urls
-        self.client.urls = urls
+    def _enable_testnet_mode(self) -> None:
+        if self.market_type == "spot":
+            raise ExchangeConfigurationError(
+                "Gate.io testnet/demo is not supported for spot in this adapter. "
+                "Use market_type='swap' for Gate testnet, or set exchange_testnet=false for live spot."
+            )
+
+        try:
+            self.client.set_sandbox_mode(True)
+        except Exception as exc:
+            raise ExchangeConfigurationError(
+                f"Failed to enable Gate.io testnet/sandbox mode: {exc}"
+            ) from exc
 
     @staticmethod
     def normalize_symbol(symbol: str) -> str:
-        raw = str(symbol or "").strip().upper().replace("/", "").replace("-", "")
+        raw = str(symbol or "").strip().upper().replace("-", "")
         if not raw:
             raise ExchangeConfigurationError("Symbol is required.")
+        if "/" in raw:
+            return raw
         if raw.endswith("USDT"):
             return f"{raw[:-4]}/USDT"
         if raw.endswith("USD"):
             return f"{raw[:-3]}/USD"
-        if "/" in str(symbol):
-            return str(symbol).strip().upper()
         raise ExchangeConfigurationError(
             f"Unsupported Gate.io symbol format: {symbol!r}. Expected like BTCUSDT or BTC/USDT."
         )
@@ -101,11 +106,17 @@ class GateIOAdapter:
                 "Missing Gate.io API credentials. Set the configured API key and secret env vars first."
             )
 
+    def _api_environment_label(self) -> str:
+        if self.testnet:
+            return f"gateio-{self.market_type}-testnet"
+        return f"gateio-{self.market_type}-live"
+
     def describe(self) -> dict[str, Any]:
         return {
             "exchange_id": self.exchange_id,
             "market_type": self.market_type,
             "testnet": self.testnet,
+            "environment": self._api_environment_label(),
             "capabilities": self.capabilities().to_dict(),
         }
 
@@ -120,6 +131,7 @@ class GateIOAdapter:
             has_fetch_balance=bool(has.get("fetchBalance")),
             has_fetch_ticker=bool(has.get("fetchTicker")),
             has_fetch_open_orders=bool(has.get("fetchOpenOrders")),
+            has_fetch_order=bool(has.get("fetchOrder")),
             has_fetch_positions=bool(has.get("fetchPositions")),
             has_create_order=bool(has.get("createOrder")),
             has_cancel_order=bool(has.get("cancelOrder")),
@@ -132,11 +144,11 @@ class GateIOAdapter:
             raise ExchangeAuthError(str(exc)) from exc
         except Exception as exc:
             raise ExchangeConnectionError(str(exc)) from exc
-
         return {
             "ok": True,
             "exchange": self.exchange_id,
             "market_count": len(markets),
+            "environment": self._api_environment_label(),
         }
 
     def health_check(self) -> dict[str, Any]:
@@ -148,6 +160,7 @@ class GateIOAdapter:
                 "exchange": self.exchange_id,
                 "market_type": self.market_type,
                 "testnet": self.testnet,
+                "environment": self._api_environment_label(),
                 "server_time": server_time,
                 "market_count": len(markets),
             }
@@ -159,13 +172,19 @@ class GateIOAdapter:
     def validate_symbol(self, symbol: str, market_type: str = "spot") -> dict[str, Any]:
         normalized_market_type = self._normalize_market_type(market_type)
         if normalized_market_type != self.market_type:
+            if self.testnet and normalized_market_type == "spot":
+                raise ExchangeConfigurationError(
+                    "Gate.io testnet/demo is not supported for spot in this adapter. "
+                    "Use market_type='swap' for Gate testnet, or set exchange_testnet=false for live spot."
+                )
             self.client.options["defaultType"] = normalized_market_type
             self.market_type = normalized_market_type
 
         normalized_symbol = self.normalize_symbol(symbol)
-
         try:
             markets = self.client.load_markets()
+        except ccxt.AuthenticationError as exc:
+            raise ExchangeAuthError(str(exc)) from exc
         except Exception as exc:
             raise ExchangeConnectionError(str(exc)) from exc
 
@@ -176,7 +195,9 @@ class GateIOAdapter:
             "normalized_symbol": normalized_symbol,
             "market_type": self.market_type,
             "exchange": self.exchange_id,
-            "active": bool(getattr(market, "get", lambda *_: False)("active")) if market else False,
+            "testnet": self.testnet,
+            "environment": self._api_environment_label(),
+            "active": bool(market.get("active")) if market else False,
             "limits": dict(market.get("limits", {}) or {}) if market else None,
             "precision": dict(market.get("precision", {}) or {}) if market else None,
             "raw_market_id": market.get("id") if market else None,
@@ -202,7 +223,17 @@ class GateIOAdapter:
         self._require_credentials()
         normalized_symbol = self.normalize_symbol(symbol) if symbol else None
         try:
-            return self.client.fetch_open_orders(normalized_symbol)
+            return list(self.client.fetch_open_orders(normalized_symbol) or [])
+        except ccxt.AuthenticationError as exc:
+            raise ExchangeAuthError(str(exc)) from exc
+        except Exception as exc:
+            raise ExchangeConnectionError(str(exc)) from exc
+
+    def fetch_order(self, *, order_id: str, symbol: str) -> dict[str, Any]:
+        self._require_credentials()
+        normalized_symbol = self.normalize_symbol(symbol)
+        try:
+            return self.client.fetch_order(str(order_id), normalized_symbol)
         except ccxt.AuthenticationError as exc:
             raise ExchangeAuthError(str(exc)) from exc
         except Exception as exc:
@@ -273,7 +304,6 @@ def gateio_credentials_from_env(
     api_passphrase = None
     if api_passphrase_env:
         api_passphrase = os.getenv(str(api_passphrase_env).strip(), "").strip() or None
-
     return ExchangeCredentials(
         api_key=api_key,
         api_secret=api_secret,

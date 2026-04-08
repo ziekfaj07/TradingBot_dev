@@ -33,6 +33,7 @@ from core.execution_models import Fill, PortfolioState
 from core.run_naming import make_run_id
 from services.execution_engine import ExecutionEngine
 from services.exchange_service import validate_live_config
+from services.live_execution_service import LiveExecutionService
 from services.margin_engine import evaluate_position_margin
 from services.market_data_service import CoinGeckoService, GateIOService
 from services.risk_engine import RiskEngine
@@ -187,6 +188,12 @@ class ModeController:
         self._recent_fill_key_set: set[str] = set()
         self._reconnect_attempts: int = 0
         self._last_fetch_error: str | None = None
+        self._live_execution: LiveExecutionService | None = None
+        self._live_balance: dict[str, Any] | None = None
+        self._live_open_orders: list[dict[str, Any]] = []
+        self._live_positions: list[dict[str, Any]] = []
+        self._live_last_sync_at: str | None = None
+        self._live_last_sync_error: str | None = None
 
         init_runtime_db()
         self._restore_paper_session()
@@ -352,21 +359,19 @@ class ModeController:
                     exchange_name=self._status.config.exchange_name,
                     market_type=self._status.config.market_type,
                     symbol=self._status.config.symbol,
+                    testnet=self._status.config.exchange_testnet,
                     enable_live_trading=self._status.config.enable_live_trading,
                     dry_run_live=self._status.config.live_dry_run,
                     api_key_env=self._status.config.exchange_api_key_env,
                     api_secret_env=self._status.config.exchange_api_secret_env,
                     api_passphrase_env=self._status.config.exchange_api_passphrase_env,
                 )
+
                 if not live_validation.get("ok"):
                     errors = "; ".join(live_validation.get("errors", [])) or "live config invalid"
                     raise RuntimeError(f"Live startup blocked: {errors}")
-                raise RuntimeError(
-                    "v0.7.0 / v0.7.1 only wires the Gate.io adapter and safety rails. Real live order execution starts in v0.7.2."
-                )
 
             self._status.state = EngineState.STARTING
-
             self._status.started_at = time.time()
             self._status.stopped_at = None
             self._status.last_error = None
@@ -379,13 +384,18 @@ class ModeController:
 
             self._reset_runtime_memory()
             self._build_runtime_objects()
+            if self._status.mode == Mode.LIVE:
+                self._build_live_service_locked()
 
             self._stop_event = asyncio.Event()
             self._persist_status()
             self._persist_snapshot()
 
-            self._task = asyncio.create_task(self._run_loop())
+        if self._status.mode == Mode.LIVE and self._status.config.sync_positions_on_start:
+            await self._sync_live_account(force=True)
 
+        async with self._lock:
+            self._task = asyncio.create_task(self._run_loop())
             self._status.state = EngineState.RUNNING
             self._persist_status()
 
@@ -398,6 +408,17 @@ class ModeController:
                         "interval": self._status.config.interval,
                     },
                 )
+            elif self._status.mode == Mode.LIVE:
+                await self._broadcast_trace_event(
+                    "live_started",
+                    data={
+                        "run_id": self._status.run_id,
+                        "symbol": self._status.config.symbol,
+                        "interval": self._status.config.interval,
+                        "live_dry_run": self._status.config.live_dry_run,
+                        "enable_live_trading": self._status.config.enable_live_trading,
+                    },
+                )
 
             return self.status()
 
@@ -405,6 +426,11 @@ class ModeController:
         async with self._lock:
             if self._status.state not in (EngineState.STARTING, EngineState.RUNNING):
                 raise RuntimeError("Engine is not running.")
+
+            current_mode = self._status.mode
+            cancel_live_orders = bool(
+                current_mode == Mode.LIVE and self._status.config.cancel_open_orders_on_stop
+            )
 
             self._status.state = EngineState.STOPPING
             self._persist_status()
@@ -417,6 +443,9 @@ class ModeController:
             except asyncio.CancelledError:
                 pass
 
+        if cancel_live_orders:
+            await self._cancel_live_open_orders_best_effort()
+
         async with self._lock:
             self._task = None
             self._status.state = EngineState.IDLE
@@ -427,6 +456,11 @@ class ModeController:
             if self._status.mode == Mode.PAPER:
                 await self._broadcast_trace_event(
                     "paper_stopped",
+                    data={"run_id": self._status.run_id},
+                )
+            elif self._status.mode == Mode.LIVE:
+                await self._broadcast_trace_event(
+                    "live_stopped",
                     data={"run_id": self._status.run_id},
                 )
 
@@ -641,6 +675,14 @@ class ModeController:
                 "sync_positions_on_start": cfg.get("sync_positions_on_start"),
                 "cancel_open_orders_on_stop": cfg.get("cancel_open_orders_on_stop"),
                 "client_order_id_prefix": cfg.get("client_order_id_prefix"),
+                "can_submit_live_orders": bool(
+                    self._live_execution is not None and self._live_execution.can_submit_live_orders
+                ),
+                "last_sync_at": self._live_last_sync_at,
+                "last_sync_error": self._live_last_sync_error,
+                "balance": self._live_balance,
+                "open_orders": self._live_open_orders[-20:],
+                "positions": self._live_positions[-20:],
             },
         }
 
@@ -1579,6 +1621,12 @@ class ModeController:
         self._recent_fill_key_set = set()
         self._reconnect_attempts = 0
         self._last_fetch_error = None
+        self._live_execution = None
+        self._live_balance = None
+        self._live_open_orders = []
+        self._live_positions = []
+        self._live_last_sync_at = None
+        self._live_last_sync_error = None
         self._reset_risk_runtime_locked()
 
     def _build_runtime_objects(self) -> None:
@@ -1639,6 +1687,179 @@ class ModeController:
             self._status.started_at = time.time()
         self._status.stopped_at = None
         self._status.last_error = None
+
+    def _build_live_service_locked(self) -> None:
+        cfg = self._status.config
+
+        self._live_execution = LiveExecutionService(
+            exchange_name=cfg.exchange_name,
+            market_type=cfg.market_type,
+            testnet=cfg.exchange_testnet,
+            api_key_env=cfg.exchange_api_key_env,
+            api_secret_env=cfg.exchange_api_secret_env,
+            api_passphrase_env=cfg.exchange_api_passphrase_env,
+            client_order_id_prefix=cfg.client_order_id_prefix,
+            armed=bool(cfg.enable_live_trading),
+            dry_run=bool(cfg.live_dry_run),
+        )
+
+        self._live_balance = None
+        self._live_open_orders = []
+        self._live_positions = []
+        self._live_last_sync_at = None
+        self._live_last_sync_error = None
+
+    async def _sync_live_account(self, *, force: bool = False) -> None:
+        if self._status.mode != Mode.LIVE:
+            return
+
+        live_execution = self._live_execution
+        if live_execution is None:
+            return
+
+        cfg = self._status.config
+
+        try:
+            snapshot = await asyncio.to_thread(
+                live_execution.sync_account,
+                symbol=cfg.symbol,
+            )
+
+            async with self._lock:
+                self._live_balance = dict(snapshot.get("balance") or {})
+                self._live_open_orders = list(snapshot.get("open_orders") or [])
+                self._live_positions = list(snapshot.get("positions") or [])
+                self._live_last_sync_at = snapshot.get("synced_at")
+                self._live_last_sync_error = None
+
+                ticker = dict(snapshot.get("ticker") or {})
+                last_price = ticker.get("last")
+
+                if last_price is not None:
+                    try:
+                        price_value = float(last_price)
+                        self._latest_bar = {
+                            "timestamp": snapshot.get("synced_at"),
+                            "open": price_value,
+                            "high": price_value,
+                            "low": price_value,
+                            "close": price_value,
+                            "volume": 0.0,
+                            "source": "live_sync",
+                        }
+                        if self._state is not None:
+                            await self._mark_to_market(price_value)
+                    except (TypeError, ValueError):
+                        pass
+
+                self._persist_status()
+                self._persist_snapshot()
+
+            await self._broadcast_runtime_update()
+
+            if force:
+                await self._broadcast_trace_event(
+                    "live_account_sync",
+                    data={
+                        "run_id": self._status.run_id,
+                        "symbol": cfg.symbol,
+                        "exchange": cfg.exchange_name,
+                        "open_order_count": len(snapshot.get("open_orders") or []),
+                        "position_count": len(snapshot.get("positions") or []),
+                        "synced_at": snapshot.get("synced_at"),
+                    },
+                )
+
+        except Exception as e:
+            async with self._lock:
+                self._live_last_sync_error = str(e)
+                self._persist_status()
+                self._persist_snapshot()
+
+            if force:
+                await self._broadcast_trace_event(
+                    "live_account_sync_error",
+                    data={
+                        "run_id": self._status.run_id,
+                        "symbol": cfg.symbol,
+                        "exchange": cfg.exchange_name,
+                        "error": str(e),
+                    },
+                )
+
+    async def _cancel_live_open_orders_best_effort(self) -> None:
+        live_execution = self._live_execution
+        if live_execution is None:
+            return
+
+        cfg = self._status.config
+        open_orders = list(self._live_open_orders or [])
+        if not open_orders:
+            return
+
+        for order in open_orders:
+            order_id = str(order.get("id") or "").strip()
+            if not order_id:
+                continue
+
+            try:
+                result = await asyncio.to_thread(
+                    live_execution.cancel_order,
+                    symbol=cfg.symbol,
+                    order_id=order_id,
+                )
+
+                await self._broadcast_trace_event(
+                    "live_order_cancelled",
+                    data={
+                        "run_id": self._status.run_id,
+                        "symbol": cfg.symbol,
+                        "order_id": order_id,
+                        "result": result,
+                    },
+                )
+            except Exception as e:
+                await self._broadcast_trace_event(
+                    "live_order_cancel_failed",
+                    data={
+                        "run_id": self._status.run_id,
+                        "symbol": cfg.symbol,
+                        "order_id": order_id,
+                        "error": str(e),
+                    },
+                )
+
+        await self._sync_live_account(force=True)
+
+    async def _run_live_loop(self) -> None:
+        try:
+            while not self._stop_event.is_set():
+                cfg = self._status.config
+
+                await self._sync_live_account(force=False)
+
+                await self._sleep_or_stop(
+                    float(getattr(cfg, "live_poll_seconds", 3.0) or 3.0)
+                )
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            async with self._lock:
+                self._status.state = EngineState.ERROR
+                self._status.last_error = str(e)
+                self._status.stopped_at = time.time()
+                self._persist_status()
+                self._persist_snapshot()
+
+            await self._broadcast_trace_event(
+                "live_loop_error",
+                data={
+                    "run_id": self._status.run_id,
+                    "symbol": self._status.config.symbol,
+                    "error": str(e),
+                },
+            )
 
     async def _broadcast_runtime_update(self) -> None:
         latest_price = None
@@ -1796,6 +2017,10 @@ class ModeController:
             await self._append_fill(fill)
 
     async def _run_loop(self) -> None:
+        if self._status.mode == Mode.LIVE:
+            await self._run_live_loop()
+            return
+
         try:
             while not self._stop_event.is_set():
                 cfg = self._status.config
