@@ -25,11 +25,13 @@ class GateIOAdapter:
         api_passphrase: str | None = None,
         market_type: str = "spot",
         testnet: bool = False,
+        settle_currency: str = "USDT",
         enable_rate_limit: bool = True,
         timeout_ms: int = 15000,
     ) -> None:
         self.market_type = self._normalize_market_type(market_type)
         self.testnet = bool(testnet)
+        self.settle_currency = str(settle_currency or "USDT").strip().upper() or "USDT"
         self.credentials = ExchangeCredentials(
             api_key=(api_key or "").strip(),
             api_secret=(api_secret or "").strip(),
@@ -85,20 +87,36 @@ class GateIOAdapter:
                 f"Failed to enable Gate.io testnet/sandbox mode: {exc}"
             ) from exc
 
-    @staticmethod
-    def normalize_symbol(symbol: str) -> str:
+    def normalize_symbol(self, symbol: str) -> str:
         raw = str(symbol or "").strip().upper().replace("-", "")
         if not raw:
             raise ExchangeConfigurationError("Symbol is required.")
+
         if "/" in raw:
-            return raw
+            if self.market_type == "swap":
+                if ":" in raw:
+                    return raw
+                return f"{raw}:{self.settle_currency}"
+            return raw.split(":", 1)[0]
+
+        quote = None
+        base = None
         if raw.endswith("USDT"):
-            return f"{raw[:-4]}/USDT"
-        if raw.endswith("USD"):
-            return f"{raw[:-3]}/USD"
-        raise ExchangeConfigurationError(
-            f"Unsupported Gate.io symbol format: {symbol!r}. Expected like BTCUSDT or BTC/USDT."
-        )
+            base = raw[:-4]
+            quote = "USDT"
+        elif raw.endswith("USD"):
+            base = raw[:-3]
+            quote = "USD"
+
+        if not base or not quote:
+            raise ExchangeConfigurationError(
+                f"Unsupported Gate.io symbol format: {symbol!r}. Expected like BTCUSDT or BTC/USDT."
+            )
+
+        normalized = f"{base}/{quote}"
+        if self.market_type == "swap":
+            return f"{normalized}:{self.settle_currency}"
+        return normalized
 
     def _require_credentials(self) -> None:
         if not self.credentials.api_key or not self.credentials.api_secret:
@@ -117,6 +135,7 @@ class GateIOAdapter:
             "market_type": self.market_type,
             "testnet": self.testnet,
             "environment": self._api_environment_label(),
+            "settle_currency": self.settle_currency,
             "capabilities": self.capabilities().to_dict(),
         }
 
@@ -161,6 +180,7 @@ class GateIOAdapter:
                 "market_type": self.market_type,
                 "testnet": self.testnet,
                 "environment": self._api_environment_label(),
+                "settle_currency": self.settle_currency,
                 "server_time": server_time,
                 "market_count": len(markets),
             }
@@ -197,6 +217,7 @@ class GateIOAdapter:
             "exchange": self.exchange_id,
             "testnet": self.testnet,
             "environment": self._api_environment_label(),
+            "settle_currency": self.settle_currency,
             "active": bool(market.get("active")) if market else False,
             "limits": dict(market.get("limits", {}) or {}) if market else None,
             "precision": dict(market.get("precision", {}) or {}) if market else None,

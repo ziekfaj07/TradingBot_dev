@@ -94,6 +94,12 @@ class ConfigureBody(BaseModel):
     exchange_api_key_env: str | None = None
     exchange_api_secret_env: str | None = None
     exchange_api_passphrase_env: str | None = None
+    exchange_live_api_key_env: str | None = None
+    exchange_live_api_secret_env: str | None = None
+    exchange_live_api_passphrase_env: str | None = None
+    exchange_demo_api_key_env: str | None = None
+    exchange_demo_api_secret_env: str | None = None
+    exchange_demo_api_passphrase_env: str | None = None    
     exchange_testnet: bool | None = None
     exchange_settle_currency: str | None = None
     enable_live_trading: bool | None = None

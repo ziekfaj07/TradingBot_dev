@@ -6,7 +6,7 @@ from typing import Any
 
 from core.execution_models import Fill
 from market.exceptions import ExchangeAdapterError, ExchangeConfigurationError
-from services.exchange_service import build_exchange_adapter
+from services.exchange_service import build_exchange_adapter, resolve_exchange_env_names
 
 
 @dataclass(slots=True)
@@ -34,9 +34,16 @@ class LiveExecutionService:
         exchange_name: str,
         market_type: str,
         testnet: bool,
+        settle_currency: str,
         api_key_env: str,
         api_secret_env: str,
         api_passphrase_env: str | None,
+        live_api_key_env: str | None = None,
+        live_api_secret_env: str | None = None,
+        live_api_passphrase_env: str | None = None,
+        demo_api_key_env: str | None = None,
+        demo_api_secret_env: str | None = None,
+        demo_api_passphrase_env: str | None = None,
         client_order_id_prefix: str = "tb",
         armed: bool = False,
         dry_run: bool = True,
@@ -44,16 +51,36 @@ class LiveExecutionService:
         self.exchange_name = str(exchange_name or "gateio").strip().lower()
         self.market_type = str(market_type or "spot").strip().lower()
         self.testnet = bool(testnet)
-        self.client_order_id_prefix = str(client_order_id_prefix or "tb").strip() or "tb"
+        self.settle_currency = str(settle_currency or "USDT").strip().upper() or "USDT"
+        self.client_order_id_prefix = self._normalize_client_order_id_prefix(client_order_id_prefix)
         self.armed = bool(armed)
         self.dry_run = bool(dry_run)
-        self.adapter = build_exchange_adapter(
-            exchange_name=self.exchange_name,
-            market_type=self.market_type,
+
+        resolved = resolve_exchange_env_names(
             testnet=self.testnet,
             api_key_env=api_key_env,
             api_secret_env=api_secret_env,
             api_passphrase_env=api_passphrase_env,
+            live_api_key_env=live_api_key_env,
+            live_api_secret_env=live_api_secret_env,
+            live_api_passphrase_env=live_api_passphrase_env,
+            demo_api_key_env=demo_api_key_env,
+            demo_api_secret_env=demo_api_secret_env,
+            demo_api_passphrase_env=demo_api_passphrase_env,
+        )
+        self.credential_profile = str(resolved["credential_profile"])
+        self.resolved_api_key_env = str(resolved["api_key_env"] or "")
+        self.resolved_api_secret_env = str(resolved["api_secret_env"] or "")
+        self.resolved_api_passphrase_env = resolved["api_passphrase_env"]
+
+        self.adapter = build_exchange_adapter(
+            exchange_name=self.exchange_name,
+            market_type=self.market_type,
+            testnet=self.testnet,
+            settle_currency=self.settle_currency,
+            api_key_env=self.resolved_api_key_env,
+            api_secret_env=self.resolved_api_secret_env,
+            api_passphrase_env=self.resolved_api_passphrase_env,
         )
 
     @property
@@ -72,6 +99,11 @@ class LiveExecutionService:
             "exchange": self.exchange_name,
             "market_type": self.market_type,
             "symbol": normalized_symbol,
+            "environment": self.adapter.describe().get("environment"),
+            "settle_currency": self.settle_currency,
+            "credential_profile": self.credential_profile,
+            "resolved_api_key_env": self.resolved_api_key_env,
+            "resolved_api_secret_env": self.resolved_api_secret_env,
             "ticker": self.normalize_ticker(ticker),
             "balance": self.normalize_balance(balance),
             "open_orders": [self.normalize_order(x) for x in open_orders],
@@ -80,6 +112,16 @@ class LiveExecutionService:
             "armed": self.armed,
             "dry_run": self.dry_run,
         }
+
+    @staticmethod
+    def _normalize_client_order_id_prefix(prefix: str | None) -> str:
+        raw = str(prefix or "tb").strip()
+        if not raw:
+            raw = "tb"
+        if raw.startswith("t-"):
+            return raw
+        raw = raw.lstrip("-")
+        return f"t-{raw}"
 
     def submit_order(
         self,
@@ -238,77 +280,53 @@ class LiveExecutionService:
         fee = payload.get("fee") or {}
         return {
             "id": str(payload.get("id") or ""),
-            "client_order_id": payload.get("clientOrderId") or payload.get("client_order_id") or (payload.get("info") or {}).get("text"),
+            "client_order_id": payload.get("clientOrderId") or payload.get("client_order_id"),
             "symbol": payload.get("symbol"),
-            "type": str(payload.get("type") or "").lower() or None,
-            "side": str(payload.get("side") or "").lower() or None,
+            "type": payload.get("type"),
+            "side": payload.get("side"),
             "amount": self._float_or_none(payload.get("amount")),
             "filled": self._float_or_none(payload.get("filled")),
             "remaining": self._float_or_none(payload.get("remaining")),
             "price": self._float_or_none(payload.get("price")),
             "average": self._float_or_none(payload.get("average")),
-            "status": self._normalize_status(payload.get("status")),
+            "status": payload.get("status"),
             "reduce_only": bool(payload.get("reduceOnly") or payload.get("reduce_only") or False),
-            "fee": {
-                "cost": self._float_or_none((fee or {}).get("cost")),
-                "currency": (fee or {}).get("currency"),
-            },
             "timestamp": payload.get("datetime") or payload.get("timestamp"),
+            "fee_cost": self._float_or_none(fee.get("cost")) if isinstance(fee, dict) else None,
+            "fee_currency": fee.get("currency") if isinstance(fee, dict) else None,
             "raw": payload,
-            "dry_run": bool((payload.get("info") or {}).get("dry_run") or False),
         }
 
     def normalize_position(self, position: dict[str, Any] | None) -> dict[str, Any]:
         payload = dict(position or {})
-        contracts = (
-            payload.get("contracts")
-            if payload.get("contracts") is not None
-            else payload.get("contractSize")
-        )
         return {
             "symbol": payload.get("symbol"),
             "side": payload.get("side"),
-            "contracts": self._float_or_none(contracts),
-            "entry_price": self._float_or_none(
-                payload.get("entryPrice") or payload.get("entry_price") or payload.get("avgPrice")
-            ),
-            "mark_price": self._float_or_none(payload.get("markPrice") or payload.get("mark_price")),
+            "contracts": self._float_or_none(payload.get("contracts")),
+            "contract_size": self._float_or_none(payload.get("contractSize")),
+            "entry_price": self._float_or_none(payload.get("entryPrice")),
+            "mark_price": self._float_or_none(payload.get("markPrice")),
             "notional": self._float_or_none(payload.get("notional")),
-            "unrealized_pnl": self._float_or_none(payload.get("unrealizedPnl") or payload.get("unrealized_pnl")),
-            "liquidation_price": self._float_or_none(payload.get("liquidationPrice") or payload.get("liquidation_price")),
-            "margin_mode": payload.get("marginMode") or payload.get("margin_mode"),
+            "leverage": self._float_or_none(payload.get("leverage")),
+            "margin_mode": payload.get("marginMode"),
+            "unrealized_pnl": self._float_or_none(payload.get("unrealizedPnl")),
+            "liquidation_price": self._float_or_none(payload.get("liquidationPrice")),
             "raw": payload,
         }
 
-    def _normalize_status(self, status: Any) -> str:
-        raw = str(status or "unknown").strip().lower()
-        aliases = {
-            "new": "open",
-            "open": "open",
-            "closed": "closed",
-            "filled": "closed",
-            "canceled": "canceled",
-            "cancelled": "canceled",
-            "expired": "expired",
-            "rejected": "rejected",
-        }
-        return aliases.get(raw, raw or "unknown")
-
     def _extract_fee_cost(self, order: dict[str, Any]) -> float:
         fee = order.get("fee") or {}
-        if isinstance(fee, dict) and fee.get("cost") is not None:
-            return float(fee.get("cost") or 0.0)
-        info = order.get("raw") or order.get("info") or {}
-        for key in ("fee", "fees", "fill_fees"):
-            value = info.get(key)
-            if isinstance(value, (int, float)):
-                return float(value)
+        if isinstance(fee, dict):
+            fee_cost = self._float_or_none(fee.get("cost"))
+            if fee_cost is not None:
+                return fee_cost
         return 0.0
 
-    def _float_or_none(self, value: Any) -> float | None:
-        if value is None or value == "":
-            return None
+    @staticmethod
+    def _float_or_none(value: Any) -> float | None:
         try:
+            if value is None:
+                return None
             return float(value)
         except (TypeError, ValueError):
             return None

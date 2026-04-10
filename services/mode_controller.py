@@ -129,9 +129,19 @@ class RunConfig:
     exchange_name: str = "gateio"
     exchange_api_key_env: str = "GATEIO_API_KEY"
     exchange_api_secret_env: str = "GATEIO_API_SECRET"
-    exchange_api_passphrase_env: str | None = "GATEIO_API_PASSPHRASE"
+    exchange_api_passphrase_env: str | None = None
+
+    exchange_live_api_key_env: str | None = None
+    exchange_live_api_secret_env: str | None = None
+    exchange_live_api_passphrase_env: str | None = None
+
+    exchange_demo_api_key_env: str | None = None
+    exchange_demo_api_secret_env: str | None = None
+    exchange_demo_api_passphrase_env: str | None = None    
+
     exchange_testnet: bool = False
     exchange_settle_currency: str = "usdt"
+
     enable_live_trading: bool = False
     live_dry_run: bool = True
     sync_positions_on_start: bool = True
@@ -360,11 +370,18 @@ class ModeController:
                     market_type=self._status.config.market_type,
                     symbol=self._status.config.symbol,
                     testnet=self._status.config.exchange_testnet,
+                    settle_currency=self._status.config.exchange_settle_currency,
                     enable_live_trading=self._status.config.enable_live_trading,
                     dry_run_live=self._status.config.live_dry_run,
                     api_key_env=self._status.config.exchange_api_key_env,
                     api_secret_env=self._status.config.exchange_api_secret_env,
                     api_passphrase_env=self._status.config.exchange_api_passphrase_env,
+                    live_api_key_env=self._status.config.exchange_live_api_key_env,
+                    live_api_secret_env=self._status.config.exchange_live_api_secret_env,
+                    live_api_passphrase_env=self._status.config.exchange_live_api_passphrase_env,
+                    demo_api_key_env=self._status.config.exchange_demo_api_key_env,
+                    demo_api_secret_env=self._status.config.exchange_demo_api_secret_env,
+                    demo_api_passphrase_env=self._status.config.exchange_demo_api_passphrase_env,
                 )
 
                 if not live_validation.get("ok"):
@@ -670,13 +687,40 @@ class ModeController:
             "live": {
                 "exchange_name": cfg.get("exchange_name"),
                 "exchange_testnet": cfg.get("exchange_testnet"),
+                "market_type": cfg.get("market_type"),
+                "settle_currency": cfg.get("exchange_settle_currency"),
                 "enable_live_trading": cfg.get("enable_live_trading"),
                 "live_dry_run": cfg.get("live_dry_run"),
+                "submission_mode": (
+                    "live_submit"
+                    if self._live_execution is not None and self._live_execution.can_submit_live_orders
+                    else ("dry_run" if cfg.get("live_dry_run") else "disarmed")
+                ),
                 "sync_positions_on_start": cfg.get("sync_positions_on_start"),
                 "cancel_open_orders_on_stop": cfg.get("cancel_open_orders_on_stop"),
                 "client_order_id_prefix": cfg.get("client_order_id_prefix"),
                 "can_submit_live_orders": bool(
                     self._live_execution is not None and self._live_execution.can_submit_live_orders
+                ),
+                "credential_profile": (
+                    getattr(self._live_execution, "credential_profile", None)
+                    if self._live_execution is not None
+                    else None
+                ),
+                "resolved_api_key_env": (
+                    getattr(self._live_execution, "resolved_api_key_env", None)
+                    if self._live_execution is not None
+                    else None
+                ),
+                "resolved_api_secret_env": (
+                    getattr(self._live_execution, "resolved_api_secret_env", None)
+                    if self._live_execution is not None
+                    else None
+                ),
+                "environment": (
+                    getattr(getattr(self._live_execution, "adapter", None), "describe", lambda: {})().get("environment")
+                    if self._live_execution is not None
+                    else None
                 ),
                 "last_sync_at": self._live_last_sync_at,
                 "last_sync_error": self._live_last_sync_error,
@@ -1695,9 +1739,16 @@ class ModeController:
             exchange_name=cfg.exchange_name,
             market_type=cfg.market_type,
             testnet=cfg.exchange_testnet,
+            settle_currency=cfg.exchange_settle_currency,
             api_key_env=cfg.exchange_api_key_env,
             api_secret_env=cfg.exchange_api_secret_env,
             api_passphrase_env=cfg.exchange_api_passphrase_env,
+            live_api_key_env=cfg.exchange_live_api_key_env,
+            live_api_secret_env=cfg.exchange_live_api_secret_env,
+            live_api_passphrase_env=cfg.exchange_live_api_passphrase_env,
+            demo_api_key_env=cfg.exchange_demo_api_key_env,
+            demo_api_secret_env=cfg.exchange_demo_api_secret_env,
+            demo_api_passphrase_env=cfg.exchange_demo_api_passphrase_env,
             client_order_id_prefix=cfg.client_order_id_prefix,
             armed=bool(cfg.enable_live_trading),
             dry_run=bool(cfg.live_dry_run),
@@ -2232,6 +2283,28 @@ class ModeController:
             resolved_price = float(self._state.entry_price)
 
         if self._engine is None or resolved_price is None:
+            fallback_equity = self._state.equity
+            if fallback_equity is None:
+                fallback_equity = self._state.cash
+            if fallback_equity is None:
+                fallback_equity = self._status.config.initial_balance
+            return float(fallback_equity or 0.0)
+
+        try:
+            marked = self._engine.mark_equity(
+                self._state,
+                self._status.config.market_type,
+                float(resolved_price),
+            )
+            if marked is None:
+                fallback_equity = self._state.equity
+                if fallback_equity is None:
+                    fallback_equity = self._state.cash
+                if fallback_equity is None:
+                    fallback_equity = self._status.config.initial_balance
+                return float(fallback_equity or 0.0)
+            return float(marked)
+        except Exception:
             fallback_equity = self._state.equity
             if fallback_equity is None:
                 fallback_equity = self._state.cash
