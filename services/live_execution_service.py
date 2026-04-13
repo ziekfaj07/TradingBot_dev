@@ -322,6 +322,46 @@ class LiveExecutionService:
                 return fee_cost
         return 0.0
 
+    def set_armed(self, armed: bool) -> None:
+        self.armed = bool(armed)
+
+    def set_dry_run(self, dry_run: bool) -> None:
+        self.dry_run = bool(dry_run)
+
+    def cancel_all_open_orders(self, *, symbol: str) -> dict[str, Any]:
+        normalized_symbol = self.adapter.normalize_symbol(symbol)
+
+        if not self.can_submit_live_orders:
+            return {
+                "ok": True,
+                "dry_run": True,
+                "armed": self.armed,
+                "symbol": normalized_symbol,
+                "canceled": [],
+            }
+
+        open_orders = self.adapter.fetch_open_orders(normalized_symbol)
+        canceled: list[dict[str, Any]] = []
+
+        for raw_order in open_orders:
+            order_id = str((raw_order or {}).get("id") or "")
+            if not order_id:
+                continue
+            try:
+                result = self.adapter.cancel_order(order_id=order_id, symbol=normalized_symbol)
+                canceled.append(self.normalize_order(result))
+            except Exception:
+                # best effort: continue cancelling the rest
+                continue
+
+        return {
+            "ok": True,
+            "dry_run": False,
+            "armed": True,
+            "symbol": normalized_symbol,
+            "canceled": canceled,
+        }
+
     @staticmethod
     def _float_or_none(value: Any) -> float | None:
         try:

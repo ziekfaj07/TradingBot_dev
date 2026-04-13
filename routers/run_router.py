@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import PlainTextResponse
@@ -39,7 +39,6 @@ class ConfigureBody(BaseModel):
     maintenance_margin: float | None = None
     max_leverage: float | None = None
     max_qty: float | None = None
-
     include_equity: bool | None = None
     equity_stride: int | None = None
     include_trades: bool | None = None
@@ -48,7 +47,6 @@ class ConfigureBody(BaseModel):
     max_equity_points: int | None = None
     max_trades_returned: int | None = None
     max_risk_events_returned: int | None = None
-
     poll_seconds: float | None = None
     bar_confirmations: int | None = None
     max_reconnect_attempts: int | None = None
@@ -60,30 +58,23 @@ class ConfigureBody(BaseModel):
     strategy_params: dict[str, Any] | None = Field(default=None)
     candle_limit: int | None = None
     debug_stream: bool | None = None
-
     position_sizing_mode: str | None = None
     position_size_value: float | None = None
-
     enable_volatility_scaling: bool | None = None
     volatility_target_pct: float | None = None
     min_volatility_scale: float | None = None
     max_volatility_scale: float | None = None    
-
     max_drawdown_pct: float | None = None
     max_trades_per_day: int | None = None
     cooldown_seconds: int | None = None
-
     stop_loss_pct: float | None = None
     take_profit_pct: float | None = None
     exit_on_signal: bool | None = None
     exit_mode: str | None = None
-
     atr_period: int | None = None
     atr_stop_mult: float | None = None
     atr_take_mult: float | None = None
     atr_reference_mode: str | None = None
-
-    # v0.6.4 / v0.6.4.1 liquidation + margin config
     margin_mode: str | None = None
     enable_liquidation: bool | None = None
     use_mark_price_for_liquidation: bool | None = None
@@ -148,10 +139,65 @@ class ConfigureBody(BaseModel):
 
         return self
 
+
+class StartBody(BaseModel):
+    arm_live_run: bool = False
+    confirm_symbol: str | None = None
+    confirm_exchange_testnet: bool | None = None
+    confirm_submission_mode: Literal["dry_run", "live_submit"] | None = None
+
+
 class DevActionBody(BaseModel):
     price: float | None = None
     note: str | None = None
+    
 
+@router.post("/mode")
+async def set_mode(body: SetModeBody):
+    try:
+        return await mode_controller.set_mode(body.mode)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/configure")
+async def configure(body: ConfigureBody):
+    try:
+        updates = {k: v for k, v in body.model_dump().items() if v is not None}
+        return await mode_controller.configure(**updates)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/start")
+async def start(body: StartBody = StartBody()):
+    try:
+        return await mode_controller.start(
+            arm_live_run=body.arm_live_run,
+            confirm_symbol=body.confirm_symbol,
+            confirm_exchange_testnet=body.confirm_exchange_testnet,
+            confirm_submission_mode=body.confirm_submission_mode,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/stop")
+async def stop():
+    try:
+        return await mode_controller.stop()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/backtest")
+async def run_backtest(body: ConfigureBody):
+    try:
+        overrides = {k: v for k, v in body.model_dump().items() if v is not None}
+        return await mode_controller.run_backtest(**overrides)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    
 
 @router.get("/status")
 async def status():
@@ -227,47 +273,5 @@ async def flatten(body: DevActionBody = DevActionBody()):
 async def reset_paper():
     try:
         return await mode_controller.reset_paper()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.post("/mode")
-async def set_mode(body: SetModeBody):
-    try:
-        return await mode_controller.set_mode(body.mode)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.post("/configure")
-async def configure(body: ConfigureBody):
-    try:
-        updates = {k: v for k, v in body.model_dump().items() if v is not None}
-        return await mode_controller.configure(**updates)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.post("/start")
-async def start():
-    try:
-        return await mode_controller.start()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.post("/stop")
-async def stop():
-    try:
-        return await mode_controller.stop()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.post("/backtest")
-async def run_backtest(body: ConfigureBody):
-    try:
-        overrides = {k: v for k, v in body.model_dump().items() if v is not None}
-        return await mode_controller.run_backtest(**overrides)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

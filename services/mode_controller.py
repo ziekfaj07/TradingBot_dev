@@ -202,6 +202,10 @@ class ModeController:
         self._live_balance: dict[str, Any] | None = None
         self._live_open_orders: list[dict[str, Any]] = []
         self._live_positions: list[dict[str, Any]] = []
+        self._live_run_armed: bool = False
+        self._live_kill_switch_triggered: bool = False
+        self._live_kill_switch_reason: str | None = None
+        self._live_start_equity: float | None = None        
         self._live_last_sync_at: str | None = None
         self._live_last_sync_error: str | None = None
 
@@ -356,7 +360,14 @@ class ModeController:
             strategy_params=self._resolved_strategy_params_from_config(cfg),
         )
 
-    async def start(self) -> dict:
+    async def start(
+        self,
+        *,
+        arm_live_run: bool = False,
+        confirm_symbol: str | None = None,
+        confirm_exchange_testnet: bool | None = None,
+        confirm_submission_mode: str | None = None,
+    ) -> dict:
         async with self._lock:
             if self._status.state != EngineState.IDLE:
                 raise RuntimeError("Engine must be idle before starting.")
@@ -364,29 +375,63 @@ class ModeController:
             if self._status.mode == Mode.BACKTEST:
                 raise RuntimeError("Use run_backtest() for backtest mode.")
 
-            if self._status.mode == Mode.LIVE:
-                live_validation = validate_live_config(
-                    exchange_name=self._status.config.exchange_name,
-                    market_type=self._status.config.market_type,
-                    symbol=self._status.config.symbol,
-                    testnet=self._status.config.exchange_testnet,
-                    settle_currency=self._status.config.exchange_settle_currency,
-                    enable_live_trading=self._status.config.enable_live_trading,
-                    dry_run_live=self._status.config.live_dry_run,
-                    api_key_env=self._status.config.exchange_api_key_env,
-                    api_secret_env=self._status.config.exchange_api_secret_env,
-                    api_passphrase_env=self._status.config.exchange_api_passphrase_env,
-                    live_api_key_env=self._status.config.exchange_live_api_key_env,
-                    live_api_secret_env=self._status.config.exchange_live_api_secret_env,
-                    live_api_passphrase_env=self._status.config.exchange_live_api_passphrase_env,
-                    demo_api_key_env=self._status.config.exchange_demo_api_key_env,
-                    demo_api_secret_env=self._status.config.exchange_demo_api_secret_env,
-                    demo_api_passphrase_env=self._status.config.exchange_demo_api_passphrase_env,
-                )
+            requested_arm = False
 
+            if self._status.mode == Mode.LIVE:
+                cfg = self._status.config
+
+                live_validation = validate_live_config(
+                    exchange_name=cfg.exchange_name,
+                    market_type=cfg.market_type,
+                    symbol=cfg.symbol,
+                    testnet=cfg.exchange_testnet,
+                    settle_currency=cfg.exchange_settle_currency,
+                    enable_live_trading=cfg.enable_live_trading,
+                    dry_run_live=cfg.live_dry_run,
+                    api_key_env=cfg.exchange_api_key_env,
+                    api_secret_env=cfg.exchange_api_secret_env,
+                    api_passphrase_env=cfg.exchange_api_passphrase_env,
+                    live_api_key_env=cfg.exchange_live_api_key_env,
+                    live_api_secret_env=cfg.exchange_live_api_secret_env,
+                    live_api_passphrase_env=cfg.exchange_live_api_passphrase_env,
+                    demo_api_key_env=cfg.exchange_demo_api_key_env,
+                    demo_api_secret_env=cfg.exchange_demo_api_secret_env,
+                    demo_api_passphrase_env=cfg.exchange_demo_api_passphrase_env,
+                )
                 if not live_validation.get("ok"):
                     errors = "; ".join(live_validation.get("errors", [])) or "live config invalid"
                     raise RuntimeError(f"Live startup blocked: {errors}")
+
+                if arm_live_run:
+                    if not cfg.enable_live_trading:
+                        raise RuntimeError(
+                            "Live arming blocked: enable_live_trading must be true for an armed live run."
+                        )
+                    if cfg.live_dry_run:
+                        raise RuntimeError(
+                            "Live arming blocked: live_dry_run is true. Set live_dry_run=false before arming."
+                        )
+
+                    expected_mode = "live_submit"
+                    if confirm_submission_mode != expected_mode:
+                        raise RuntimeError(
+                            f"Live arming blocked: confirm_submission_mode must be '{expected_mode}'."
+                        )
+
+                    if confirm_symbol is None or str(confirm_symbol).strip().upper() != str(cfg.symbol).strip().upper():
+                        raise RuntimeError(
+                            f"Live arming blocked: confirm_symbol must exactly match configured symbol '{cfg.symbol.upper()}'."
+                        )
+
+                    if confirm_exchange_testnet is None or bool(confirm_exchange_testnet) != bool(cfg.exchange_testnet):
+                        env_name = "demo/testnet" if cfg.exchange_testnet else "production/mainnet"
+                        raise RuntimeError(
+                            f"Live arming blocked: confirm_exchange_testnet must match configured environment ({env_name})."
+                        )
+
+                    requested_arm = True
+                else:
+                    requested_arm = False
 
             self._status.state = EngineState.STARTING
             self._status.started_at = time.time()
@@ -401,8 +446,14 @@ class ModeController:
 
             self._reset_runtime_memory()
             self._build_runtime_objects()
+
+            self._live_run_armed = requested_arm
+            self._live_kill_switch_triggered = False
+            self._live_kill_switch_reason = None
+            self._live_start_equity = None
+
             if self._status.mode == Mode.LIVE:
-                self._build_live_service_locked()
+                self._build_live_service_locked(armed=requested_arm)
 
             self._stop_event = asyncio.Event()
             self._persist_status()
@@ -416,28 +467,34 @@ class ModeController:
             self._status.state = EngineState.RUNNING
             self._persist_status()
 
-            if self._status.mode == Mode.PAPER:
-                await self._broadcast_trace_event(
-                    "paper_started",
-                    data={
-                        "run_id": self._status.run_id,
-                        "symbol": self._status.config.symbol,
-                        "interval": self._status.config.interval,
-                    },
-                )
-            elif self._status.mode == Mode.LIVE:
-                await self._broadcast_trace_event(
-                    "live_started",
-                    data={
-                        "run_id": self._status.run_id,
-                        "symbol": self._status.config.symbol,
-                        "interval": self._status.config.interval,
-                        "live_dry_run": self._status.config.live_dry_run,
-                        "enable_live_trading": self._status.config.enable_live_trading,
-                    },
-                )
+        if self._status.mode == Mode.PAPER:
+            await self._broadcast_trace_event(
+                "paper_started",
+                data={
+                    "run_id": self._status.run_id,
+                    "symbol": self._status.config.symbol,
+                    "interval": self._status.config.interval,
+                },
+            )
+        elif self._status.mode == Mode.LIVE:
+            await self._broadcast_trace_event(
+                "live_started",
+                data={
+                    "run_id": self._status.run_id,
+                    "symbol": self._status.config.symbol,
+                    "interval": self._status.config.interval,
+                    "live_dry_run": self._status.config.live_dry_run,
+                    "enable_live_trading": self._status.config.enable_live_trading,
+                    "armed_for_this_run": self._live_run_armed,
+                    "submission_mode": (
+                        "live_submit"
+                        if self._live_execution is not None and self._live_execution.can_submit_live_orders
+                        else ("dry_run" if self._status.config.live_dry_run else "disarmed")
+                    ),
+                },
+            )
 
-            return self.status()
+        return self.status()
 
     async def stop(self) -> dict:
         async with self._lock:
@@ -480,6 +537,14 @@ class ModeController:
                     "live_stopped",
                     data={"run_id": self._status.run_id},
                 )
+
+            self._live_run_armed = False
+            self._live_kill_switch_triggered = False
+            self._live_kill_switch_reason = None
+            self._live_start_equity = None
+            if self._live_execution is not None:
+                self._live_execution.set_armed(False)
+                self._live_execution.set_dry_run(True)
 
             return self.status()
 
@@ -722,6 +787,13 @@ class ModeController:
                     if self._live_execution is not None
                     else None
                 ),
+                "armed_for_this_run": self._live_run_armed,
+                "kill_switch_triggered": self._live_kill_switch_triggered,
+                "kill_switch_reason": self._live_kill_switch_reason,
+                "live_start_equity": self._live_start_equity,
+                "max_loss_rule": {
+                    "max_drawdown_pct": cfg.get("max_drawdown_pct"),
+                },                
                 "last_sync_at": self._live_last_sync_at,
                 "last_sync_error": self._live_last_sync_error,
                 "balance": self._live_balance,
@@ -1602,14 +1674,14 @@ class ModeController:
             ExecutionEngine(
                 fee_rate=self._status.config.fee_rate,
                 slippage_bps=self._status.config.slippage_bps,
-                liquidation_fee_rate=self.config.liquidation_fee_rate,
+                liquidation_fee_rate=self._status.config.liquidation_fee_rate,
                 maintenance_margin=self._status.config.maintenance_margin,
                 max_leverage=self._status.config.max_leverage,
                 max_qty=self._status.config.max_qty,
             )
             if restored_state
             else None
-        )
+        )        
 
         self._fills = []
         self._recent_fill_keys = []
@@ -1732,14 +1804,15 @@ class ModeController:
         self._status.stopped_at = None
         self._status.last_error = None
 
-    def _build_live_service_locked(self) -> None:
+    def _build_live_service_locked(self, *, armed: bool | None = None) -> None:
         cfg = self._status.config
+        effective_armed = self._live_run_armed if armed is None else bool(armed)
 
         self._live_execution = LiveExecutionService(
             exchange_name=cfg.exchange_name,
             market_type=cfg.market_type,
             testnet=cfg.exchange_testnet,
-            settle_currency=cfg.exchange_settle_currency,
+            settle_currency=str(cfg.exchange_settle_currency or "USDT").upper(),
             api_key_env=cfg.exchange_api_key_env,
             api_secret_env=cfg.exchange_api_secret_env,
             api_passphrase_env=cfg.exchange_api_passphrase_env,
@@ -1750,15 +1823,9 @@ class ModeController:
             demo_api_secret_env=cfg.exchange_demo_api_secret_env,
             demo_api_passphrase_env=cfg.exchange_demo_api_passphrase_env,
             client_order_id_prefix=cfg.client_order_id_prefix,
-            armed=bool(cfg.enable_live_trading),
-            dry_run=bool(cfg.live_dry_run),
+            armed=effective_armed,
+            dry_run=cfg.live_dry_run,
         )
-
-        self._live_balance = None
-        self._live_open_orders = []
-        self._live_positions = []
-        self._live_last_sync_at = None
-        self._live_last_sync_error = None
 
     async def _sync_live_account(self, *, force: bool = False) -> None:
         if self._status.mode != Mode.LIVE:
@@ -1782,6 +1849,8 @@ class ModeController:
                 self._live_positions = list(snapshot.get("positions") or [])
                 self._live_last_sync_at = snapshot.get("synced_at")
                 self._live_last_sync_error = None
+
+                await self._check_live_max_loss_kill_switch()                
 
                 ticker = dict(snapshot.get("ticker") or {})
                 last_price = ticker.get("last")
@@ -1838,47 +1907,148 @@ class ModeController:
                     },
                 )
 
-    async def _cancel_live_open_orders_best_effort(self) -> None:
+    def _live_has_open_long_locked(self) -> bool:
+        if self._state is not None and float(self._state.position_qty or 0.0) > 0.0:
+            return True
+
+        for position in self._live_positions or []:
+            try:
+                contracts = float(position.get("contracts") or 0.0)
+            except (TypeError, ValueError):
+                contracts = 0.0
+
+            side = str(position.get("side") or "").strip().lower()
+            if contracts > 0.0 and side in {"long", "buy"}:
+                return True
+
+        return False
+
+    def _live_position_qty_locked(self) -> float:
+        if self._state is not None:
+            qty = abs(float(self._state.position_qty or 0.0))
+            if qty > 0.0:
+                return qty
+
+        for position in self._live_positions or []:
+            try:
+                contracts = abs(float(position.get("contracts") or 0.0))
+            except (TypeError, ValueError):
+                contracts = 0.0
+
+            side = str(position.get("side") or "").strip().lower()
+            if contracts > 0.0 and side in {"long", "buy"}:
+                return contracts
+
+        return 0.0
+
+    async def _apply_live_fill_to_shadow_state_locked(
+        self,
+        *,
+        fill: Fill,
+        processed_ts: int | None,
+        market_price: float,
+    ) -> None:
+        if self._engine is None or self._state is None:
+            return
+
+        effective_ts = int(processed_ts or time.time())
+        fill_type = str(fill.type or "").upper()
+        exec_price = float(fill.price or market_price or 0.0)
+        exec_qty = abs(float(fill.qty or 0.0))
+
+        if exec_price <= 0.0 or exec_qty <= 0.0:
+            return
+
+        if fill_type == "ENTRY" and float(self._state.position_qty or 0.0) <= 0.0:
+            self._trade_id = max(int(self._trade_id or 0), int(fill.trade_id or 0))
+            self._state, _shadow_fill = self._engine.enter_long(
+                ts_iso=str(effective_ts),
+                state=self._state,
+                close=exec_price,
+                market_type=self._status.config.market_type,
+                leverage=self._status.config.leverage,
+                trade_id=int(fill.trade_id or self._trade_id or 1),
+                qty_override=exec_qty,
+            )
+            await self._mark_to_market(exec_price)
+            return
+
+        if fill_type in {"EXIT", "LIQUIDATION"} and float(self._state.position_qty or 0.0) > 0.0:
+            self._state, _shadow_fill = self._engine.exit_long(
+                ts_iso=str(effective_ts),
+                state=self._state,
+                close=exec_price,
+                market_type=self._status.config.market_type,
+                trade_id=int(fill.trade_id or self._trade_id or 1),
+            )
+            await self._mark_to_market(exec_price)
+            return
+
+    async def _submit_live_signal_order(
+        self,
+        *,
+        side: str,
+        qty: float,
+        reduce_only: bool,
+        fill_type: str,
+        market_price: float,
+        processed_ts: int | None,
+    ) -> None:
         live_execution = self._live_execution
         if live_execution is None:
-            return
+            raise RuntimeError("Live execution service is not initialized.")
 
-        cfg = self._status.config
-        open_orders = list(self._live_open_orders or [])
-        if not open_orders:
-            return
+        if qty <= 0.0:
+            raise RuntimeError("Live order qty must be > 0.")
 
-        for order in open_orders:
-            order_id = str(order.get("id") or "").strip()
-            if not order_id:
-                continue
+        client_order_id = (
+            f"{self._status.config.client_order_id_prefix}-"
+            f"{self._status.run_id or 'live'}-"
+            f"{int(time.time() * 1000)}"
+        )
 
-            try:
-                result = await asyncio.to_thread(
-                    live_execution.cancel_order,
-                    symbol=cfg.symbol,
-                    order_id=order_id,
-                )
+        result = await asyncio.to_thread(
+            live_execution.submit_order,
+            symbol=self._status.config.symbol,
+            side=side,
+            qty=float(qty),
+            order_type="market",
+            price=None,
+            reduce_only=reduce_only,
+            client_order_id=client_order_id,
+        )
 
-                await self._broadcast_trace_event(
-                    "live_order_cancelled",
-                    data={
-                        "run_id": self._status.run_id,
-                        "symbol": cfg.symbol,
-                        "order_id": order_id,
-                        "result": result,
-                    },
-                )
-            except Exception as e:
-                await self._broadcast_trace_event(
-                    "live_order_cancel_failed",
-                    data={
-                        "run_id": self._status.run_id,
-                        "symbol": cfg.symbol,
-                        "order_id": order_id,
-                        "error": str(e),
-                    },
-                )
+        fill = live_execution.fill_from_order(
+            order=result.order,
+            fill_type=fill_type,
+            market_price=float(market_price),
+            trade_id=(self._trade_id if self._trade_id > 0 else None),
+        )
+
+        await self._append_fill(fill)
+        await self._apply_live_fill_to_shadow_state_locked(
+            fill=fill,
+            processed_ts=processed_ts,
+            market_price=float(market_price),
+        )
+
+        self._persist_status()
+        self._persist_snapshot()
+
+        await self._broadcast_trace_event(
+            "live_order_submitted",
+            data={
+                "run_id": self._status.run_id,
+                "symbol": self._status.config.symbol,
+                "side": side,
+                "qty": float(qty),
+                "reduce_only": bool(reduce_only),
+                "fill_type": fill_type,
+                "dry_run": result.dry_run,
+                "armed": result.armed,
+                "order": result.order,
+            },
+        )
 
         await self._sync_live_account(force=True)
 
@@ -1889,28 +2059,193 @@ class ModeController:
 
                 await self._sync_live_account(force=False)
 
-                await self._sleep_or_stop(
-                    float(getattr(cfg, "live_poll_seconds", 3.0) or 3.0)
+                bars = await asyncio.to_thread(
+                    self._fetch_recent_bars,
+                    cfg.symbol,
+                    cfg.interval,
+                    max(50, int(cfg.candle_limit or 300)),
                 )
+
+                if not bars:
+                    raise RuntimeError("No bars returned from market data service.")
+
+                self._reconnect_attempts = 0
+                self._last_fetch_error = None
+
+                latest_bar = bars[-1]
+                self._latest_bar = latest_bar
+                self._bars = bars[-max(1000, int(cfg.candle_limit or 300)) :]
+
+                latest_price = float(latest_bar["close"])
+                if self._state is not None:
+                    await self._mark_to_market(latest_price)
+
+                if self._live_kill_switch_triggered:
+                    self._persist_status()
+                    self._persist_snapshot()
+                    await self._sleep_or_stop(float(getattr(cfg, "live_poll_seconds", 3.0) or 3.0))
+                    continue
+
+                if self._live_has_open_long_locked():
+                    static_exit = self._check_static_exit_locked(latest_price)
+                    if static_exit.get("should_exit"):
+                        exit_qty = self._live_position_qty_locked()
+                        if exit_qty > 0.0:
+                            await self._submit_live_signal_order(
+                                side="sell",
+                                qty=exit_qty,
+                                reduce_only=(cfg.market_type == "swap"),
+                                fill_type="EXIT",
+                                market_price=latest_price,
+                                processed_ts=self._safe_int_value(latest_bar.get("timestamp"), int(time.time())),
+                            )
+                            await self._broadcast_trace_event(
+                                "live_risk_exit",
+                                note=f"Live {static_exit.get('reason')} triggered.",
+                                data={
+                                    "reason": static_exit.get("reason"),
+                                    "market_price": latest_price,
+                                    "meta": static_exit.get("meta", {}) or {},
+                                },
+                            )
+                            await self._sleep_or_stop(float(getattr(cfg, "live_poll_seconds", 3.0) or 3.0))
+                            continue
+
+                stable_bars, processed_ts = self._stable_bars_for_signal(bars)
+
+                if (
+                    processed_ts is not None
+                    and (
+                        self._last_processed_bar_ts is None
+                        or int(processed_ts) > int(self._last_processed_bar_ts)
+                    )
+                ):
+                    signal = int(self._latest_signal_from_bars(stable_bars, cfg))
+                    self._last_signal = signal
+                    self._last_processed_bar_ts = int(processed_ts)
+
+                    has_long = self._live_has_open_long_locked()
+
+                    if signal > 0 and not has_long:
+                        entry_gate = self._check_entry_gate_locked(
+                            latest_price,
+                            now_ts=processed_ts,
+                        )
+
+                        if entry_gate["allowed"]:
+                            entry_qty = self._compute_entry_qty_locked(latest_price)
+                            if entry_qty is not None and float(entry_qty) > 0.0:
+                                self._trade_id += 1
+                                await self._submit_live_signal_order(
+                                    side="buy",
+                                    qty=float(entry_qty),
+                                    reduce_only=False,
+                                    fill_type="ENTRY",
+                                    market_price=latest_price,
+                                    processed_ts=int(processed_ts),
+                                )
+                                await self._broadcast_trace_event(
+                                    "live_signal_fill",
+                                    data={
+                                        "signal": signal,
+                                        "processed_bar_ts": int(processed_ts),
+                                        "price": latest_price,
+                                        "trade_id": self._trade_id,
+                                        "fill_type": "ENTRY",
+                                    },
+                                )
+                            else:
+                                await self._broadcast_trace_event(
+                                    "live_entry_skipped",
+                                    note="Computed live entry qty was zero.",
+                                    data={
+                                        "processed_bar_ts": int(processed_ts),
+                                        "price": latest_price,
+                                    },
+                                )
+                        else:
+                            self._risk_halt_reason = entry_gate["reason"]
+                            await self._broadcast_trace_event(
+                                "live_entry_blocked",
+                                note=f"Risk blocked live entry: {entry_gate['reason']}",
+                                data={
+                                    "processed_bar_ts": int(processed_ts),
+                                    "price": latest_price,
+                                    **(entry_gate.get("meta", {}) or {}),
+                                },
+                            )
+
+                    elif cfg.exit_on_signal and signal < 0 and has_long:
+                        exit_qty = self._live_position_qty_locked()
+                        if exit_qty > 0.0:
+                            await self._submit_live_signal_order(
+                                side="sell",
+                                qty=exit_qty,
+                                reduce_only=(cfg.market_type == "swap"),
+                                fill_type="EXIT",
+                                market_price=latest_price,
+                                processed_ts=int(processed_ts),
+                            )
+                            await self._broadcast_trace_event(
+                                "live_signal_fill",
+                                data={
+                                    "signal": signal,
+                                    "processed_bar_ts": int(processed_ts),
+                                    "price": latest_price,
+                                    "trade_id": self._trade_id,
+                                    "fill_type": "EXIT",
+                                },
+                            )
+
+                self._persist_status()
+                self._persist_snapshot()
+                await self._broadcast_runtime_update()
+                await self._sleep_or_stop(float(getattr(cfg, "live_poll_seconds", 3.0) or 3.0))
 
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            async with self._lock:
+            self._reconnect_attempts += 1
+            self._last_fetch_error = str(e)
+
+            self._persist_status()
+            self._persist_snapshot()
+
+            await self._broadcast_trace_event(
+                "live_reconnect_wait",
+                note="Live loop fetch/process error. Retrying.",
+                data={
+                    "attempt": self._reconnect_attempts,
+                    "error": str(e),
+                },
+            )
+
+            max_attempts = max(1, int(self._status.config.max_reconnect_attempts or 8))
+            backoff_base = max(1.0, float(self._status.config.reconnect_backoff_base or 1.5))
+
+            if self._reconnect_attempts >= max_attempts:
                 self._status.state = EngineState.ERROR
-                self._status.last_error = str(e)
+                self._status.last_error = (
+                    f"Live loop stopped after {self._reconnect_attempts} reconnect attempts: {e}"
+                )
                 self._status.stopped_at = time.time()
                 self._persist_status()
                 self._persist_snapshot()
 
-            await self._broadcast_trace_event(
-                "live_loop_error",
-                data={
-                    "run_id": self._status.run_id,
-                    "symbol": self._status.config.symbol,
-                    "error": str(e),
-                },
-            )
+                await self._broadcast_trace_event(
+                    "live_error",
+                    note="Reconnect limit reached. Live loop stopped.",
+                    data={
+                        "attempts": self._reconnect_attempts,
+                        "error": str(e),
+                    },
+                )
+                return
+
+            delay = min(30.0, backoff_base ** max(0, self._reconnect_attempts - 1))
+            await self._sleep_or_stop(delay)
+            if not self._stop_event.is_set():
+                await self._run_live_loop()
 
     async def _broadcast_runtime_update(self) -> None:
         latest_price = None
@@ -2538,5 +2873,102 @@ class ModeController:
         )
         return True
 
+    def _extract_live_total_equity(self, balance: dict[str, Any] | None) -> float | None:
+        if not balance:
+            return None
+
+        total = dict(balance.get("total") or {})
+        settle = str(self._status.config.exchange_settle_currency or "USDT").upper()
+        candidates = [settle, settle.lower(), "USDT", "usd", "USD"]
+
+        for key in candidates:
+            value = total.get(key)
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+
+        for value in total.values():
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+
+        return None
+
+    async def _trigger_live_kill_switch(self, reason: str) -> None:
+        if self._live_kill_switch_triggered:
+            return
+
+        self._live_kill_switch_triggered = True
+        self._live_kill_switch_reason = str(reason or "live_kill_switch")
+
+        if self._live_execution is not None:
+            self._live_execution.set_armed(False)
+
+        await self._broadcast_trace_event(
+            "live_kill_switch_triggered",
+            data={
+                "run_id": self._status.run_id,
+                "reason": self._live_kill_switch_reason,
+            },
+        )
+
+        await self._cancel_live_open_orders_best_effort()
+        self._stop_event.set()
+
+    async def _check_live_max_loss_kill_switch(self) -> None:
+        if self._status.mode != Mode.LIVE:
+            return
+
+        max_dd = self._status.config.max_drawdown_pct
+        if max_dd is None or max_dd <= 0:
+            return
+
+        live_equity = self._extract_live_total_equity(self._live_balance)
+        if live_equity is None:
+            return
+
+        if self._live_start_equity is None:
+            self._live_start_equity = live_equity
+            return
+
+        baseline = float(self._live_start_equity)
+        if baseline <= 0:
+            return
+
+        drawdown_pct = ((baseline - live_equity) / baseline) * 100.0
+        if drawdown_pct >= float(max_dd):
+            await self._trigger_live_kill_switch(
+                f"max_drawdown_pct breached: start_equity={baseline:.8f}, "
+                f"live_equity={live_equity:.8f}, drawdown_pct={drawdown_pct:.4f}, "
+                f"limit={float(max_dd):.4f}"
+            )
+
+    async def _cancel_live_open_orders_best_effort(self) -> None:
+        if self._live_execution is None:
+            return
+        try:
+            result = self._live_execution.cancel_all_open_orders(symbol=self._status.config.symbol)
+            self._live_open_orders = []
+            await self._broadcast_trace_event(
+                "live_open_orders_canceled",
+                data={
+                    "run_id": self._status.run_id,
+                    "result": result,
+                },
+            )
+        except Exception as exc:
+            self._live_last_sync_error = str(exc)
+            await self._broadcast_trace_event(
+                "live_cancel_open_orders_failed",
+                data={
+                    "run_id": self._status.run_id,
+                    "error": str(exc),
+                },
+            )
+            
 
 mode_controller = ModeController()
