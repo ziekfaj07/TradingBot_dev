@@ -65,6 +65,9 @@ window.uiController = {
     const runtime = data?.runtime || {};
     const paper = runtime.paper_state || {};
     const latestBar = runtime.latest_bar || {};
+    const live = runtime.live || {};
+    const execution = live.execution || {};
+    const lastLiveFill = execution.last_fill || {};    
 
     qs("botState").textContent = data?.state || "unknown";
     qs("lastSignal").textContent = String(runtime.last_signal ?? "WAIT");
@@ -82,6 +85,18 @@ window.uiController = {
     qs("lastProcessedTs").textContent = fmtTs(runtime.last_processed_bar_ts);
     qs("barCount").textContent = fmtNum(runtime.bar_count ?? 0, 0);
     qs("startedAt").textContent = fmtTs(data?.started_at);
+    qs("liveExpectedPrice").textContent = fmtNum(lastLiveFill.expected_price);
+    qs("liveFillPrice").textContent = fmtNum(lastLiveFill.price);
+    qs("liveSlippageBps").textContent = fmtNum(lastLiveFill.price_slippage_bps);
+    qs("liveExpectedQty").textContent = fmtNum(lastLiveFill.expected_qty);
+    qs("liveFilledQty").textContent = fmtNum(lastLiveFill.qty);
+    qs("liveQtyDeltaPct").textContent = fmtNum(lastLiveFill.qty_delta_pct);
+    qs("liveAckMs").textContent = fmtNum(lastLiveFill.submit_to_ack_ms);
+    qs("liveFillMs").textContent = fmtNum(lastLiveFill.submit_to_fill_ms);
+    qs("liveAvgSlippageBps").textContent = fmtNum(execution.avg_slippage_bps);
+    qs("liveMaxAbsSlippageBps").textContent = fmtNum(execution.max_abs_slippage_bps);
+    qs("liveAvgAckMs").textContent = fmtNum(execution.avg_submit_to_ack_ms);
+    qs("liveAvgFillMs").textContent = fmtNum(execution.avg_submit_to_fill_ms);
 
     qs("chartSymbolView").textContent =
       runtime.chart_symbol || data?.config?.symbol || "-";

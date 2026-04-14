@@ -157,6 +157,24 @@
     </section>
 
     <section class="card mt-16">
+      <h2>Live Execution Deltas</h2>
+      <div class="status-grid">
+        <div class="stat"><div class="stat-label">Last Expected Price</div><div id="liveExpectedPrice" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Last Fill Price</div><div id="liveFillPrice" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Last Slippage (bps)</div><div id="liveSlippageBps" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Last Expected Qty</div><div id="liveExpectedQty" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Last Filled Qty</div><div id="liveFilledQty" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Last Qty Delta %</div><div id="liveQtyDeltaPct" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Last Submit → Ack (ms)</div><div id="liveAckMs" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Last Submit → Fill (ms)</div><div id="liveFillMs" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Avg Slippage (bps)</div><div id="liveAvgSlippageBps" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Max |Slippage| (bps)</div><div id="liveMaxAbsSlippageBps" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Avg Submit → Ack (ms)</div><div id="liveAvgAckMs" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Avg Submit → Fill (ms)</div><div id="liveAvgFillMs" class="stat-value">-</div></div>
+      </div>
+    </section>
+
+    <section class="card mt-16">
       <h2>Live Candlestick Chart</h2>
       <div class="chart-meta">
         <div>Symbol: <strong id="chartSymbolView">-</strong></div>
@@ -183,11 +201,16 @@
         <thead>
           <tr>
             <th>Time</th>
+            <th>Type</th>
             <th>Side</th>
-            <th>Qty</th>
-            <th>Price</th>
-            <th>Fee</th>
-            <th>Realized PnL</th>
+            <th>Expected Qty</th>
+            <th>Filled Qty</th>
+            <th>Expected Px</th>
+            <th>Fill Px</th>
+            <th>Slip (bps)</th>
+            <th>Ack (ms)</th>
+            <th>Fill (ms)</th>
+            <th>PnL</th>            
           </tr>
         </thead>
         <tbody id="fillsTableBody"></tbody>

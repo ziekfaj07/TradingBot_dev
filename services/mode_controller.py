@@ -728,6 +728,52 @@ class ModeController:
                 self._persist_status()
             raise
 
+    def _build_live_execution_summary(self) -> dict:
+        live_fills: list[dict[str, Any]] = []
+
+        for item in reversed(self._fills):
+            row = item.to_dict() if isinstance(item, Fill) else dict(getattr(item, "__dict__", item))
+            source = str(row.get("execution_source") or "")
+            if source.startswith("live_"):
+                live_fills.append(row)
+
+        recent = live_fills[-50:]
+        last_fill = recent[-1] if recent else None
+
+        def _nums(key: str) -> list[float]:
+            vals: list[float] = []
+            for row in recent:
+                value = row.get(key)
+                if value is None:
+                    continue
+                try:
+                    vals.append(float(value))
+                except (TypeError, ValueError):
+                    continue
+            return vals
+
+        slip_bps = _nums("price_slippage_bps")
+        ack_ms = _nums("submit_to_ack_ms")
+        fill_ms = _nums("submit_to_fill_ms")
+        qty_pct = _nums("qty_delta_pct")
+
+        avg_slip_bps = (sum(slip_bps) / len(slip_bps)) if slip_bps else None
+        max_abs_slip_bps = max((abs(v) for v in slip_bps), default=None)
+        avg_ack_ms = (sum(ack_ms) / len(ack_ms)) if ack_ms else None
+        avg_fill_ms = (sum(fill_ms) / len(fill_ms)) if fill_ms else None
+        avg_qty_delta_pct = (sum(qty_pct) / len(qty_pct)) if qty_pct else None
+
+        return {
+            "live_fill_count": len(live_fills),
+            "recent_live_fill_count": len(recent),
+            "avg_slippage_bps": avg_slip_bps,
+            "max_abs_slippage_bps": max_abs_slip_bps,
+            "avg_submit_to_ack_ms": avg_ack_ms,
+            "avg_submit_to_fill_ms": avg_fill_ms,
+            "avg_qty_delta_pct": avg_qty_delta_pct,
+            "last_fill": last_fill,
+        }
+
     def status(self) -> dict:
         cfg = asdict(self._status.config)
 
@@ -799,6 +845,7 @@ class ModeController:
                 "balance": self._live_balance,
                 "open_orders": self._live_open_orders[-20:],
                 "positions": self._live_positions[-20:],
+                "execution": self._build_live_execution_summary(),                
             },
         }
 
@@ -2023,6 +2070,8 @@ class ModeController:
             fill_type=fill_type,
             market_price=float(market_price),
             trade_id=(self._trade_id if self._trade_id > 0 else None),
+            expected_price=float(market_price),
+            expected_qty=float(qty),
         )
 
         await self._append_fill(fill)

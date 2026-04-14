@@ -16,6 +16,9 @@ class LiveOrderResult:
     status: str
     dry_run: bool
     armed: bool
+    submitted_at: str | None = None
+    acknowledged_at: str | None = None
+    filled_at: str | None = None    
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -24,6 +27,9 @@ class LiveOrderResult:
             "status": self.status,
             "dry_run": self.dry_run,
             "armed": self.armed,
+            "submitted_at": self.submitted_at,
+            "acknowledged_at": self.acknowledged_at,
+            "filled_at": self.filled_at,            
         }
 
 
@@ -114,6 +120,109 @@ class LiveExecutionService:
         }
 
     @staticmethod
+    def _float_or_none(value: Any) -> float | None:
+        try:
+            if value is None or value == "":
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _to_epoch_ms(value: Any) -> int | None:
+        if value is None or value == "":
+            return None
+
+        if isinstance(value, (int, float)):
+            raw = float(value)
+            if raw <= 0:
+                return None
+            # seconds vs milliseconds
+            if raw < 10_000_000_000:
+                raw *= 1000.0
+            return int(raw)
+
+        text = str(value).strip()
+        if not text:
+            return None
+
+        try:
+            as_num = float(text)
+            if as_num > 0:
+                if as_num < 10_000_000_000:
+                    as_num *= 1000.0
+                return int(as_num)
+        except ValueError:
+            pass
+
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            return int(dt.timestamp() * 1000)
+        except Exception:
+            return None
+
+    @classmethod
+    def _iso_from_any(cls, value: Any) -> str | None:
+        epoch_ms = cls._to_epoch_ms(value)
+        if epoch_ms is None:
+            return None
+        return datetime.fromtimestamp(epoch_ms / 1000.0, tz=timezone.utc).isoformat()
+
+    @classmethod
+    def _latency_ms(cls, start_value: Any, end_value: Any) -> float | None:
+        start_ms = cls._to_epoch_ms(start_value)
+        end_ms = cls._to_epoch_ms(end_value)
+        if start_ms is None or end_ms is None:
+            return None
+        return float(max(0, end_ms - start_ms))
+
+    def _extract_acknowledged_at(self, payload: dict[str, Any]) -> str | None:
+        raw = dict(payload or {})
+        info = raw.get("info") if isinstance(raw.get("info"), dict) else {}
+
+        candidates = [
+            raw.get("datetime"),
+            raw.get("timestamp"),
+            raw.get("createdAt"),
+            raw.get("create_time"),
+            raw.get("createTime"),
+            raw.get("updateTime"),
+            info.get("create_time_ms"),
+            info.get("create_time"),
+            info.get("update_time_ms"),
+            info.get("update_time"),
+        ]
+        for item in candidates:
+            iso = self._iso_from_any(item)
+            if iso:
+                return iso
+        return None
+
+    def _extract_filled_at(self, payload: dict[str, Any]) -> str | None:
+        raw = dict(payload or {})
+        info = raw.get("info") if isinstance(raw.get("info"), dict) else {}
+
+        candidates = [
+            raw.get("lastTradeTimestamp"),
+            raw.get("lastFillTime"),
+            raw.get("filledAt"),
+            raw.get("fillTime"),
+            raw.get("tradeTime"),
+            raw.get("updateTime"),
+            info.get("finish_time_ms"),
+            info.get("finish_time"),
+            info.get("fill_time_ms"),
+            info.get("fill_time"),
+            info.get("update_time_ms"),
+            info.get("update_time"),
+        ]
+        for item in candidates:
+            iso = self._iso_from_any(item)
+            if iso:
+                return iso
+        return None
+
+    @staticmethod
     def _normalize_client_order_id_prefix(prefix: str | None) -> str:
         raw = str(prefix or "tb").strip()
         if not raw:
@@ -140,6 +249,8 @@ class LiveExecutionService:
         requested_qty = float(qty)
         if requested_qty <= 0.0:
             raise ExchangeConfigurationError("Order qty must be > 0.")
+
+        submitted_at = datetime.now(timezone.utc).isoformat()
 
         params: dict[str, Any] = {}
         if client_order_id:
@@ -169,12 +280,19 @@ class LiveExecutionService:
                 },
             }
             normalized = self.normalize_order(fake_order)
+            normalized["submitted_at"] = submitted_at
+            normalized["acknowledged_at"] = fake_now
+            normalized["filled_at"] = fake_now
+
             return LiveOrderResult(
                 ok=True,
                 order=normalized,
                 status=str(normalized.get("status") or "closed"),
                 dry_run=True,
                 armed=self.armed,
+                submitted_at=submitted_at,
+                acknowledged_at=fake_now,
+                filled_at=fake_now,
             )
 
         created = self.adapter.create_order(
@@ -185,13 +303,45 @@ class LiveExecutionService:
             price=price,
             params=params,
         )
-        normalized = self.normalize_order(created)
+
+        ack_order = self.normalize_order(created)
+        acknowledged_at = ack_order.get("acknowledged_at") or ack_order.get("timestamp") or datetime.now(timezone.utc).isoformat()
+
+        final_order = dict(ack_order)
+        final_order["submitted_at"] = submitted_at
+        final_order["acknowledged_at"] = acknowledged_at
+
+        order_id = str(final_order.get("id") or "")
+        if order_id:
+            try:
+                refreshed_raw = self.adapter.fetch_order(order_id=order_id, symbol=normalized_symbol)
+                refreshed = self.normalize_order(refreshed_raw)
+                refreshed["submitted_at"] = submitted_at
+                refreshed["acknowledged_at"] = refreshed.get("acknowledged_at") or acknowledged_at
+                if refreshed.get("filled_at") is None:
+                    status = str(refreshed.get("status") or "").lower()
+                    filled_qty = float(refreshed.get("filled") or 0.0)
+                    if status in {"closed", "filled"} and filled_qty > 0.0:
+                        refreshed["filled_at"] = refreshed.get("acknowledged_at")
+                final_order.update(refreshed)
+            except Exception:
+                pass
+
+        if final_order.get("filled_at") is None:
+            status = str(final_order.get("status") or "").lower()
+            filled_qty = float(final_order.get("filled") or 0.0)
+            if status in {"closed", "filled"} and filled_qty > 0.0:
+                final_order["filled_at"] = final_order.get("acknowledged_at")
+
         return LiveOrderResult(
             ok=True,
-            order=normalized,
-            status=str(normalized.get("status") or "open"),
+            order=final_order,
+            status=str(final_order.get("status") or "open"),
             dry_run=False,
             armed=True,
+            submitted_at=submitted_at,
+            acknowledged_at=final_order.get("acknowledged_at"),
+            filled_at=final_order.get("filled_at"),
         )
 
     def cancel_order(self, *, symbol: str, order_id: str) -> dict[str, Any]:
@@ -227,6 +377,8 @@ class LiveExecutionService:
         fill_type: str,
         market_price: float,
         trade_id: int | None,
+        expected_price: float | None = None,
+        expected_qty: float | None = None,
     ) -> Fill:
         filled_qty = float(order.get("filled") or order.get("amount") or 0.0)
         price = float(order.get("average") or order.get("price") or market_price)
@@ -234,7 +386,28 @@ class LiveExecutionService:
         side = str(order.get("side") or "buy").lower()
         logical_side = "long" if side == "buy" else "sell"
         order_status = str(order.get("status") or "unknown").lower()
-        timestamp = str(order.get("timestamp") or datetime.now(timezone.utc).isoformat())
+
+        submitted_at = order.get("submitted_at")
+        acknowledged_at = order.get("acknowledged_at")
+        filled_at = order.get("filled_at")
+        timestamp = str(filled_at or acknowledged_at or order.get("timestamp") or datetime.now(timezone.utc).isoformat())
+
+        effective_expected_price = float(expected_price if expected_price is not None else market_price)
+        effective_expected_qty = float(expected_qty if expected_qty is not None else filled_qty)
+
+        price_slippage = price - effective_expected_price
+        if side == "sell":
+            price_slippage = effective_expected_price - price
+
+        price_slippage_bps = None
+        if effective_expected_price > 0.0:
+            price_slippage_bps = (price_slippage / effective_expected_price) * 10_000.0
+
+        qty_delta = filled_qty - effective_expected_qty
+        qty_delta_pct = None
+        if effective_expected_qty > 0.0:
+            qty_delta_pct = (qty_delta / effective_expected_qty) * 100.0
+
         return Fill(
             timestamp=timestamp,
             type=str(fill_type),
@@ -253,6 +426,17 @@ class LiveExecutionService:
             execution_source="live_exchange" if self.can_submit_live_orders else "live_dry_run",
             reduce_only=bool(order.get("reduce_only") or False),
             dry_run=bool(order.get("dry_run") or not self.can_submit_live_orders),
+            expected_price=effective_expected_price,
+            expected_qty=effective_expected_qty,
+            submitted_at=submitted_at,
+            acknowledged_at=acknowledged_at,
+            filled_at=filled_at,
+            submit_to_ack_ms=self._latency_ms(submitted_at, acknowledged_at),
+            submit_to_fill_ms=self._latency_ms(submitted_at, filled_at),
+            price_slippage=price_slippage,
+            price_slippage_bps=price_slippage_bps,
+            qty_delta=qty_delta,
+            qty_delta_pct=qty_delta_pct,
         )
 
     def normalize_ticker(self, ticker: dict[str, Any] | None) -> dict[str, Any]:
@@ -278,6 +462,10 @@ class LiveExecutionService:
     def normalize_order(self, order: dict[str, Any] | None) -> dict[str, Any]:
         payload = dict(order or {})
         fee = payload.get("fee") or {}
+
+        acknowledged_at = self._extract_acknowledged_at(payload)
+        filled_at = self._extract_filled_at(payload)
+
         return {
             "id": str(payload.get("id") or ""),
             "client_order_id": payload.get("clientOrderId") or payload.get("client_order_id"),
@@ -291,7 +479,9 @@ class LiveExecutionService:
             "average": self._float_or_none(payload.get("average")),
             "status": payload.get("status"),
             "reduce_only": bool(payload.get("reduceOnly") or payload.get("reduce_only") or False),
-            "timestamp": payload.get("datetime") or payload.get("timestamp"),
+            "timestamp": self._iso_from_any(payload.get("datetime") or payload.get("timestamp")) or payload.get("datetime") or payload.get("timestamp"),
+            "acknowledged_at": acknowledged_at,
+            "filled_at": filled_at,
             "fee_cost": self._float_or_none(fee.get("cost")) if isinstance(fee, dict) else None,
             "fee_currency": fee.get("currency") if isinstance(fee, dict) else None,
             "raw": payload,

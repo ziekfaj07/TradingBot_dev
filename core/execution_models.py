@@ -53,6 +53,7 @@ class Fill:
     exit_price: Optional[float] = None
     trade_id: Optional[int] = None
     pnl: Optional[float] = None
+
     exchange: Optional[str] = None
     symbol: Optional[str] = None
     market_type: Optional[str] = None
@@ -62,6 +63,19 @@ class Fill:
     execution_source: Optional[str] = None
     reduce_only: Optional[bool] = None
     dry_run: Optional[bool] = None
+
+    # v0.7.4 live execution telemetry
+    expected_price: Optional[float] = None
+    expected_qty: Optional[float] = None
+    submitted_at: Optional[str] = None
+    acknowledged_at: Optional[str] = None
+    filled_at: Optional[str] = None
+    submit_to_ack_ms: Optional[float] = None
+    submit_to_fill_ms: Optional[float] = None
+    price_slippage: Optional[float] = None
+    price_slippage_bps: Optional[float] = None
+    qty_delta: Optional[float] = None
+    qty_delta_pct: Optional[float] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -91,4 +105,15 @@ class Fill:
             execution_source=data.get("execution_source"),
             reduce_only=data.get("reduce_only"),
             dry_run=data.get("dry_run"),
+            expected_price=data.get("expected_price"),
+            expected_qty=data.get("expected_qty"),
+            submitted_at=data.get("submitted_at"),
+            acknowledged_at=data.get("acknowledged_at"),
+            filled_at=data.get("filled_at"),
+            submit_to_ack_ms=data.get("submit_to_ack_ms"),
+            submit_to_fill_ms=data.get("submit_to_fill_ms"),
+            price_slippage=data.get("price_slippage"),
+            price_slippage_bps=data.get("price_slippage_bps"),
+            qty_delta=data.get("qty_delta"),
+            qty_delta_pct=data.get("qty_delta_pct"),            
         )

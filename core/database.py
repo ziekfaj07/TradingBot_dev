@@ -162,6 +162,26 @@ def _normalize_fill_payload(run_id: str, fill: dict, now: Optional[float] = None
         "exit_price": payload.get("exit_price"),
         "trade_id": payload.get("trade_id"),
         "pnl": payload.get("pnl"),
+        "exchange": payload.get("exchange"),
+        "symbol": payload.get("symbol"),
+        "market_type": payload.get("market_type"),
+        "order_id": payload.get("order_id"),
+        "client_order_id": payload.get("client_order_id"),
+        "order_status": payload.get("order_status"),
+        "execution_source": payload.get("execution_source"),
+        "reduce_only": 1 if payload.get("reduce_only") is True else 0 if payload.get("reduce_only") is False else None,
+        "dry_run": 1 if payload.get("dry_run") is True else 0 if payload.get("dry_run") is False else None,
+        "expected_price": _safe_float(payload.get("expected_price")),
+        "expected_qty": _safe_float(payload.get("expected_qty")),
+        "submitted_at": payload.get("submitted_at"),
+        "acknowledged_at": payload.get("acknowledged_at"),
+        "filled_at": payload.get("filled_at"),
+        "submit_to_ack_ms": _safe_float(payload.get("submit_to_ack_ms")),
+        "submit_to_fill_ms": _safe_float(payload.get("submit_to_fill_ms")),
+        "price_slippage": _safe_float(payload.get("price_slippage")),
+        "price_slippage_bps": _safe_float(payload.get("price_slippage_bps")),
+        "qty_delta": _safe_float(payload.get("qty_delta")),
+        "qty_delta_pct": _safe_float(payload.get("qty_delta_pct")),
         "created_at": created_at,
         "meta_json": _json_dumps(payload),
     }
@@ -207,9 +227,29 @@ def _insert_runtime_fills_batch_conn(
             exit_price,
             trade_id,
             pnl,
+            exchange,
+            symbol,
+            market_type,
+            order_id,
+            client_order_id,
+            order_status,
+            execution_source,
+            reduce_only,
+            dry_run,
+            expected_price,
+            expected_qty,
+            submitted_at,
+            acknowledged_at,
+            filled_at,
+            submit_to_ack_ms,
+            submit_to_fill_ms,
+            price_slippage,
+            price_slippage_bps,
+            qty_delta,
+            qty_delta_pct,
             created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             (
@@ -225,6 +265,26 @@ def _insert_runtime_fills_batch_conn(
                 row["exit_price"],
                 row["trade_id"],
                 row["pnl"],
+                row["exchange"],
+                row["symbol"],
+                row["market_type"],
+                row["order_id"],
+                row["client_order_id"],
+                row["order_status"],
+                row["execution_source"],
+                row["reduce_only"],
+                row["dry_run"],
+                row["expected_price"],
+                row["expected_qty"],
+                row["submitted_at"],
+                row["acknowledged_at"],
+                row["filled_at"],
+                row["submit_to_ack_ms"],
+                row["submit_to_fill_ms"],
+                row["price_slippage"],
+                row["price_slippage_bps"],
+                row["qty_delta"],
+                row["qty_delta_pct"],
                 row["created_at"],
             )
             for row in rows
@@ -471,6 +531,30 @@ def create_table(symbol: str) -> None:
     conn.close()
 
 
+def _table_column_names(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({table_name})")
+    rows = cur.fetchall()
+    names: set[str] = set()
+    for row in rows:
+        try:
+            names.add(str(row["name"]))
+        except Exception:
+            try:
+                names.add(str(row[1]))
+            except Exception:
+                continue
+    return names
+
+
+def _ensure_columns(conn: sqlite3.Connection, table_name: str, columns: dict[str, str]) -> None:
+    existing = _table_column_names(conn, table_name)
+    cur = conn.cursor()
+    for col_name, col_type in columns.items():
+        if col_name in existing:
+            continue
+        cur.execute(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}")
+
 # ============================================================
 # v0.5.1 Persistent DB schema
 # ============================================================
@@ -544,6 +628,33 @@ def init_runtime_db() -> None:
         )
         """
     )
+
+    _ensure_columns(
+        conn,
+        "runtime_fills",
+        {
+            "exchange": "TEXT",
+            "symbol": "TEXT",
+            "market_type": "TEXT",
+            "order_id": "TEXT",
+            "client_order_id": "TEXT",
+            "order_status": "TEXT",
+            "execution_source": "TEXT",
+            "reduce_only": "INTEGER",
+            "dry_run": "INTEGER",
+            "expected_price": "REAL",
+            "expected_qty": "REAL",
+            "submitted_at": "TEXT",
+            "acknowledged_at": "TEXT",
+            "filled_at": "TEXT",
+            "submit_to_ack_ms": "REAL",
+            "submit_to_fill_ms": "REAL",
+            "price_slippage": "REAL",
+            "price_slippage_bps": "REAL",
+            "qty_delta": "REAL",
+            "qty_delta_pct": "REAL",
+        },
+    )    
 
     cur.execute(
         """
@@ -950,6 +1061,26 @@ def load_runtime_fills(
             exit_price,
             trade_id,
             pnl,
+            exchange,
+            symbol,
+            market_type,
+            order_id,
+            client_order_id,
+            order_status,
+            execution_source,
+            reduce_only,
+            dry_run,
+            expected_price,
+            expected_qty,
+            submitted_at,
+            acknowledged_at,
+            filled_at,
+            submit_to_ack_ms,
+            submit_to_fill_ms,
+            price_slippage,
+            price_slippage_bps,
+            qty_delta,
+            qty_delta_pct,
             created_at
         FROM runtime_fills
         WHERE run_id = ?
@@ -1597,6 +1728,26 @@ def export_runtime_fills_csv(run_id: str) -> str:
             "exit_price",
             "trade_id",
             "pnl",
+            "exchange",
+            "symbol",
+            "market_type",
+            "order_id",
+            "client_order_id",
+            "order_status",
+            "execution_source",
+            "reduce_only",
+            "dry_run",
+            "expected_price",
+            "expected_qty",
+            "submitted_at",
+            "acknowledged_at",
+            "filled_at",
+            "submit_to_ack_ms",
+            "submit_to_fill_ms",
+            "price_slippage",
+            "price_slippage_bps",
+            "qty_delta",
+            "qty_delta_pct",
             "created_at",
         ]
     )
@@ -1617,6 +1768,26 @@ def export_runtime_fills_csv(run_id: str) -> str:
                 row.get("exit_price"),
                 row.get("trade_id"),
                 row.get("pnl"),
+                row.get("exchange"),
+                row.get("symbol"),
+                row.get("market_type"),
+                row.get("order_id"),
+                row.get("client_order_id"),
+                row.get("order_status"),
+                row.get("execution_source"),
+                row.get("reduce_only"),
+                row.get("dry_run"),
+                row.get("expected_price"),
+                row.get("expected_qty"),
+                row.get("submitted_at"),
+                row.get("acknowledged_at"),
+                row.get("filled_at"),
+                row.get("submit_to_ack_ms"),
+                row.get("submit_to_fill_ms"),
+                row.get("price_slippage"),
+                row.get("price_slippage_bps"),
+                row.get("qty_delta"),
+                row.get("qty_delta_pct"),
                 row.get("created_at"),
             ]
         )
