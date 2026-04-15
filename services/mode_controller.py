@@ -202,6 +202,10 @@ class ModeController:
         self._live_balance: dict[str, Any] | None = None
         self._live_open_orders: list[dict[str, Any]] = []
         self._live_positions: list[dict[str, Any]] = []
+        self._live_order_registry: dict[str, dict[str, Any]] = {}
+        self._live_fill_id_set: set[str] = set()
+        self._live_trade_since_ms: int | None = None
+        self._live_private_stream_connected: bool = False
         self._live_run_armed: bool = False
         self._live_kill_switch_triggered: bool = False
         self._live_kill_switch_reason: str | None = None
@@ -731,7 +735,7 @@ class ModeController:
     def _build_live_execution_summary(self) -> dict:
         live_fills: list[dict[str, Any]] = []
 
-        for item in reversed(self._fills):
+        for item in self._fills:
             row = item.to_dict() if isinstance(item, Fill) else dict(getattr(item, "__dict__", item))
             source = str(row.get("execution_source") or "")
             if source.startswith("live_"):
@@ -845,6 +849,9 @@ class ModeController:
                 "balance": self._live_balance,
                 "open_orders": self._live_open_orders[-20:],
                 "positions": self._live_positions[-20:],
+                "order_registry": list(self._live_order_registry.values())[-50:],
+                "private_stream_connected": self._live_private_stream_connected,
+                "position_mode": (self._live_balance or {}).get("position_mode") if isinstance(self._live_balance, dict) else None,
                 "execution": self._build_live_execution_summary(),                
             },
         }
@@ -1033,6 +1040,9 @@ class ModeController:
 
     def _fill_dedupe_key(self, fill: Fill | Mapping[str, Any]) -> str:
         data = self._fill_to_dict(fill)
+        fill_id = str(data.get("fill_id") or data.get("order_id") or "")
+        if fill_id:
+            return "|".join([str(self._status.run_id or ""), fill_id, str(data.get("type", "")), str(data.get("side", ""))])
         return "|".join(
             [
                 str(self._status.run_id or ""),
@@ -1788,6 +1798,14 @@ class ModeController:
         self._live_balance = None
         self._live_open_orders = []
         self._live_positions = []
+        self._live_order_registry = {}
+        self._live_fill_id_set = set()
+        self._live_trade_since_ms = None
+        self._live_private_stream_connected = False
+        self._live_order_registry = {}
+        self._live_fill_id_set = set()
+        self._live_trade_since_ms = None
+        self._live_private_stream_connected = False
         self._live_last_sync_at = None
         self._live_last_sync_error = None
         self._reset_risk_runtime_locked()
@@ -1892,10 +1910,14 @@ class ModeController:
 
             async with self._lock:
                 self._live_balance = dict(snapshot.get("balance") or {})
+                self._live_balance["position_mode"] = snapshot.get("position_mode")
                 self._live_open_orders = list(snapshot.get("open_orders") or [])
                 self._live_positions = list(snapshot.get("positions") or [])
                 self._live_last_sync_at = snapshot.get("synced_at")
                 self._live_last_sync_error = None
+                self._merge_live_open_orders_into_registry_locked()
+                await self._reconcile_live_orders_locked(force=force)
+                self._sync_shadow_state_from_live_account_locked()
 
                 await self._check_live_max_loss_kill_switch()                
 
@@ -1933,6 +1955,7 @@ class ModeController:
                         "exchange": cfg.exchange_name,
                         "open_order_count": len(snapshot.get("open_orders") or []),
                         "position_count": len(snapshot.get("positions") or []),
+                        "registry_count": len(self._live_order_registry),
                         "synced_at": snapshot.get("synced_at"),
                     },
                 )
@@ -1954,21 +1977,27 @@ class ModeController:
                     },
                 )
 
-    def _live_has_open_long_locked(self) -> bool:
+    def _live_position_side_locked(self) -> str | None:
         if self._state is not None and float(self._state.position_qty or 0.0) > 0.0:
-            return True
+            side = str(self._state.side or "").strip().lower()
+            if side in {"long", "short"}:
+                return side
 
         for position in self._live_positions or []:
-            try:
-                contracts = float(position.get("contracts") or 0.0)
-            except (TypeError, ValueError):
-                contracts = 0.0
-
             side = str(position.get("side") or "").strip().lower()
-            if contracts > 0.0 and side in {"long", "buy"}:
-                return True
+            try:
+                base_qty = abs(float(position.get("base_qty") or 0.0))
+            except (TypeError, ValueError):
+                base_qty = 0.0
+            if base_qty > 0.0 and side in {"long", "short", "buy", "sell"}:
+                return "short" if side in {"short", "sell"} else "long"
+        return None
 
-        return False
+    def _live_has_open_long_locked(self) -> bool:
+        return self._live_position_side_locked() == "long"
+
+    def _live_has_open_short_locked(self) -> bool:
+        return self._live_position_side_locked() == "short"
 
     def _live_position_qty_locked(self) -> float:
         if self._state is not None:
@@ -1978,15 +2007,126 @@ class ModeController:
 
         for position in self._live_positions or []:
             try:
-                contracts = abs(float(position.get("contracts") or 0.0))
+                base_qty = abs(float(position.get("base_qty") or 0.0))
             except (TypeError, ValueError):
-                contracts = 0.0
-
-            side = str(position.get("side") or "").strip().lower()
-            if contracts > 0.0 and side in {"long", "buy"}:
-                return contracts
+                base_qty = 0.0
+            if base_qty > 0.0:
+                return base_qty
 
         return 0.0
+
+    def _live_side_safe_order_intent(self, *, signal: int) -> dict[str, Any] | None:
+        current_side = self._live_position_side_locked()
+        allow_short = bool(self._status.config.allow_short) and str(self._status.config.market_type).lower() == "swap"
+        if signal > 0:
+            if current_side == "long":
+                return None
+            if current_side == "short":
+                return {"action": "exit_short", "side": "buy", "reduce_only": True, "fill_type": "EXIT"}
+            return {"action": "enter_long", "side": "buy", "reduce_only": False, "fill_type": "ENTRY"}
+        if signal < 0:
+            if current_side == "long":
+                return {"action": "exit_long", "side": "sell", "reduce_only": True, "fill_type": "EXIT"}
+            if current_side == "short":
+                return None
+            if allow_short:
+                return {"action": "enter_short", "side": "sell", "reduce_only": False, "fill_type": "ENTRY"}
+        return None
+
+    def _register_live_order_locked(self, *, order: dict[str, Any], requested_qty: float, requested_side: str, reduce_only: bool, fill_type: str) -> None:
+        order_id = str(order.get("id") or "")
+        if not order_id:
+            return
+        registry = self._live_order_registry.get(order_id, {})
+        registry.update({
+            "order_id": order_id,
+            "client_order_id": order.get("client_order_id"),
+            "symbol": order.get("symbol"),
+            "requested_side": requested_side,
+            "reduce_only": bool(reduce_only),
+            "fill_type": fill_type,
+            "requested_base_qty": float(requested_qty),
+            "filled_base_qty": float(order.get("filled_base_qty") or 0.0),
+            "remaining_base_qty": float(order.get("remaining_base_qty") or 0.0),
+            "status": str(order.get("status") or "open"),
+            "submitted_at": order.get("submitted_at"),
+            "acknowledged_at": order.get("acknowledged_at"),
+            "filled_at": order.get("filled_at"),
+            "avg_price": order.get("average") or order.get("price"),
+            "fee_cost": float(order.get("fee_cost") or 0.0),
+            "contract_size": order.get("contract_size"),
+            "fills_seen": registry.get("fills_seen", []),
+            "raw_order": order,
+        })
+        self._live_order_registry[order_id] = registry
+
+    def _merge_live_open_orders_into_registry_locked(self) -> None:
+        for row in self._live_open_orders or []:
+            order_id = str(row.get("id") or "")
+            if not order_id:
+                continue
+            registry = self._live_order_registry.get(order_id, {})
+            registry.update({
+                "order_id": order_id,
+                "client_order_id": row.get("client_order_id"),
+                "symbol": row.get("symbol"),
+                "status": str(row.get("status") or registry.get("status") or "open"),
+                "filled_base_qty": float(row.get("filled_base_qty") or registry.get("filled_base_qty") or 0.0),
+                "remaining_base_qty": float(row.get("remaining_base_qty") or registry.get("remaining_base_qty") or 0.0),
+                "avg_price": row.get("average") or row.get("price") or registry.get("avg_price"),
+                "fee_cost": float(row.get("fee_cost") or registry.get("fee_cost") or 0.0),
+                "contract_size": row.get("contract_size") or registry.get("contract_size"),
+                "raw_order": row,
+                "fills_seen": registry.get("fills_seen", []),
+            })
+            self._live_order_registry[order_id] = registry
+
+        live_open_ids = {str(row.get("id") or "") for row in self._live_open_orders or [] if str(row.get("id") or "")}
+        for order_id, registry in list(self._live_order_registry.items()):
+            if registry.get("status") in {"open", "partially_filled"} and order_id not in live_open_ids:
+                registry["status"] = "closed" if float(registry.get("filled_base_qty") or 0.0) > 0.0 else "canceled"
+
+    async def _reconcile_live_orders_locked(self, *, force: bool = False) -> None:
+        if self._live_execution is None or not self._live_order_registry:
+            return
+        now_ms = int(time.time() * 1000)
+        if self._live_trade_since_ms is None:
+            self._live_trade_since_ms = now_ms - 15 * 60 * 1000
+
+        for order_id, registry in list(self._live_order_registry.items()):
+            current_status = str(registry.get("status") or "open").lower()
+            if not force and current_status in {"closed", "canceled"}:
+                continue
+            try:
+                reconciled = await asyncio.to_thread(
+                    self._live_execution.reconcile_order,
+                    symbol=self._status.config.symbol,
+                    order_id=order_id,
+                    since_ms=self._live_trade_since_ms,
+                    expected_client_order_id=registry.get("client_order_id"),
+                )
+            except Exception:
+                continue
+
+            registry.update({
+                "status": str(reconciled.get("status") or registry.get("status") or "open"),
+                "filled_base_qty": float(reconciled.get("filled_base_qty") or registry.get("filled_base_qty") or 0.0),
+                "remaining_base_qty": float(reconciled.get("remaining_base_qty") or registry.get("remaining_base_qty") or 0.0),
+                "avg_price": reconciled.get("average") or reconciled.get("price") or registry.get("avg_price"),
+                "fee_cost": float(reconciled.get("fee_cost") or registry.get("fee_cost") or 0.0),
+                "filled_at": reconciled.get("filled_at") or registry.get("filled_at"),
+                "raw_order": reconciled,
+            })
+            fills_seen = set(registry.get("fills_seen") or [])
+            for trade in reconciled.get("fills") or []:
+                fill_id = str(trade.get("id") or "")
+                if not fill_id or fill_id in fills_seen or fill_id in self._live_fill_id_set:
+                    continue
+                fills_seen.add(fill_id)
+                self._live_fill_id_set.add(fill_id)
+                self._live_trade_since_ms = max(self._live_trade_since_ms or 0, int((self._safe_int_value(trade.get("timestamp"), 0) or 0) * 1000))
+            registry["fills_seen"] = sorted(fills_seen)
+            self._live_order_registry[order_id] = registry
 
     async def _apply_live_fill_to_shadow_state_locked(
         self,
@@ -2006,30 +2146,88 @@ class ModeController:
         if exec_price <= 0.0 or exec_qty <= 0.0:
             return
 
+        current_side = str(self._state.side or "").strip().lower() if self._state is not None else ""
         if fill_type == "ENTRY" and float(self._state.position_qty or 0.0) <= 0.0:
             self._trade_id = max(int(self._trade_id or 0), int(fill.trade_id or 0))
-            self._state, _shadow_fill = self._engine.enter_long(
-                ts_iso=str(effective_ts),
-                state=self._state,
-                close=exec_price,
-                market_type=self._status.config.market_type,
-                leverage=self._status.config.leverage,
-                trade_id=int(fill.trade_id or self._trade_id or 1),
-                qty_override=exec_qty,
-            )
+            if str(fill.side or "").lower() == "short":
+                self._state, shadow_fill = self._engine.enter_short(
+                    ts_iso=str(effective_ts),
+                    state=self._state,
+                    close=exec_price,
+                    market_type=self._status.config.market_type,
+                    leverage=self._status.config.leverage,
+                    trade_id=int(fill.trade_id or self._trade_id or 1),
+                    qty_override=exec_qty,
+                    fee_override=float(fill.fee or 0.0),
+                )
+            else:
+                self._state, shadow_fill = self._engine.enter_long(
+                    ts_iso=str(effective_ts),
+                    state=self._state,
+                    close=exec_price,
+                    market_type=self._status.config.market_type,
+                    leverage=self._status.config.leverage,
+                    trade_id=int(fill.trade_id or self._trade_id or 1),
+                    qty_override=exec_qty,
+                    fee_override=float(fill.fee or 0.0),
+                )
+
+            if shadow_fill is not None:
+                fill.trade_id = shadow_fill.trade_id
+                fill.entry_price = shadow_fill.entry_price
+                fill.equity_after = float(shadow_fill.equity_after or 0.0)
+
             await self._mark_to_market(exec_price)
+            if self._state is not None and (fill.equity_after is None or float(fill.equity_after or 0.0) <= 0.0):
+                fill.equity_after = float(self._state.equity or 0.0)
             return
 
         if fill_type in {"EXIT", "LIQUIDATION"} and float(self._state.position_qty or 0.0) > 0.0:
-            self._state, _shadow_fill = self._engine.exit_long(
-                ts_iso=str(effective_ts),
-                state=self._state,
-                close=exec_price,
-                market_type=self._status.config.market_type,
-                trade_id=int(fill.trade_id or self._trade_id or 1),
-            )
+            if current_side == "short":
+                self._state, shadow_fill = self._engine.exit_short(
+                    ts_iso=str(effective_ts),
+                    state=self._state,
+                    close=exec_price,
+                    market_type=self._status.config.market_type,
+                    trade_id=int(fill.trade_id or self._trade_id or 1),
+                    fee_override=float(fill.fee or 0.0),
+                )
+            else:
+                self._state, shadow_fill = self._engine.exit_long(
+                    ts_iso=str(effective_ts),
+                    state=self._state,
+                    close=exec_price,
+                    market_type=self._status.config.market_type,
+                    trade_id=int(fill.trade_id or self._trade_id or 1),
+                    fee_override=float(fill.fee or 0.0),
+                )
+
+            if shadow_fill is not None:
+                fill.trade_id = shadow_fill.trade_id
+                fill.exit_price = shadow_fill.exit_price
+                fill.pnl = shadow_fill.pnl
+                fill.equity_after = float(shadow_fill.equity_after or 0.0)
+
             await self._mark_to_market(exec_price)
+            if self._state is not None and (fill.equity_after is None or float(fill.equity_after or 0.0) <= 0.0):
+                fill.equity_after = float(self._state.equity or 0.0)
             return
+
+    def _validate_live_position_mode_locked(self) -> None:
+        if self._status.config.market_type != "swap" or self._live_execution is None:
+            return
+        position_mode = (self._live_balance or {}).get("position_mode") if isinstance(self._live_balance, dict) else None
+        if position_mode is None:
+            position_mode = self._live_execution.get_position_mode()
+        if position_mode and str(position_mode).strip().lower() not in {"single", "oneway", "one_way"}:
+            raise RuntimeError(f"Live swap trading requires single/one-way position mode. Current mode: {position_mode}")
+
+    def _build_live_client_order_id(self, *, side: str, reduce_only: bool) -> str:
+        run_tail = str(self._status.run_id or "live").split("-")[-1]
+        ts_tail = str(int(time.time() * 1000))[-8:]
+        side_tag = "b" if str(side).lower() == "buy" else "s"
+        ro_tag = "r" if reduce_only else "n"
+        return f"t-{run_tail}-{side_tag}{ro_tag}-{ts_tail}"[:28]
 
     async def _submit_live_signal_order(
         self,
@@ -2048,11 +2246,11 @@ class ModeController:
         if qty <= 0.0:
             raise RuntimeError("Live order qty must be > 0.")
 
-        client_order_id = (
-            f"{self._status.config.client_order_id_prefix}-"
-            f"{self._status.run_id or 'live'}-"
-            f"{int(time.time() * 1000)}"
+        client_order_id = self._build_live_client_order_id(
+            side=side,
+            reduce_only=reduce_only,
         )
+        self._validate_live_position_mode_locked()
 
         result = await asyncio.to_thread(
             live_execution.submit_order,
@@ -2065,6 +2263,14 @@ class ModeController:
             client_order_id=client_order_id,
         )
 
+        self._register_live_order_locked(
+            order=result.order,
+            requested_qty=float(qty),
+            requested_side=side,
+            reduce_only=reduce_only,
+            fill_type=fill_type,
+        )
+
         fill = live_execution.fill_from_order(
             order=result.order,
             fill_type=fill_type,
@@ -2074,12 +2280,12 @@ class ModeController:
             expected_qty=float(qty),
         )
 
-        await self._append_fill(fill)
         await self._apply_live_fill_to_shadow_state_locked(
             fill=fill,
             processed_ts=processed_ts,
             market_price=float(market_price),
         )
+        await self._append_fill(fill)
 
         self._persist_status()
         self._persist_snapshot()
@@ -2173,65 +2379,53 @@ class ModeController:
                     self._last_signal = signal
                     self._last_processed_bar_ts = int(processed_ts)
 
-                    has_long = self._live_has_open_long_locked()
+                    await self._broadcast_trace_event(
+                        "live_signal_evaluated",
+                        data={
+                            "processed_bar_ts": int(processed_ts),
+                            "signal": signal,
+                            "bar_count": len(stable_bars),
+                            "latest_close": float(stable_bars[-1]["close"]) if stable_bars else None,
+                            "source": stable_bars[-1].get("source") if stable_bars else None,
+                            "strategy_name": self._resolved_strategy_name_from_config(cfg),
+                            "strategy_params": self._resolved_strategy_params_from_config(cfg),
+                        },
+                    )
 
-                    if signal > 0 and not has_long:
-                        entry_gate = self._check_entry_gate_locked(
-                            latest_price,
-                            now_ts=processed_ts,
-                        )
-
-                        if entry_gate["allowed"]:
-                            entry_qty = self._compute_entry_qty_locked(latest_price)
-                            if entry_qty is not None and float(entry_qty) > 0.0:
-                                self._trade_id += 1
-                                await self._submit_live_signal_order(
-                                    side="buy",
-                                    qty=float(entry_qty),
-                                    reduce_only=False,
-                                    fill_type="ENTRY",
-                                    market_price=latest_price,
-                                    processed_ts=int(processed_ts),
-                                )
-                                await self._broadcast_trace_event(
-                                    "live_signal_fill",
-                                    data={
-                                        "signal": signal,
-                                        "processed_bar_ts": int(processed_ts),
-                                        "price": latest_price,
-                                        "trade_id": self._trade_id,
-                                        "fill_type": "ENTRY",
-                                    },
-                                )
-                            else:
-                                await self._broadcast_trace_event(
-                                    "live_entry_skipped",
-                                    note="Computed live entry qty was zero.",
-                                    data={
-                                        "processed_bar_ts": int(processed_ts),
-                                        "price": latest_price,
-                                    },
-                                )
-                        else:
-                            self._risk_halt_reason = entry_gate["reason"]
-                            await self._broadcast_trace_event(
-                                "live_entry_blocked",
-                                note=f"Risk blocked live entry: {entry_gate['reason']}",
-                                data={
-                                    "processed_bar_ts": int(processed_ts),
-                                    "price": latest_price,
-                                    **(entry_gate.get("meta", {}) or {}),
-                                },
+                    intent = self._live_side_safe_order_intent(signal=signal)
+                    if intent is not None:
+                        is_entry = str(intent.get("fill_type")) == "ENTRY"
+                        submit_qty = self._live_position_qty_locked()
+                        if is_entry:
+                            entry_gate = self._check_entry_gate_locked(
+                                latest_price,
+                                now_ts=processed_ts,
                             )
+                            if not entry_gate["allowed"]:
+                                self._risk_halt_reason = entry_gate["reason"]
+                                await self._broadcast_trace_event(
+                                    "live_entry_blocked",
+                                    note=f"Risk blocked live entry: {entry_gate['reason']}",
+                                    data={
+                                        "processed_bar_ts": int(processed_ts),
+                                        "price": latest_price,
+                                        **(entry_gate.get("meta", {}) or {}),
+                                    },
+                                )
+                                submit_qty = 0.0
+                            else:
+                                submit_qty = float(self._compute_entry_qty_locked(latest_price) or 0.0)
+                                if submit_qty > 0.0:
+                                    self._trade_id += 1
+                        if not is_entry:
+                            submit_qty = self._live_position_qty_locked()
 
-                    elif cfg.exit_on_signal and signal < 0 and has_long:
-                        exit_qty = self._live_position_qty_locked()
-                        if exit_qty > 0.0:
+                        if submit_qty > 0.0:
                             await self._submit_live_signal_order(
-                                side="sell",
-                                qty=exit_qty,
-                                reduce_only=(cfg.market_type == "swap"),
-                                fill_type="EXIT",
+                                side=str(intent.get("side") or "buy"),
+                                qty=float(submit_qty),
+                                reduce_only=bool(intent.get("reduce_only")),
+                                fill_type=str(intent.get("fill_type") or "ENTRY"),
                                 market_price=latest_price,
                                 processed_ts=int(processed_ts),
                             )
@@ -2242,7 +2436,17 @@ class ModeController:
                                     "processed_bar_ts": int(processed_ts),
                                     "price": latest_price,
                                     "trade_id": self._trade_id,
-                                    "fill_type": "EXIT",
+                                    "fill_type": str(intent.get("fill_type") or "ENTRY"),
+                                    "action": intent.get("action"),
+                                },
+                            )
+                        elif is_entry:
+                            await self._broadcast_trace_event(
+                                "live_entry_skipped",
+                                note="Computed live entry qty was zero.",
+                                data={
+                                    "processed_bar_ts": int(processed_ts),
+                                    "price": latest_price,
                                 },
                             )
 
@@ -2330,7 +2534,22 @@ class ModeController:
 
     def _fetch_recent_bars(self, symbol: str, interval: str, limit: int) -> list[dict]:
         try:
-            bars = self.market_data.get_candles(symbol=symbol, interval=interval, limit=limit)
+            if (
+                self._status.mode == Mode.LIVE
+                and self._live_execution is not None
+            ):
+                bars = self._live_execution.adapter.fetch_ohlcv(
+                    symbol=symbol,
+                    timeframe=interval,
+                    limit=limit,
+                )
+                return bars or []
+
+            bars = self.market_data.get_candles(
+                symbol=symbol,
+                interval=interval,
+                limit=limit,
+            )
             return bars or []
         except Exception:
             return []
@@ -2921,6 +3140,63 @@ class ModeController:
             },
         )
         return True
+
+
+    def _primary_live_position_locked(self) -> dict[str, Any] | None:
+        for position in self._live_positions or []:
+            try:
+                base_qty = abs(float(position.get("base_qty") or 0.0))
+            except (TypeError, ValueError):
+                base_qty = 0.0
+            if base_qty > 0.0:
+                return position
+        return None
+
+    def _sync_shadow_state_from_live_account_locked(self) -> None:
+        if self._state is None:
+            return
+
+        live_total = self._extract_live_total_equity(self._live_balance)
+        primary = self._primary_live_position_locked()
+        unrealized = 0.0
+        if primary is not None:
+            try:
+                unrealized = float(primary.get("unrealized_pnl") or 0.0)
+            except (TypeError, ValueError):
+                unrealized = 0.0
+
+        if live_total is not None:
+            try:
+                self._state.cash = float(live_total) - float(unrealized)
+                self._state.equity = float(live_total)
+            except Exception:
+                pass
+
+        if primary is None:
+            self._state.position_qty = 0.0
+            self._state.entry_price = None
+            self._state.side = None
+            self._state.open_fee_paid = 0.0
+            return
+
+        try:
+            self._state.position_qty = abs(float(primary.get("base_qty") or 0.0))
+        except (TypeError, ValueError):
+            self._state.position_qty = 0.0
+        try:
+            self._state.entry_price = float(primary.get("entry_price")) if primary.get("entry_price") is not None else None
+        except (TypeError, ValueError):
+            self._state.entry_price = None
+        side = str(primary.get("side") or "").strip().lower()
+        if side in {"buy", "long"}:
+            self._state.side = "long"
+        elif side in {"sell", "short"}:
+            self._state.side = "short"
+        try:
+            # position-level realized pnl on Gate often carries open-entry fee for the active leg
+            self._state.open_fee_paid = abs(float((primary.get("raw") or {}).get("realizedPnl") or primary.get("raw", {}).get("realized_pnl") or 0.0))
+        except Exception:
+            pass
 
     def _extract_live_total_equity(self, balance: dict[str, Any] | None) -> float | None:
         if not balance:

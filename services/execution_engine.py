@@ -102,9 +102,12 @@ class ExecutionEngine:
         if state.position_qty == 0.0 or state.entry_price is None:
             return self._clean_money(base_cash)
 
-        return self._clean_money(
-            float(base_cash + state.position_qty * (market_price - state.entry_price))
-        )
+        side = str(getattr(state, "side", "long") or "long").strip().lower()
+        if side == "short":
+            pnl = float(abs(state.position_qty)) * (float(state.entry_price) - float(market_price))
+        else:
+            pnl = float(abs(state.position_qty)) * (float(market_price) - float(state.entry_price))
+        return self._clean_money(float(base_cash + pnl))
 
     def _set_active_trade_id(self, state: PortfolioState, trade_id: int) -> None:
         try:
@@ -147,6 +150,15 @@ class ExecutionEngine:
             return self._clean_money(gross_cost_after_fee * self.fee_rate / (1.0 - self.fee_rate))
 
         return self._clean_money(gross_cost_after_fee * self.fee_rate)
+
+    def _position_sign(self, state: PortfolioState) -> float:
+        side = str(getattr(state, "side", "") or "").strip().lower()
+        return -1.0 if side == "short" else 1.0
+
+    def _gross_pnl(self, qty: float, entry_px: float, exit_px: float, side: str) -> float:
+        if str(side or "long").strip().lower() == "short":
+            return self._clean_money(float(abs(qty)) * (float(entry_px) - float(exit_px)))
+        return self._clean_money(float(abs(qty)) * (float(exit_px) - float(entry_px)))
 
     def apply_margin_snapshot(self, state: PortfolioState, snapshot: Any) -> None:
         if snapshot is None:
@@ -205,6 +217,7 @@ class ExecutionEngine:
         leverage: float,
         trade_id: int,
         qty_override: float | None = None,
+        fee_override: float | None = None,
     ) -> Tuple[PortfolioState, Optional[Fill]]:
         mt = (market_type or "spot").lower()
         buy_px = self.apply_slippage(close, is_buy=True)
@@ -223,12 +236,12 @@ class ExecutionEngine:
         if requested_qty is not None and (requested_qty <= 0 or not math.isfinite(requested_qty)):
             return state, None
 
-        fee = 0.0
+        fee = 0.0 if fee_override is None else self._clean_money(float(fee_override))
 
         if mt == "spot":
             if requested_qty is None:
                 notional = float(state.cash)
-                fee = self._clean_money(notional * self.fee_rate)
+                fee = fee if fee_override is not None else self._clean_money(notional * self.fee_rate)
                 notional_after_fee = max(0.0, notional - fee)
                 qty = notional_after_fee / buy_px
                 remaining_cash = 0.0
@@ -237,7 +250,7 @@ class ExecutionEngine:
                 gross_cost_after_fee = qty * buy_px
                 if self.fee_rate >= 1.0:
                     return state, None
-                fee = self._clean_money(
+                fee = fee if fee_override is not None else self._clean_money(
                     gross_cost_after_fee * self.fee_rate / max(1e-12, (1.0 - self.fee_rate))
                 )
                 total_cash_needed = gross_cost_after_fee + fee
@@ -285,12 +298,12 @@ class ExecutionEngine:
             else:
                 if requested_qty is None:
                     notional = available_cash * lev
-                    fee = self._clean_money(notional * self.fee_rate)
+                    fee = fee if fee_override is not None else self._clean_money(notional * self.fee_rate)
                     qty = notional / buy_px
                 else:
                     qty = float(requested_qty)
                     notional = qty * buy_px
-                    fee = self._clean_money(notional * self.fee_rate)
+                    fee = fee if fee_override is not None else self._clean_money(notional * self.fee_rate)
                     if fee > available_cash + 1e-12:
                         return state, None
 
@@ -306,6 +319,7 @@ class ExecutionEngine:
             state.entry_price = self._clean_money(float(buy_px))
             state.side = "long"
 
+        state.open_fee_paid = self._clean_money(float(fee))
         self._set_active_trade_id(state, entry_trade_id)
         eq_after = self._clean_money(self.mark_equity(state, mt, close))
 
@@ -331,6 +345,7 @@ class ExecutionEngine:
         close: float,
         market_type: str,
         trade_id: int,
+        fee_override: float | None = None,
     ) -> Tuple[PortfolioState, Optional[Fill]]:
         mt = (market_type or "spot").lower()
         if state.position_qty <= 0.0:
@@ -345,21 +360,23 @@ class ExecutionEngine:
         exit_qty = float(state.position_qty)
         entry_px = float(state.entry_price) if state.entry_price is not None else float(sell_px)
 
+        open_fee_paid = self._clean_money(float(getattr(state, "open_fee_paid", 0.0) or 0.0))
+
         if mt == "spot":
             notional = abs(exit_qty) * sell_px
-            fee = self._clean_money(notional * self.fee_rate)
+            fee = self._clean_money(float(fee_override)) if fee_override is not None else self._clean_money(notional * self.fee_rate)
 
-            entry_fee = self._estimate_entry_fee(entry_px, exit_qty, mt)
-            gross_pnl = self._clean_money(float(exit_qty) * (float(sell_px) - entry_px))
+            entry_fee = open_fee_paid or self._estimate_entry_fee(entry_px, exit_qty, mt)
+            gross_pnl = self._gross_pnl(exit_qty, entry_px, sell_px, "long")
             net_pnl = self._clean_money(float(gross_pnl - entry_fee - fee))
 
             state.cash = self._clean_money(float(state.cash) + float(notional - fee))
 
         else:
-            gross_pnl = self._clean_money(float(exit_qty) * (float(sell_px) - entry_px))
+            gross_pnl = self._gross_pnl(exit_qty, entry_px, sell_px, "long")
             notional = abs(exit_qty) * sell_px
-            fee = self._clean_money(notional * self.fee_rate)
-            net_pnl = self._clean_money(float(gross_pnl - fee))
+            fee = self._clean_money(float(fee_override)) if fee_override is not None else self._clean_money(notional * self.fee_rate)
+            net_pnl = self._clean_money(float(gross_pnl - open_fee_paid - fee))
 
             if self._margin_mode(state) == "isolated":
                 released_margin = self._get_isolated_margin(state)
@@ -374,6 +391,8 @@ class ExecutionEngine:
         state.position_qty = 0.0
         state.entry_price = None
         state.side = None
+        state.open_fee_paid = 0.0
+        state.open_fee_paid = 0.0
         self._clear_active_trade_id(state)
 
         eq_after = self._clean_money(self.mark_equity(state, mt, close))
@@ -432,15 +451,16 @@ class ExecutionEngine:
 
         notional = abs(exit_qty) * exit_px
         fee = self._clean_money(notional * self.liquidation_fee_rate)
+        open_fee_paid = self._clean_money(float(getattr(state, "open_fee_paid", 0.0) or 0.0))
 
         if mt == "spot":
-            entry_fee = self._estimate_entry_fee(entry_px, exit_qty, mt)
-            gross_pnl = self._clean_money(float(exit_qty) * (float(exit_px) - entry_px))
+            entry_fee = open_fee_paid or self._estimate_entry_fee(entry_px, exit_qty, mt)
+            gross_pnl = self._gross_pnl(exit_qty, entry_px, exit_px, position_side)
             net_pnl = self._clean_money(float(gross_pnl - entry_fee - fee))
             state.cash = self._clean_money(float(state.cash) + float(notional - fee))
         else:
-            gross_pnl = self._clean_money(float(exit_qty) * (float(exit_px) - entry_px))
-            net_pnl = self._clean_money(float(gross_pnl - fee))
+            gross_pnl = self._gross_pnl(exit_qty, entry_px, exit_px, position_side)
+            net_pnl = self._clean_money(float(gross_pnl - open_fee_paid - fee))
 
             if self._margin_mode(state) == "isolated":
                 released_margin = self._get_isolated_margin(state)

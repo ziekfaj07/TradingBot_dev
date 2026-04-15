@@ -16,6 +16,7 @@ class PortfolioState:
     borrowed: float = 0.0
     isolated_margin: float = 0.0
     margin_mode: str = "cross"
+    open_fee_paid: float = 0.0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -37,6 +38,7 @@ class PortfolioState:
             borrowed=float(data.get("borrowed", 0.0)),
             isolated_margin=float(data.get("isolated_margin", 0.0)),
             margin_mode=str(data.get("margin_mode", "cross") or "cross"),
+            open_fee_paid=float(data.get("open_fee_paid", 0.0)),
         )
 
 
@@ -76,6 +78,11 @@ class Fill:
     price_slippage_bps: Optional[float] = None
     qty_delta: Optional[float] = None
     qty_delta_pct: Optional[float] = None
+    fill_id: Optional[str] = None
+    order_state: Optional[str] = None
+    cumulative_qty: Optional[float] = None
+    remaining_qty: Optional[float] = None
+    contract_size: Optional[float] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -115,5 +122,10 @@ class Fill:
             price_slippage=data.get("price_slippage"),
             price_slippage_bps=data.get("price_slippage_bps"),
             qty_delta=data.get("qty_delta"),
-            qty_delta_pct=data.get("qty_delta_pct"),            
+            qty_delta_pct=data.get("qty_delta_pct"),
+            fill_id=data.get("fill_id"),
+            order_state=data.get("order_state"),
+            cumulative_qty=data.get("cumulative_qty"),
+            remaining_qty=data.get("remaining_qty"),
+            contract_size=data.get("contract_size"),
         )

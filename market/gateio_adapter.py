@@ -224,6 +224,47 @@ class GateIOAdapter:
             "raw_market_id": market.get("id") if market else None,
         }
 
+    def fetch_ohlcv(
+        self,
+        symbol: str,
+        timeframe: str = "1m",
+        limit: int = 300,
+    ) -> list[dict[str, Any]]:
+        normalized_symbol = self.normalize_symbol(symbol)
+        safe_limit = max(10, min(int(limit), 1000))
+
+        try:
+            rows = self.client.fetch_ohlcv(
+                normalized_symbol,
+                timeframe=timeframe,
+                limit=safe_limit,
+            )
+        except ccxt.AuthenticationError as exc:
+            raise ExchangeAuthError(str(exc)) from exc
+        except Exception as exc:
+            raise ExchangeConnectionError(str(exc)) from exc
+
+        bars: list[dict[str, Any]] = []
+        for row in rows or []:
+            try:
+                ts_ms = int(row[0])
+                bars.append(
+                    {
+                        "timestamp": int(ts_ms // 1000),
+                        "open": float(row[1]),
+                        "high": float(row[2]),
+                        "low": float(row[3]),
+                        "close": float(row[4]),
+                        "volume": float(row[5]),
+                        "source": self._api_environment_label(),
+                    }
+                )
+            except (TypeError, ValueError, IndexError):
+                continue
+
+        bars.sort(key=lambda x: x["timestamp"])
+        return bars
+
     def fetch_balance(self) -> dict[str, Any]:
         self._require_credentials()
         try:
@@ -232,6 +273,43 @@ class GateIOAdapter:
             raise ExchangeAuthError(str(exc)) from exc
         except Exception as exc:
             raise ExchangeConnectionError(str(exc)) from exc
+
+
+    def market_info(self, symbol: str) -> dict[str, Any]:
+        normalized_symbol = self.normalize_symbol(symbol)
+        try:
+            markets = self.client.load_markets()
+        except ccxt.AuthenticationError as exc:
+            raise ExchangeAuthError(str(exc)) from exc
+        except Exception as exc:
+            raise ExchangeConnectionError(str(exc)) from exc
+
+        market = markets.get(normalized_symbol)
+        if not isinstance(market, dict):
+            raise ExchangeConfigurationError(f"Market metadata not found for symbol: {normalized_symbol}")
+        return market
+
+    def contract_size_for_symbol(self, symbol: str) -> float | None:
+        if self.market_type != "swap":
+            return None
+        market = self.market_info(symbol)
+        raw = market.get("info") if isinstance(market.get("info"), dict) else {}
+        for candidate in (
+            market.get("contractSize"),
+            market.get("contract_size"),
+            raw.get("quanto_multiplier"),
+            raw.get("contract_size"),
+            raw.get("order_size_min"),
+        ):
+            try:
+                if candidate is None or candidate == "":
+                    continue
+                value = float(candidate)
+                if value > 0:
+                    return value
+            except (TypeError, ValueError):
+                continue
+        return None
 
     def fetch_ticker(self, symbol: str) -> dict[str, Any]:
         normalized_symbol = self.normalize_symbol(symbol)
@@ -270,6 +348,47 @@ class GateIOAdapter:
         except Exception as exc:
             raise ExchangeConnectionError(str(exc)) from exc
         return list(positions or [])
+
+    def fetch_my_trades(
+        self,
+        symbol: str | None = None,
+        since: int | None = None,
+        limit: int = 100,
+        params: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        self._require_credentials()
+        normalized_symbol = self.normalize_symbol(symbol) if symbol else None
+        try:
+            rows = self.client.fetch_my_trades(
+                normalized_symbol,
+                since=None if since is None else int(since),
+                limit=max(1, min(int(limit), 200)),
+                params=params or {},
+            )
+            return list(rows or [])
+        except ccxt.AuthenticationError as exc:
+            raise ExchangeAuthError(str(exc)) from exc
+        except Exception as exc:
+            raise ExchangeConnectionError(str(exc)) from exc
+
+    def get_position_mode(self) -> str | None:
+        if self.market_type != "swap":
+            return None
+        balance = self.fetch_balance()
+        raw = dict(balance.get("raw") or {})
+        info = raw.get("info")
+        if isinstance(info, list) and info:
+            first = info[0] if isinstance(info[0], dict) else {}
+            mode = first.get("position_mode") or first.get("mode")
+            if mode is None:
+                return None
+            mode_text = str(mode).strip().lower()
+            if mode_text in {"single", "oneway", "one_way"}:
+                return "single"
+            if mode_text in {"dual", "hedge", "both"}:
+                return "dual"
+            return mode_text
+        return None
 
     def create_order(
         self,

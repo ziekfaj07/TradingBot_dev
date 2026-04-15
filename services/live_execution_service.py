@@ -110,6 +110,7 @@ class LiveExecutionService:
             "credential_profile": self.credential_profile,
             "resolved_api_key_env": self.resolved_api_key_env,
             "resolved_api_secret_env": self.resolved_api_secret_env,
+            "position_mode": self.get_position_mode(),
             "ticker": self.normalize_ticker(ticker),
             "balance": self.normalize_balance(balance),
             "open_orders": [self.normalize_order(x) for x in open_orders],
@@ -118,6 +119,24 @@ class LiveExecutionService:
             "armed": self.armed,
             "dry_run": self.dry_run,
         }
+
+
+    def fetch_recent_trades(
+        self,
+        *,
+        symbol: str,
+        since_ms: int | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        normalized_symbol = self.adapter.normalize_symbol(symbol)
+        rows = self.adapter.fetch_my_trades(normalized_symbol, since=since_ms, limit=limit)
+        return [self.normalize_trade(x) for x in rows]
+
+    def get_position_mode(self) -> str | None:
+        try:
+            return self.adapter.get_position_mode()
+        except Exception:
+            return None
 
     @staticmethod
     def _float_or_none(value: Any) -> float | None:
@@ -232,6 +251,46 @@ class LiveExecutionService:
         raw = raw.lstrip("-")
         return f"t-{raw}"
 
+
+    def _contract_size_for_symbol(self, symbol: str) -> float | None:
+        try:
+            return self.adapter.contract_size_for_symbol(symbol)
+        except Exception:
+            return None
+
+    def _contracts_from_base_qty(self, *, symbol: str, base_qty: float) -> tuple[float, float | None]:
+        contract_size = self._contract_size_for_symbol(symbol)
+        qty = float(base_qty)
+        if self.market_type != "swap":
+            return qty, contract_size
+        if contract_size is None or contract_size <= 0:
+            return qty, contract_size
+        contracts = max(1.0, round(qty / contract_size))
+        return float(contracts), float(contract_size)
+
+    def _resolve_contract_size(
+        self,
+        *,
+        symbol: Any = None,
+        payload: dict[str, Any] | None = None,
+        info: dict[str, Any] | None = None,
+    ) -> float | None:
+        payload = dict(payload or {})
+        info = dict(info or {})
+        for candidate in (
+            payload.get("contractSize"),
+            payload.get("contract_size"),
+            info.get("quanto_multiplier"),
+            info.get("contract_size"),
+        ):
+            value = self._float_or_none(candidate)
+            if value is not None and value > 0:
+                return value
+        symbol_value = symbol or payload.get("symbol")
+        if symbol_value:
+            return self._contract_size_for_symbol(str(symbol_value))
+        return None
+
     def submit_order(
         self,
         *,
@@ -246,11 +305,15 @@ class LiveExecutionService:
         normalized_symbol = self.adapter.normalize_symbol(symbol)
         normalized_side = str(side or "buy").strip().lower()
         normalized_type = str(order_type or "market").strip().lower()
-        requested_qty = float(qty)
-        if requested_qty <= 0.0:
+        requested_base_qty = float(qty)
+        if requested_base_qty <= 0.0:
             raise ExchangeConfigurationError("Order qty must be > 0.")
 
         submitted_at = datetime.now(timezone.utc).isoformat()
+        exchange_amount, contract_size = self._contracts_from_base_qty(
+            symbol=normalized_symbol,
+            base_qty=requested_base_qty,
+        )
 
         params: dict[str, Any] = {}
         if client_order_id:
@@ -266,9 +329,10 @@ class LiveExecutionService:
                 "symbol": normalized_symbol,
                 "type": normalized_type,
                 "side": normalized_side,
-                "amount": requested_qty,
-                "filled": requested_qty,
+                "amount": exchange_amount,
+                "filled": exchange_amount,
                 "remaining": 0.0,
+                "contractSize": contract_size,
                 "price": price,
                 "average": price,
                 "status": "closed",
@@ -299,7 +363,7 @@ class LiveExecutionService:
             symbol=normalized_symbol,
             order_type=normalized_type,
             side=normalized_side,
-            amount=requested_qty,
+            amount=exchange_amount,
             price=price,
             params=params,
         )
@@ -380,11 +444,15 @@ class LiveExecutionService:
         expected_price: float | None = None,
         expected_qty: float | None = None,
     ) -> Fill:
-        filled_qty = float(order.get("filled") or order.get("amount") or 0.0)
+        filled_qty = float(order.get("filled_base_qty") or order.get("amount_base_qty") or order.get("filled") or order.get("amount") or 0.0)
         price = float(order.get("average") or order.get("price") or market_price)
         fee_cost = self._extract_fee_cost(order)
         side = str(order.get("side") or "buy").lower()
-        logical_side = "long" if side == "buy" else "sell"
+        fill_type_normalized = str(fill_type or "").upper()
+        if fill_type_normalized == "ENTRY":
+            logical_side = "short" if side == "sell" else "long"
+        else:
+            logical_side = side
         order_status = str(order.get("status") or "unknown").lower()
 
         submitted_at = order.get("submitted_at")
@@ -437,7 +505,63 @@ class LiveExecutionService:
             price_slippage_bps=price_slippage_bps,
             qty_delta=qty_delta,
             qty_delta_pct=qty_delta_pct,
+            order_state=order_status,
+            cumulative_qty=filled_qty,
+            remaining_qty=float(order.get("remaining_base_qty") or order.get("remaining") or 0.0),
+            contract_size=self._float_or_none(order.get("contract_size")),
         )
+
+    def reconcile_order(
+        self,
+        *,
+        symbol: str,
+        order_id: str,
+        since_ms: int | None = None,
+        expected_client_order_id: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_symbol = self.adapter.normalize_symbol(symbol)
+        order = self.fetch_order_status(symbol=normalized_symbol, order_id=order_id)
+        trades: list[dict[str, Any]] = []
+        try:
+            trades = self.fetch_recent_trades(symbol=normalized_symbol, since_ms=since_ms, limit=200)
+        except Exception:
+            trades = []
+
+        matched: list[dict[str, Any]] = []
+        for trade in trades:
+            if str(trade.get("order_id") or "") == str(order_id):
+                matched.append(trade)
+                continue
+            if expected_client_order_id and str(trade.get("client_order_id") or "") == str(expected_client_order_id):
+                matched.append(trade)
+
+        matched.sort(key=lambda row: str(row.get("timestamp") or ""))
+        cumulative_base_qty = sum(float(t.get("base_qty") or 0.0) for t in matched)
+        cumulative_fee = sum(float(t.get("fee_cost") or 0.0) for t in matched)
+        if cumulative_base_qty > 0.0:
+            order["filled_base_qty"] = cumulative_base_qty
+            contract_size = float(order.get("contract_size") or 1.0)
+            if contract_size > 0 and self.market_type == "swap":
+                order["filled"] = cumulative_base_qty / contract_size
+            if order.get("amount_base_qty") is not None:
+                order["remaining_base_qty"] = max(0.0, float(order.get("amount_base_qty") or 0.0) - cumulative_base_qty)
+            if order.get("amount") is not None and self.market_type == "swap" and contract_size > 0:
+                order["remaining"] = max(0.0, float(order.get("amount") or 0.0) - float(order.get("filled") or 0.0))
+        if cumulative_fee > 0.0:
+            order["fee_cost"] = cumulative_fee
+            order["fee"] = {"cost": cumulative_fee, "currency": order.get("fee_currency") or self.settle_currency}
+        if matched:
+            order["fills"] = matched
+            order["filled_at"] = matched[-1].get("timestamp") or order.get("filled_at")
+        status = str(order.get("status") or "open").lower()
+        amount_base = float(order.get("amount_base_qty") or 0.0)
+        filled_base = float(order.get("filled_base_qty") or 0.0)
+        if status not in {"closed", "canceled"}:
+            if amount_base > 0.0 and filled_base > 0.0 and filled_base + 1e-12 < amount_base:
+                order["status"] = "partially_filled"
+            elif amount_base > 0.0 and filled_base >= amount_base - 1e-12:
+                order["status"] = "closed"
+        return order
 
     def normalize_ticker(self, ticker: dict[str, Any] | None) -> dict[str, Any]:
         payload = dict(ticker or {})
@@ -462,9 +586,38 @@ class LiveExecutionService:
     def normalize_order(self, order: dict[str, Any] | None) -> dict[str, Any]:
         payload = dict(order or {})
         fee = payload.get("fee") or {}
+        info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
+        contract_size = self._resolve_contract_size(
+            symbol=payload.get("symbol"),
+            payload=payload,
+            info=info,
+        )
+        amount = self._float_or_none(payload.get("amount"))
+        filled = self._float_or_none(payload.get("filled"))
+        remaining = self._float_or_none(payload.get("remaining"))
+        amount_base_qty = amount
+        filled_base_qty = filled
+        remaining_base_qty = remaining
+        if self.market_type == "swap" and contract_size and contract_size > 0:
+            if amount is not None:
+                amount_base_qty = float(amount) * float(contract_size)
+            if filled is not None:
+                filled_base_qty = float(filled) * float(contract_size)
+            if remaining is not None:
+                remaining_base_qty = float(remaining) * float(contract_size)
 
         acknowledged_at = self._extract_acknowledged_at(payload)
         filled_at = self._extract_filled_at(payload)
+
+        status = str(payload.get("status") or info.get("status") or "open").lower()
+        if status == "canceled":
+            status = "canceled"
+        elif status in {"closed", "filled", "finished"}:
+            status = "closed"
+        elif status in {"partially_filled", "partial-filled", "open"}:
+            status = "open" if not filled or remaining_base_qty else "partially_filled"
+        elif (filled_base_qty or 0.0) > 0 and (remaining_base_qty or 0.0) > 0:
+            status = "partially_filled"
 
         return {
             "id": str(payload.get("id") or ""),
@@ -472,35 +625,57 @@ class LiveExecutionService:
             "symbol": payload.get("symbol"),
             "type": payload.get("type"),
             "side": payload.get("side"),
-            "amount": self._float_or_none(payload.get("amount")),
-            "filled": self._float_or_none(payload.get("filled")),
-            "remaining": self._float_or_none(payload.get("remaining")),
+            "amount": amount,
+            "filled": filled,
+            "remaining": remaining,
+            "amount_base_qty": amount_base_qty,
+            "filled_base_qty": filled_base_qty,
+            "remaining_base_qty": remaining_base_qty,
             "price": self._float_or_none(payload.get("price")),
             "average": self._float_or_none(payload.get("average")),
-            "status": payload.get("status"),
-            "reduce_only": bool(payload.get("reduceOnly") or payload.get("reduce_only") or False),
+            "status": status,
+            "reduce_only": bool(payload.get("reduceOnly") or payload.get("reduce_only") or info.get("is_reduce_only") or False),
             "timestamp": self._iso_from_any(payload.get("datetime") or payload.get("timestamp")) or payload.get("datetime") or payload.get("timestamp"),
             "acknowledged_at": acknowledged_at,
             "filled_at": filled_at,
+            "fee": fee if isinstance(fee, dict) else {},
             "fee_cost": self._float_or_none(fee.get("cost")) if isinstance(fee, dict) else None,
             "fee_currency": fee.get("currency") if isinstance(fee, dict) else None,
+            "contract_size": contract_size,
             "raw": payload,
         }
 
     def normalize_position(self, position: dict[str, Any] | None) -> dict[str, Any]:
         payload = dict(position or {})
+        info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
+        contracts = self._float_or_none(payload.get("contracts") or info.get("size"))
+        contract_size = self._resolve_contract_size(
+            symbol=payload.get("symbol"),
+            payload=payload,
+            info=info,
+        )
+        side = payload.get("side")
+        if not side and contracts is not None:
+            if float(contracts) > 0:
+                side = "long"
+            elif float(contracts) < 0:
+                side = "short"
+        base_qty = None
+        if contracts is not None:
+            base_qty = abs(float(contracts)) * float(contract_size or 1.0)
         return {
             "symbol": payload.get("symbol"),
-            "side": payload.get("side"),
-            "contracts": self._float_or_none(payload.get("contracts")),
-            "contract_size": self._float_or_none(payload.get("contractSize")),
-            "entry_price": self._float_or_none(payload.get("entryPrice")),
-            "mark_price": self._float_or_none(payload.get("markPrice")),
-            "notional": self._float_or_none(payload.get("notional")),
-            "leverage": self._float_or_none(payload.get("leverage")),
-            "margin_mode": payload.get("marginMode"),
-            "unrealized_pnl": self._float_or_none(payload.get("unrealizedPnl")),
-            "liquidation_price": self._float_or_none(payload.get("liquidationPrice")),
+            "side": side,
+            "contracts": abs(float(contracts)) if contracts is not None else None,
+            "contract_size": contract_size,
+            "base_qty": base_qty,
+            "entry_price": self._float_or_none(payload.get("entryPrice") or info.get("entry_price")),
+            "mark_price": self._float_or_none(payload.get("markPrice") or info.get("mark_price")),
+            "notional": self._float_or_none(payload.get("notional") or payload.get("collateral")),
+            "leverage": self._float_or_none(payload.get("leverage") or info.get("leverage")),
+            "margin_mode": payload.get("marginMode") or info.get("margin_mode") or info.get("pos_margin_mode"),
+            "unrealized_pnl": self._float_or_none(payload.get("unrealizedPnl") or info.get("unrealised_pnl")),
+            "liquidation_price": self._float_or_none(payload.get("liquidationPrice") or info.get("liq_price")),
             "raw": payload,
         }
 
@@ -510,7 +685,64 @@ class LiveExecutionService:
             fee_cost = self._float_or_none(fee.get("cost"))
             if fee_cost is not None:
                 return fee_cost
+
+        fee_cost = self._float_or_none(order.get("fee_cost"))
+        if fee_cost is not None:
+            return fee_cost
+
+        raw = dict(order.get("raw") or {})
+        info = raw.get("info") if isinstance(raw.get("info"), dict) else {}
+        cost = self._float_or_none(raw.get("cost") or order.get("cost"))
+        fill_price = self._float_or_none(info.get("fill_price") or raw.get("average") or raw.get("price") or order.get("average") or order.get("price"))
+        filled_contracts = self._float_or_none(raw.get("filled") or order.get("filled") or raw.get("amount") or order.get("amount"))
+        contract_size = self._float_or_none(order.get("contract_size") or raw.get("contractSize") or info.get("quanto_multiplier") or info.get("contract_size"))
+        taker_rate = self._float_or_none(info.get("tkfr"))
+        maker_rate = self._float_or_none(info.get("mkfr"))
+        rate = taker_rate if taker_rate is not None else maker_rate
+        if rate is None:
+            rate = self._float_or_none(info.get("fee_rate"))
+        if rate is not None:
+            if cost is None and fill_price is not None and filled_contracts is not None:
+                multiplier = float(contract_size or 1.0) if self.market_type == "swap" else 1.0
+                cost = abs(float(fill_price) * float(filled_contracts) * multiplier)
+            if cost is not None:
+                return abs(float(cost) * float(rate))
         return 0.0
+
+    def normalize_trade(self, trade: dict[str, Any] | None) -> dict[str, Any]:
+        payload = dict(trade or {})
+        fee = payload.get("fee") or {}
+        info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
+        contract_size = self._resolve_contract_size(
+            symbol=payload.get("symbol"),
+            payload=payload,
+            info=info,
+        )
+        amount = self._float_or_none(payload.get("amount"))
+        base_qty = amount
+        if self.market_type == "swap" and amount is not None:
+            base_qty = float(amount) * float(contract_size or 1.0)
+        fee_cost = self._float_or_none(fee.get("cost")) if isinstance(fee, dict) else None
+        if fee_cost is None:
+            fee_cost = self._extract_fee_cost({"fee": fee, "raw": payload, "contract_size": contract_size, "filled": amount, "average": payload.get("price")})
+        trade_id = payload.get("id") or info.get("id") or info.get("trade_id")
+        order_id = payload.get("order") or payload.get("orderId") or info.get("order_id") or info.get("order")
+        return {
+            "id": str(trade_id or ""),
+            "order_id": str(order_id or ""),
+            "client_order_id": payload.get("clientOrderId") or info.get("text"),
+            "symbol": payload.get("symbol"),
+            "side": str(payload.get("side") or "").lower() or None,
+            "price": self._float_or_none(payload.get("price")),
+            "amount": amount,
+            "base_qty": base_qty,
+            "cost": self._float_or_none(payload.get("cost")),
+            "timestamp": self._iso_from_any(payload.get("datetime") or payload.get("timestamp") or info.get("create_time") or info.get("finish_time")),
+            "fee_cost": fee_cost,
+            "fee_currency": fee.get("currency") if isinstance(fee, dict) else None,
+            "contract_size": contract_size,
+            "raw": payload,
+        }
 
     def set_armed(self, armed: bool) -> None:
         self.armed = bool(armed)
