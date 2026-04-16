@@ -150,6 +150,11 @@ class StartBody(BaseModel):
 class DevActionBody(BaseModel):
     price: float | None = None
     note: str | None = None
+
+
+class LiveForceExitBody(BaseModel):
+    confirm: bool = False
+    note: str | None = None
     
 
 @router.post("/mode")
@@ -186,6 +191,16 @@ async def start(body: StartBody = StartBody()):
 async def stop():
     try:
         return await mode_controller.stop()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+
+
+@router.post("/live/force-exit")
+async def force_live_exit(body: LiveForceExitBody = LiveForceExitBody()):
+    try:
+        return await mode_controller.force_live_exit(confirm=body.confirm, note=body.note)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 

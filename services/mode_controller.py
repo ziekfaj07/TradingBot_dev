@@ -1224,6 +1224,146 @@ class ModeController:
             )
             return self.status()
 
+    async def force_live_exit(self, *, confirm: bool = False, note: str | None = None) -> dict:
+        if not confirm:
+            raise RuntimeError("Force exit confirmation required.")
+
+        async with self._lock:
+            if self._status.mode != Mode.LIVE:
+                raise RuntimeError("Live force exit is only available in live mode.")
+
+            if self._status.state in (EngineState.STARTING, EngineState.STOPPING):
+                raise RuntimeError("Wait for the engine transition to finish first.")
+
+            cfg = self._status.config
+            if not cfg.enable_live_trading:
+                raise RuntimeError("Live trading is disabled in the current configuration.")
+            if cfg.live_dry_run:
+                raise RuntimeError("Live force exit is unavailable while live_dry_run=true.")
+
+            if self._live_execution is None:
+                self._build_live_service_locked(armed=False)
+
+        await self._sync_live_account(force=True)
+
+        async with self._lock:
+            cfg = self._status.config
+            current_side = self._live_position_side_locked()
+            current_qty = self._live_position_qty_locked()
+
+            if current_side not in {"long", "short"} or current_qty <= 0.0:
+                raise RuntimeError("No open live position to force exit.")
+
+            order_side = "sell" if current_side == "long" else "buy"
+
+            market_price = None
+            if self._latest_bar and self._latest_bar.get("close") is not None:
+                try:
+                    market_price = float(self._latest_bar.get("close"))
+                except (TypeError, ValueError):
+                    market_price = None
+            if market_price is None:
+                for position in self._live_positions or []:
+                    side = str(position.get("side") or "").strip().lower()
+                    if current_side == "long" and side not in {"long", "buy"}:
+                        continue
+                    if current_side == "short" and side not in {"short", "sell"}:
+                        continue
+                    for key in ("mark_price", "entry_price"):
+                        try:
+                            value = float(position.get(key) or 0.0)
+                        except (TypeError, ValueError):
+                            value = 0.0
+                        if value > 0.0:
+                            market_price = value
+                            break
+                    if market_price is not None:
+                        break
+            if market_price is None:
+                raise RuntimeError("No live market price available for force exit.")
+
+            live_execution = self._live_execution
+            if live_execution is not None and live_execution.can_submit_live_orders:
+                submitter = live_execution
+            else:
+                submitter = LiveExecutionService(
+                    exchange_name=cfg.exchange_name,
+                    market_type=cfg.market_type,
+                    testnet=cfg.exchange_testnet,
+                    settle_currency=str(cfg.exchange_settle_currency or "USDT").upper(),
+                    api_key_env=cfg.exchange_api_key_env,
+                    api_secret_env=cfg.exchange_api_secret_env,
+                    api_passphrase_env=cfg.exchange_api_passphrase_env,
+                    live_api_key_env=cfg.exchange_live_api_key_env,
+                    live_api_secret_env=cfg.exchange_live_api_secret_env,
+                    live_api_passphrase_env=cfg.exchange_live_api_passphrase_env,
+                    demo_api_key_env=cfg.exchange_demo_api_key_env,
+                    demo_api_secret_env=cfg.exchange_demo_api_secret_env,
+                    demo_api_passphrase_env=cfg.exchange_demo_api_passphrase_env,
+                    client_order_id_prefix=cfg.client_order_id_prefix,
+                    armed=True,
+                    dry_run=False,
+                )
+
+            client_order_id = self._build_live_client_order_id(side=order_side, reduce_only=True)
+            self._validate_live_position_mode_locked()
+
+            result = await asyncio.to_thread(
+                submitter.submit_order,
+                symbol=cfg.symbol,
+                side=order_side,
+                qty=float(current_qty),
+                order_type="market",
+                price=None,
+                reduce_only=True,
+                client_order_id=client_order_id,
+            )
+
+            self._register_live_order_locked(
+                order=result.order,
+                requested_qty=float(current_qty),
+                requested_side=order_side,
+                reduce_only=True,
+                fill_type="EXIT",
+            )
+
+            fill = submitter.fill_from_order(
+                order=result.order,
+                fill_type="EXIT",
+                market_price=float(market_price),
+                trade_id=(self._trade_id if self._trade_id > 0 else None),
+                expected_price=float(market_price),
+                expected_qty=float(current_qty),
+            )
+
+            await self._apply_live_fill_to_shadow_state_locked(
+                fill=fill,
+                processed_ts=self._last_processed_bar_ts,
+                market_price=float(market_price),
+            )
+            await self._append_fill(fill)
+
+            self._persist_status()
+            self._persist_snapshot()
+
+            await self._broadcast_trace_event(
+                "live_force_exit",
+                note=note or "Manual live force exit executed.",
+                data={
+                    "run_id": self._status.run_id,
+                    "symbol": cfg.symbol,
+                    "position_side": current_side,
+                    "position_qty": float(current_qty),
+                    "side": order_side,
+                    "reduce_only": True,
+                    "order": result.order,
+                },
+            )
+
+        await self._sync_live_account(force=True)
+        await self._broadcast_runtime_update()
+        return self.status()
+
     async def flatten_position(self, price: float | None = None, note: str | None = None) -> dict:
         async with self._lock:
             self._ensure_manual_paper_runtime_locked()

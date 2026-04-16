@@ -59,6 +59,34 @@ window.uiController = {
     };
   },
 
+
+  _currentLivePositionInfo(data) {
+    const positions = data?.runtime?.live?.positions || [];
+    for (const position of positions) {
+      const rawSide = String(position?.side || "").toLowerCase();
+      const side = rawSide === "sell" ? "short" : rawSide === "buy" ? "long" : rawSide;
+      const qty = Number(position?.base_qty || 0);
+      if (qty > 0 && (side === "long" || side === "short")) {
+        return { side, qty };
+      }
+    }
+    return null;
+  },
+
+  updateForceExitButton(data) {
+    const btn = qs("forceExitBtn");
+    if (!btn) return;
+
+    const isLiveMode = String(data?.mode || "").toLowerCase() === "live";
+    const position = this._currentLivePositionInfo(data);
+    const canForceExit = isLiveMode && !!position;
+
+    btn.disabled = !canForceExit;
+    btn.title = canForceExit
+      ? `Force-exit ${position.side} position (${fmtNum(position.qty)} units) with a reduce-only market order.`
+      : "No open live position to force exit.";
+  },
+
   renderStatus(data) {
     state.latestStatus = data;
 
@@ -102,6 +130,8 @@ window.uiController = {
       runtime.chart_symbol || data?.config?.symbol || "-";
     qs("chartIntervalView").textContent =
       runtime.chart_interval || data?.config?.interval || "-";
+
+    this.updateForceExitButton(data);
 
     if (paper.equity !== null && paper.equity !== undefined) {
       equityModule.push(paper.equity);
@@ -151,6 +181,31 @@ window.uiController = {
     } catch (err) {
       console.error(err);
       this.setActionMessage(`Stop failed: ${err.message}`, "bad");
+    }
+  },
+
+  async forceExitLive() {
+    const data = state.latestStatus || {};
+    const position = this._currentLivePositionInfo(data);
+    if (!position) {
+      this.setActionMessage("No open live position to force exit.", "warn");
+      return;
+    }
+
+    const ok = window.confirm(
+      `Force-exit the current ${position.side.toUpperCase()} live position of ${fmtNum(position.qty)} units with a reduce-only market order? This sends a real order immediately.`
+    );
+    if (!ok) return;
+
+    try {
+      const response = await api.forceLiveExit(`Manual force exit from dashboard (${position.side})`);
+      this.renderStatus(response);
+      await fillsModule.load();
+      await chartModule.loadBootstrap(true);
+      this.setActionMessage(`Force exit submitted for ${position.side} live position.`, "warn");
+    } catch (err) {
+      console.error(err);
+      this.setActionMessage(`Force exit failed: ${err.message}`, "bad");
     }
   },
 
@@ -244,6 +299,7 @@ window.uiController = {
     qs("configureBtn")?.addEventListener("click", () => this.configureBot());
     qs("startBtn")?.addEventListener("click", () => this.startBot());
     qs("stopBtn")?.addEventListener("click", () => this.stopBot());
+    qs("forceExitBtn")?.addEventListener("click", () => this.forceExitLive());
     qs("refreshStatusBtn")?.addEventListener("click", () => this.loadStatus());
     qs("showFillsBtn")?.addEventListener("click", () => fillsModule.load());
     qs("resetPaperBtn")?.addEventListener("click", () => this.resetPaper());

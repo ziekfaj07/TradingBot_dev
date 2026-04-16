@@ -75,6 +75,13 @@ window.api = {
     return await this.request("/api/run/paper/reset", { method: "POST" });
   },
 
+  async forceLiveExit(note = "") {
+    return await this.request("/api/run/live/force-exit", {
+      method: "POST",
+      body: JSON.stringify({ confirm: true, note }),
+    });
+  },
+
   async getFills(limit = 25, offset = 0) {
     return await this.request(`/api/run/paper/fills?limit=${limit}&offset=${offset}`);
   },
