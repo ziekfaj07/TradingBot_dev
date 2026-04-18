@@ -89,16 +89,37 @@ class LiveExecutionService:
             api_passphrase_env=self.resolved_api_passphrase_env,
         )
 
+        self.last_risk_preflight: dict[str, Any] | None = None        
+
     @property
     def can_submit_live_orders(self) -> bool:
         return self.armed and not self.dry_run
 
-    def sync_account(self, *, symbol: str) -> dict[str, Any]:
+    def sync_account(
+            self,
+            *,
+            symbol: str,
+            include_recent_trades: bool = False,
+            trades_since_ms: int | None = None,
+            trades_limit: int = 100,
+    ) -> dict[str, Any]:
         normalized_symbol = self.adapter.normalize_symbol(symbol)
         ticker = self.adapter.fetch_ticker(normalized_symbol)
         balance = self.adapter.fetch_balance()
         open_orders = self.adapter.fetch_open_orders(normalized_symbol)
         positions: list[dict[str, Any]] = []
+
+        recent_trades: list[dict[str, Any]] = []
+        if include_recent_trades:
+            try:
+                recent_trades = self.fetch_recent_trades(
+                    symbol=normalized_symbol,
+                    since_ms=trades_since_ms,
+                    limit=trades_limit,
+                )
+            except Exception:
+                recent_trades = []
+
         if self.market_type == "swap":
             positions = self.adapter.fetch_positions(normalized_symbol)
         return {
@@ -118,8 +139,8 @@ class LiveExecutionService:
             "synced_at": datetime.now(timezone.utc).isoformat(),
             "armed": self.armed,
             "dry_run": self.dry_run,
+            "recent_trades": recent_trades,            
         }
-
 
     def fetch_recent_trades(
         self,
@@ -146,6 +167,119 @@ class LiveExecutionService:
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _normalize_margin_mode(value: Any) -> str | None:
+        text = str(value or "").strip().lower()
+        if text in {"cross", "isolated"}:
+            return text
+        return None
+
+    def _extract_margin_mode(self, payload: dict[str, Any] | None) -> str | None:
+        raw = dict(payload or {})
+        info = raw.get("info") if isinstance(raw.get("info"), dict) else {}
+        for candidate in (
+            raw.get("marginMode"),
+            raw.get("margin_mode"),
+            info.get("margin_mode"),
+            info.get("marginMode"),
+            info.get("pos_margin_mode"),
+        ):
+            normalized = self._normalize_margin_mode(candidate)
+            if normalized:
+                return normalized
+        return None
+
+    def _extract_leverage(self, payload: dict[str, Any] | None) -> float | None:
+        raw = dict(payload or {})
+        info = raw.get("info") if isinstance(raw.get("info"), dict) else {}
+        for candidate in (
+            raw.get("leverage"),
+            raw.get("lever"),
+            raw.get("longLeverage"),
+            raw.get("shortLeverage"),
+            info.get("lever"),
+            info.get("leverage"),
+            info.get("long_leverage"),
+            info.get("short_leverage"),
+        ):
+            lev = self._float_or_none(candidate)
+            if lev is not None and lev > 0.0:
+                return float(lev)
+        return None
+
+    def prepare_entry_risk_settings(
+        self,
+        *,
+        symbol: str,
+        leverage: float | None,
+        margin_mode: str | None,
+    ) -> dict[str, Any]:
+        normalized_symbol = self.adapter.normalize_symbol(symbol)
+        configured_margin_mode = self._normalize_margin_mode(margin_mode) or "cross"
+        configured_leverage = self._float_or_none(leverage)
+        if self.market_type != "swap" or configured_leverage is None:
+            result = {
+                "symbol": normalized_symbol,
+                "market_type": self.market_type,
+                "configured_margin_mode": configured_margin_mode,
+                "configured_leverage": configured_leverage,
+                "exchange_margin_mode": None,
+                "exchange_leverage": None,
+                "margin_mode_match": None,
+                "leverage_match": None,
+                "verified": False,
+                "source": None,
+            }
+            self.last_risk_preflight = result
+            return result
+
+        configured_leverage = max(1.0, float(configured_leverage))
+        margin_result = self.adapter.set_margin_mode(
+            margin_mode=configured_margin_mode,
+            symbol=normalized_symbol,
+            leverage=configured_leverage,
+        )
+        leverage_result = self.adapter.set_leverage(
+            leverage=configured_leverage,
+            symbol=normalized_symbol,
+            margin_mode=configured_margin_mode,
+        )
+
+        verified = self.adapter.fetch_effective_leverage(
+            symbol=normalized_symbol,
+            margin_mode=configured_margin_mode,
+        )
+        exchange_margin_mode = self._extract_margin_mode(verified) or self._normalize_margin_mode(verified.get("margin_mode"))
+        exchange_leverage = self._extract_leverage(verified) or self._float_or_none(verified.get("leverage"))
+        margin_mode_match = exchange_margin_mode == configured_margin_mode if exchange_margin_mode is not None else None
+        leverage_match = (
+            exchange_leverage is not None and abs(float(exchange_leverage) - float(configured_leverage)) <= 1e-9
+        )
+
+        result = {
+            "symbol": normalized_symbol,
+            "market_type": self.market_type,
+            "configured_margin_mode": configured_margin_mode,
+            "configured_leverage": float(configured_leverage),
+            "exchange_margin_mode": exchange_margin_mode,
+            "exchange_leverage": exchange_leverage,
+            "margin_mode_match": margin_mode_match,
+            "leverage_match": leverage_match,
+            "verified": bool(margin_mode_match and leverage_match),
+            "source": verified.get("source") if isinstance(verified, dict) else None,
+            "raw": verified.get("raw") if isinstance(verified, dict) else verified,
+            "margin_set_result": margin_result,
+            "leverage_set_result": leverage_result,
+        }
+        self.last_risk_preflight = result
+        if not result["verified"]:
+            raise ExchangeConfigurationError(
+                "Live leverage verification failed for "
+                f"{normalized_symbol}: configured margin_mode={configured_margin_mode}, leverage={configured_leverage}, "
+                f"exchange margin_mode={exchange_margin_mode}, leverage={exchange_leverage}"
+            )
+        return result
 
     @staticmethod
     def _to_epoch_ms(value: Any) -> int | None:
@@ -251,7 +385,6 @@ class LiveExecutionService:
         raw = raw.lstrip("-")
         return f"t-{raw}"
 
-
     def _contract_size_for_symbol(self, symbol: str) -> float | None:
         try:
             return self.adapter.contract_size_for_symbol(symbol)
@@ -301,6 +434,8 @@ class LiveExecutionService:
         price: float | None = None,
         reduce_only: bool = False,
         client_order_id: str | None = None,
+        leverage: float | None = None,
+        margin_mode: str | None = None,
     ) -> LiveOrderResult:
         normalized_symbol = self.adapter.normalize_symbol(symbol)
         normalized_side = str(side or "buy").strip().lower()
@@ -322,6 +457,19 @@ class LiveExecutionService:
             params["reduce_only"] = True
 
         if not self.can_submit_live_orders:
+            self.last_risk_preflight = {
+                "symbol": normalized_symbol,
+                "market_type": self.market_type,
+                "configured_margin_mode": self._normalize_margin_mode(margin_mode),
+                "configured_leverage": self._float_or_none(leverage),
+                "exchange_margin_mode": None,
+                "exchange_leverage": None,
+                "margin_mode_match": None,
+                "leverage_match": None,
+                "verified": False,
+                "source": "dry_run",
+            }
+
             fake_now = datetime.now(timezone.utc).isoformat()
             fake_order = {
                 "id": f"dryrun-{int(datetime.now(timezone.utc).timestamp() * 1000)}",
@@ -357,6 +505,13 @@ class LiveExecutionService:
                 submitted_at=submitted_at,
                 acknowledged_at=fake_now,
                 filled_at=fake_now,
+            )
+
+        if self.market_type == "swap" and not reduce_only:
+            self.prepare_entry_risk_settings(
+                symbol=normalized_symbol,
+                leverage=leverage,
+                margin_mode=margin_mode,
             )
 
         created = self.adapter.create_order(
@@ -672,8 +827,8 @@ class LiveExecutionService:
             "entry_price": self._float_or_none(payload.get("entryPrice") or info.get("entry_price")),
             "mark_price": self._float_or_none(payload.get("markPrice") or info.get("mark_price")),
             "notional": self._float_or_none(payload.get("notional") or payload.get("collateral")),
-            "leverage": self._float_or_none(payload.get("leverage") or info.get("leverage")),
-            "margin_mode": payload.get("marginMode") or info.get("margin_mode") or info.get("pos_margin_mode"),
+            "leverage": self._extract_leverage(payload),
+            "margin_mode": self._extract_margin_mode(payload),
             "unrealized_pnl": self._float_or_none(payload.get("unrealizedPnl") or info.get("unrealised_pnl")),
             "liquidation_price": self._float_or_none(payload.get("liquidationPrice") or info.get("liq_price")),
             "raw": payload,
@@ -783,12 +938,3 @@ class LiveExecutionService:
             "symbol": normalized_symbol,
             "canceled": canceled,
         }
-
-    @staticmethod
-    def _float_or_none(value: Any) -> float | None:
-        try:
-            if value is None:
-                return None
-            return float(value)
-        except (TypeError, ValueError):
-            return None

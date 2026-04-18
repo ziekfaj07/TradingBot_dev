@@ -100,6 +100,9 @@ class ConfigureBody(BaseModel):
     client_order_id_prefix: str | None = None
     live_poll_seconds: float | None = None
 
+    recover_live_state_on_start: bool | None = None
+    live_reconcile_lookback_minutes: int | None = None
+
     @model_validator(mode="after")
     def validate_strategy_block(self) -> "ConfigureBody":
         if self.strategy_name is None and self.strategy_params:
@@ -193,8 +196,6 @@ async def stop():
         return await mode_controller.stop()
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-
-
 
 
 @router.post("/live/force-exit")

@@ -149,6 +149,9 @@ class RunConfig:
     client_order_id_prefix: str = "tb"
     live_poll_seconds: float = 3.0
 
+    recover_live_state_on_start: bool = True
+    live_reconcile_lookback_minutes: int = 240    
+
 
 @dataclass
 class RunStatus:
@@ -212,6 +215,13 @@ class ModeController:
         self._live_start_equity: float | None = None        
         self._live_last_sync_at: str | None = None
         self._live_last_sync_error: str | None = None
+        self._live_recovery_performed: bool = False
+        self._live_recovered_from_exchange_at: str | None = None
+        self._live_recovery_summary: dict[str, Any] | None = None        
+        self._live_exchange_leverage: float | None = None
+        self._live_exchange_margin_mode: str | None = None
+        self._live_leverage_match: bool | None = None
+        self._live_margin_mode_match: bool | None = None
 
         init_runtime_db()
         self._restore_paper_session()
@@ -463,8 +473,9 @@ class ModeController:
             self._persist_status()
             self._persist_snapshot()
 
-        if self._status.mode == Mode.LIVE and self._status.config.sync_positions_on_start:
-            await self._sync_live_account(force=True)
+        if self._status.mode == Mode.LIVE:
+            if self._status.config.sync_positions_on_start or self._status.config.recover_live_state_on_start:
+                await self._recover_live_state_from_exchange(force=True)            
 
         async with self._lock:
             self._task = asyncio.create_task(self._run_loop())
@@ -852,7 +863,16 @@ class ModeController:
                 "order_registry": list(self._live_order_registry.values())[-50:],
                 "private_stream_connected": self._live_private_stream_connected,
                 "position_mode": (self._live_balance or {}).get("position_mode") if isinstance(self._live_balance, dict) else None,
-                "execution": self._build_live_execution_summary(),                
+                "recovery_performed": self._live_recovery_performed,
+                "recovered_from_exchange_at": self._live_recovered_from_exchange_at,
+                "recovery_summary": self._live_recovery_summary,
+                "configured_leverage": self._status.config.leverage,
+                "exchange_leverage": self._live_exchange_leverage,
+                "leverage_match": self._live_leverage_match,
+                "configured_margin_mode": self._status.config.margin_mode,
+                "exchange_margin_mode": self._live_exchange_margin_mode,
+                "margin_mode_match": self._live_margin_mode_match,                
+                "execution": self._build_live_execution_summary(),
             },
         }
 
@@ -1948,6 +1968,13 @@ class ModeController:
         self._live_private_stream_connected = False
         self._live_last_sync_at = None
         self._live_last_sync_error = None
+        self._live_recovery_performed = False
+        self._live_recovered_from_exchange_at = None
+        self._live_recovery_summary = None
+        self._live_exchange_leverage = None
+        self._live_exchange_margin_mode = None
+        self._live_leverage_match = None
+        self._live_margin_mode_match = None
         self._reset_risk_runtime_locked()
 
     def _build_runtime_objects(self) -> None:
@@ -2049,15 +2076,29 @@ class ModeController:
             )
 
             async with self._lock:
+                before = self._capture_live_exposure_signature_locked()                
                 self._live_balance = dict(snapshot.get("balance") or {})
                 self._live_balance["position_mode"] = snapshot.get("position_mode")
                 self._live_open_orders = list(snapshot.get("open_orders") or [])
                 self._live_positions = list(snapshot.get("positions") or [])
                 self._live_last_sync_at = snapshot.get("synced_at")
                 self._live_last_sync_error = None
+                orphan_count = self._import_orphan_live_open_orders_locked()                
                 self._merge_live_open_orders_into_registry_locked()
                 await self._reconcile_live_orders_locked(force=force)
                 self._sync_shadow_state_from_live_account_locked()
+                self._refresh_live_leverage_status_locked()
+                after = self._capture_live_exposure_signature_locked()
+                transition = self._describe_live_exposure_transition_locked(before, after)
+                self._live_recovery_summary = {
+                    "symbol": cfg.symbol,
+                    "open_order_count": len(self._live_open_orders),
+                    "position_count": len(self._live_positions),
+                    "orphan_open_orders_imported": orphan_count,
+                    "transition": transition,
+                    "last_sync_mode": "regular",
+                }
+                self._rebuild_trade_identity_from_live_position_locked()                
 
                 await self._check_live_max_loss_kill_switch()                
 
@@ -2116,6 +2157,190 @@ class ModeController:
                         "error": str(e),
                     },
                 )
+
+    def _capture_live_exposure_signature_locked(self) -> dict[str, Any]:
+        side = None
+        qty = 0.0
+        entry_price = None
+
+        if self._state is not None and float(self._state.position_qty or 0.0) > 0.0:
+            side = str(self._state.side or "").strip().lower() or None
+            qty = abs(float(self._state.position_qty or 0.0))
+            entry_price = self._state.entry_price
+
+        return {
+            "side": side,
+            "qty": float(qty),
+            "entry_price": entry_price,
+        }
+
+    def _primary_live_position_locked(self) -> dict[str, Any] | None:
+        best: dict[str, Any] | None = None
+        best_qty = 0.0
+
+        for position in self._live_positions or []:
+            try:
+                base_qty = abs(float(position.get("base_qty") or 0.0))
+            except (TypeError, ValueError):
+                base_qty = 0.0
+            if base_qty <= 0.0:
+                continue
+            if base_qty > best_qty:
+                best = position
+                best_qty = base_qty
+
+        return best
+
+    def _infer_live_registry_fill_type_locked(self, row: dict[str, Any]) -> str:
+        if bool(row.get("reduce_only")):
+            return "EXIT"
+        side = str(row.get("side") or "").strip().lower()
+        if side in {"buy", "sell"}:
+            return "ENTRY"
+        return "ENTRY"
+
+    def _import_orphan_live_open_orders_locked(self) -> int:
+        imported = 0
+        for row in self._live_open_orders or []:
+            order_id = str(row.get("id") or "")
+            if not order_id:
+                continue
+
+            registry = self._live_order_registry.get(order_id, {})
+            if not registry:
+                imported += 1
+
+            registry.update({
+                "order_id": order_id,
+                "client_order_id": row.get("client_order_id"),
+                "symbol": row.get("symbol"),
+                "requested_side": row.get("side"),
+                "reduce_only": bool(row.get("reduce_only") or False),
+                "fill_type": registry.get("fill_type") or self._infer_live_registry_fill_type_locked(row),
+                "requested_base_qty": float(
+                    row.get("amount_base_qty")
+                    or row.get("filled_base_qty")
+                    or registry.get("requested_base_qty")
+                    or 0.0
+                ),
+                "filled_base_qty": float(row.get("filled_base_qty") or 0.0),
+                "remaining_base_qty": float(row.get("remaining_base_qty") or 0.0),
+                "status": str(row.get("status") or registry.get("status") or "open"),
+                "submitted_at": row.get("submitted_at") or registry.get("submitted_at"),
+                "acknowledged_at": row.get("acknowledged_at") or registry.get("acknowledged_at"),
+                "filled_at": row.get("filled_at") or registry.get("filled_at"),
+                "avg_price": row.get("average") or row.get("price") or registry.get("avg_price"),
+                "fee_cost": float(row.get("fee_cost") or registry.get("fee_cost") or 0.0),
+                "contract_size": row.get("contract_size") or registry.get("contract_size"),
+                "recovered_from_exchange": True,
+                "raw_order": row,
+                "fills_seen": registry.get("fills_seen", []),
+            })
+            self._live_order_registry[order_id] = registry
+
+        return imported
+
+    def _rebuild_trade_identity_from_live_position_locked(self) -> dict[str, Any]:
+        summary = {
+            "recovered_position": False,
+            "active_trade_id": None,
+            "position_side": None,
+            "position_qty": 0.0,
+            "position_entry_price": None,
+        }
+
+        if self._state is None:
+            return summary
+
+        qty = abs(float(self._state.position_qty or 0.0))
+        if qty <= 0.0:
+            self._state.active_trade_id = None
+            self._position_peak_price = None
+            return summary
+
+        current_trade_id = int(self._trade_id or 0)
+        active_trade_id = getattr(self._state, "active_trade_id", None)
+
+        if active_trade_id is None:
+            current_trade_id += 1
+            self._trade_id = current_trade_id
+            self._state.active_trade_id = current_trade_id
+        else:
+            self._trade_id = max(current_trade_id, int(active_trade_id))
+
+        mark_ref = self._latest_bar.get("close") if isinstance(self._latest_bar, dict) else None
+        try:
+            self._position_peak_price = float(mark_ref or self._state.entry_price or 0.0) or None
+        except Exception:
+            self._position_peak_price = self._state.entry_price
+
+        summary.update({
+            "recovered_position": True,
+            "active_trade_id": self._state.active_trade_id,
+            "position_side": self._state.side,
+            "position_qty": qty,
+            "position_entry_price": self._state.entry_price,
+        })
+        return summary
+
+    def _describe_live_exposure_transition_locked(
+        self,
+        before: dict[str, Any],
+        after: dict[str, Any],
+    ) -> dict[str, Any]:
+        before_side = str(before.get("side") or "")
+        after_side = str(after.get("side") or "")
+        before_qty = float(before.get("qty") or 0.0)
+        after_qty = float(after.get("qty") or 0.0)
+
+        if before_qty <= 0.0 and after_qty <= 0.0:
+            return {"transition": "flat_to_flat"}
+
+        if before_qty <= 0.0 and after_qty > 0.0:
+            return {"transition": "flat_to_open", "side": after_side, "qty": after_qty}
+
+        if before_qty > 0.0 and after_qty <= 0.0:
+            return {"transition": "open_to_flat", "side": before_side, "qty": before_qty}
+
+        if before_side != after_side:
+            return {
+                "transition": "side_flip",
+                "from_side": before_side,
+                "to_side": after_side,
+                "from_qty": before_qty,
+                "to_qty": after_qty,
+            }
+
+        if after_qty < before_qty:
+            return {
+                "transition": "partial_reduce",
+                "side": after_side,
+                "from_qty": before_qty,
+                "to_qty": after_qty,
+                "delta_qty": before_qty - after_qty,
+            }
+
+        if after_qty > before_qty:
+            return {
+                "transition": "scale_in",
+                "side": after_side,
+                "from_qty": before_qty,
+                "to_qty": after_qty,
+                "delta_qty": after_qty - before_qty,
+            }
+
+        entry_before = before.get("entry_price")
+        entry_after = after.get("entry_price")
+        if entry_before != entry_after:
+            return {
+                "transition": "entry_price_changed",
+                "side": after_side,
+                "qty": after_qty,
+                "from_entry_price": entry_before,
+                "to_entry_price": entry_after,
+            }
+
+        return {"transition": "unchanged"}
 
     def _live_position_side_locked(self) -> str | None:
         if self._state is not None and float(self._state.position_qty or 0.0) > 0.0:
@@ -2353,6 +2578,53 @@ class ModeController:
                 fill.equity_after = float(self._state.equity or 0.0)
             return
 
+    def _refresh_live_leverage_status_locked(self) -> None:
+        configured_leverage = None
+        try:
+            configured_leverage = float(self._status.config.leverage or 1.0)
+        except Exception:
+            configured_leverage = None
+        configured_margin_mode = str(getattr(self._status.config, "margin_mode", "cross") or "cross").strip().lower()
+
+        exchange_leverage = None
+        exchange_margin_mode = None
+
+        primary = self._primary_live_position_locked()
+        if isinstance(primary, dict):
+            try:
+                value = primary.get("leverage")
+                if value is not None:
+                    exchange_leverage = float(value)
+            except Exception:
+                exchange_leverage = None
+            raw_mode = primary.get("margin_mode")
+            if raw_mode is not None:
+                exchange_margin_mode = str(raw_mode).strip().lower() or None
+
+        if exchange_margin_mode is None or exchange_leverage is None:
+            preflight = getattr(self._live_execution, "last_risk_preflight", None) if self._live_execution is not None else None
+            if isinstance(preflight, dict):
+                raw_mode = preflight.get("exchange_margin_mode")
+                if raw_mode is not None:
+                    exchange_margin_mode = str(raw_mode).strip().lower() or None
+                try:
+                    raw_lev = preflight.get("exchange_leverage")
+                    if raw_lev is not None:
+                        exchange_leverage = float(raw_lev)
+                except Exception:
+                    pass
+
+        self._live_exchange_leverage = exchange_leverage
+        self._live_exchange_margin_mode = exchange_margin_mode
+        self._live_leverage_match = (
+            None
+            if configured_leverage is None or exchange_leverage is None
+            else abs(float(configured_leverage) - float(exchange_leverage)) <= 1e-9
+        )
+        self._live_margin_mode_match = (
+            None if exchange_margin_mode is None else exchange_margin_mode == configured_margin_mode
+        )
+
     def _validate_live_position_mode_locked(self) -> None:
         if self._status.config.market_type != "swap" or self._live_execution is None:
             return
@@ -2392,16 +2664,40 @@ class ModeController:
         )
         self._validate_live_position_mode_locked()
 
-        result = await asyncio.to_thread(
-            live_execution.submit_order,
-            symbol=self._status.config.symbol,
-            side=side,
-            qty=float(qty),
-            order_type="market",
-            price=None,
-            reduce_only=reduce_only,
-            client_order_id=client_order_id,
-        )
+        try:
+            result = await asyncio.to_thread(
+                live_execution.submit_order,
+                symbol=self._status.config.symbol,
+                side=side,
+                qty=float(qty),
+                order_type="market",
+                price=None,
+                reduce_only=reduce_only,
+                client_order_id=client_order_id,
+                leverage=self._status.config.leverage,
+                margin_mode=self._status.config.margin_mode,
+            )
+        except Exception as exc:
+            self._refresh_live_leverage_status_locked()
+            self._status.last_error = str(exc)
+            await self._broadcast_trace_event(
+                "live_order_risk_preflight_error",
+                note="Live leverage/margin verification blocked the order.",
+                data={
+                    "run_id": self._status.run_id,
+                    "symbol": self._status.config.symbol,
+                    "side": side,
+                    "reduce_only": bool(reduce_only),
+                    "configured_leverage": self._status.config.leverage,
+                    "exchange_leverage": self._live_exchange_leverage,
+                    "leverage_match": self._live_leverage_match,
+                    "configured_margin_mode": self._status.config.margin_mode,
+                    "exchange_margin_mode": self._live_exchange_margin_mode,
+                    "margin_mode_match": self._live_margin_mode_match,
+                    "error": str(exc),
+                },
+            )
+            raise        
 
         self._register_live_order_locked(
             order=result.order,
@@ -2427,6 +2723,7 @@ class ModeController:
         )
         await self._append_fill(fill)
 
+        self._refresh_live_leverage_status_locked()
         self._persist_status()
         self._persist_snapshot()
 
@@ -3281,23 +3578,13 @@ class ModeController:
         )
         return True
 
-
-    def _primary_live_position_locked(self) -> dict[str, Any] | None:
-        for position in self._live_positions or []:
-            try:
-                base_qty = abs(float(position.get("base_qty") or 0.0))
-            except (TypeError, ValueError):
-                base_qty = 0.0
-            if base_qty > 0.0:
-                return position
-        return None
-
     def _sync_shadow_state_from_live_account_locked(self) -> None:
         if self._state is None:
             return
 
         live_total = self._extract_live_total_equity(self._live_balance)
         primary = self._primary_live_position_locked()
+
         unrealized = 0.0
         if primary is not None:
             try:
@@ -3317,24 +3604,38 @@ class ModeController:
             self._state.entry_price = None
             self._state.side = None
             self._state.open_fee_paid = 0.0
+            self._state.active_trade_id = None
+            self._position_peak_price = None
             return
 
         try:
             self._state.position_qty = abs(float(primary.get("base_qty") or 0.0))
         except (TypeError, ValueError):
             self._state.position_qty = 0.0
+
         try:
-            self._state.entry_price = float(primary.get("entry_price")) if primary.get("entry_price") is not None else None
+            self._state.entry_price = (
+                float(primary.get("entry_price"))
+                if primary.get("entry_price") is not None
+                else None
+            )
         except (TypeError, ValueError):
             self._state.entry_price = None
+
         side = str(primary.get("side") or "").strip().lower()
         if side in {"buy", "long"}:
             self._state.side = "long"
         elif side in {"sell", "short"}:
             self._state.side = "short"
+        else:
+            self._state.side = None
+
         try:
-            # position-level realized pnl on Gate often carries open-entry fee for the active leg
-            self._state.open_fee_paid = abs(float((primary.get("raw") or {}).get("realizedPnl") or primary.get("raw", {}).get("realized_pnl") or 0.0))
+            self._state.open_fee_paid = abs(float(
+                (primary.get("raw") or {}).get("realizedPnl")
+                or (primary.get("raw") or {}).get("realized_pnl")
+                or 0.0
+            ))
         except Exception:
             pass
 
@@ -3435,5 +3736,127 @@ class ModeController:
                 },
             )
             
+    async def _recover_live_state_from_exchange(self, *, force: bool = False) -> None:
+        if self._status.mode != Mode.LIVE:
+            return
+
+        live_execution = self._live_execution
+        if live_execution is None:
+            return
+
+        cfg = self._status.config
+
+        try:
+            lookback_minutes = max(5, int(cfg.live_reconcile_lookback_minutes or 240))
+            since_ms = int(time.time() * 1000) - (lookback_minutes * 60 * 1000)
+
+            snapshot, recent_trades = await asyncio.gather(
+                asyncio.to_thread(
+                    live_execution.sync_account,
+                    symbol=cfg.symbol,
+                ),
+                asyncio.to_thread(
+                    live_execution.fetch_recent_trades,
+                    symbol=cfg.symbol,
+                    since_ms=since_ms,
+                    limit=200,
+                ),
+            )
+
+            async with self._lock:
+                before = self._capture_live_exposure_signature_locked()
+
+                self._live_balance = dict(snapshot.get("balance") or {})
+                self._live_balance["position_mode"] = snapshot.get("position_mode")
+                self._live_open_orders = list(snapshot.get("open_orders") or [])
+                self._live_positions = list(snapshot.get("positions") or [])
+                self._live_last_sync_at = snapshot.get("synced_at")
+                self._live_last_sync_error = None
+
+                orphan_count = self._import_orphan_live_open_orders_locked()
+                self._merge_live_open_orders_into_registry_locked()
+
+                for trade in recent_trades or []:
+                    fill_id = str(trade.get("id") or "")
+                    if fill_id:
+                        self._live_fill_id_set.add(fill_id)
+
+                if recent_trades:
+                    newest_trade_ms = 0
+                    for trade in recent_trades:
+                        ts = self._safe_int_value(trade.get("timestamp"), 0) or 0
+                        newest_trade_ms = max(newest_trade_ms, int(ts * 1000))
+                    if newest_trade_ms > 0:
+                        self._live_trade_since_ms = newest_trade_ms
+
+                await self._reconcile_live_orders_locked(force=True)
+                self._sync_shadow_state_from_live_account_locked()
+                self._refresh_live_leverage_status_locked()                
+                trade_identity = self._rebuild_trade_identity_from_live_position_locked()
+
+                ticker = dict(snapshot.get("ticker") or {})
+                last_price = ticker.get("last")
+                if last_price is not None:
+                    try:
+                        price_value = float(last_price)
+                        self._latest_bar = {
+                            "timestamp": snapshot.get("synced_at"),
+                            "open": price_value,
+                            "high": price_value,
+                            "low": price_value,
+                            "close": price_value,
+                            "volume": 0.0,
+                            "source": "live_recovery",
+                        }
+                        if self._state is not None:
+                            await self._mark_to_market(price_value)
+                    except (TypeError, ValueError):
+                        pass
+
+                after = self._capture_live_exposure_signature_locked()
+                transition = self._describe_live_exposure_transition_locked(before, after)
+
+                self._live_recovery_performed = True
+                self._live_recovered_from_exchange_at = snapshot.get("synced_at")
+                self._live_recovery_summary = {
+                    "symbol": cfg.symbol,
+                    "open_order_count": len(self._live_open_orders),
+                    "position_count": len(self._live_positions),
+                    "orphan_open_orders_imported": orphan_count,
+                    "recent_trade_count": len(recent_trades or []),
+                    "transition": transition,
+                    "trade_identity": trade_identity,
+                }
+
+                self._persist_status()
+                self._persist_snapshot()
+
+            await self._broadcast_runtime_update()
+            await self._broadcast_trace_event(
+                "live_state_recovered",
+                data={
+                    "run_id": self._status.run_id,
+                    "symbol": cfg.symbol,
+                    "summary": self._live_recovery_summary,
+                    "synced_at": self._live_recovered_from_exchange_at,
+                },
+            )
+
+        except Exception as e:
+            async with self._lock:
+                self._live_last_sync_error = str(e)
+                self._persist_status()
+                self._persist_snapshot()
+
+            if force:
+                await self._broadcast_trace_event(
+                    "live_state_recovery_error",
+                    data={
+                        "run_id": self._status.run_id,
+                        "symbol": cfg.symbol,
+                        "error": str(e),
+                    },
+                )
+
 
 mode_controller = ModeController()

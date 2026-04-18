@@ -129,6 +129,15 @@ class GateIOAdapter:
             return f"gateio-{self.market_type}-testnet"
         return f"gateio-{self.market_type}-live"
 
+    @staticmethod
+    def _safe_float(value: Any) -> float | None:
+        try:
+            if value is None or value == "":
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
     def describe(self) -> dict[str, Any]:
         return {
             "exchange_id": self.exchange_id,
@@ -274,7 +283,6 @@ class GateIOAdapter:
         except Exception as exc:
             raise ExchangeConnectionError(str(exc)) from exc
 
-
     def market_info(self, symbol: str) -> dict[str, Any]:
         normalized_symbol = self.normalize_symbol(symbol)
         try:
@@ -389,6 +397,169 @@ class GateIOAdapter:
                 return "dual"
             return mode_text
         return None
+
+    def fetch_margin_mode(self, symbol: str | None = None) -> dict[str, Any] | None:
+        if self.market_type != "swap":
+            return None
+        self._require_credentials()
+        normalized_symbol = self.normalize_symbol(symbol) if symbol else None
+        try:
+            if getattr(self.client, "has", {}).get("fetchMarginMode") and hasattr(self.client, "fetch_margin_mode"):
+                return self.client.fetch_margin_mode(normalized_symbol)
+        except ccxt.AuthenticationError as exc:
+            raise ExchangeAuthError(str(exc)) from exc
+        except Exception as exc:
+            raise ExchangeConnectionError(str(exc)) from exc
+        return None
+
+    def set_margin_mode(
+        self,
+        *,
+        margin_mode: str,
+        symbol: str | None = None,
+        leverage: float | None = None,
+    ) -> dict[str, Any]:
+        if self.market_type != "swap":
+            return {
+                "marginMode": str(margin_mode).lower(),
+                "symbol": self.normalize_symbol(symbol) if symbol else None,
+                "skipped": True,
+                "reason": "non_swap_market",
+            }
+
+        self._require_credentials()
+        normalized_symbol = self.normalize_symbol(symbol) if symbol else None
+        normalized_mode = str(margin_mode or "").strip().lower()
+        params: dict[str, Any] = {}
+        if leverage is not None:
+            params["leverage"] = int(round(float(leverage)))
+
+        has_set_margin_mode = bool(getattr(self.client, "has", {}).get("setMarginMode"))
+        client_method = getattr(self.client, "set_margin_mode", None)
+
+        if not has_set_margin_mode or client_method is None:
+            return {
+                "marginMode": normalized_mode,
+                "symbol": normalized_symbol,
+                "skipped": True,
+                "reason": "unsupported_by_exchange_or_ccxt",
+            }
+
+        try:
+            result = client_method(normalized_mode, normalized_symbol, params)
+            if isinstance(result, dict):
+                result.setdefault("marginMode", normalized_mode)
+                result.setdefault("symbol", normalized_symbol)
+            return result if isinstance(result, dict) else {
+                "marginMode": normalized_mode,
+                "symbol": normalized_symbol,
+                "raw": result,
+            }
+        except ccxt.AuthenticationError as exc:
+            raise ExchangeAuthError(str(exc)) from exc
+        except Exception as exc:
+            raise ExchangeConnectionError(str(exc)) from exc
+
+    def fetch_leverage(self, *, symbol: str, margin_mode: str | None = None) -> dict[str, Any] | None:
+        if self.market_type != "swap":
+            return None
+        self._require_credentials()
+        normalized_symbol = self.normalize_symbol(symbol)
+        params: dict[str, Any] = {}
+        if margin_mode:
+            params["marginMode"] = str(margin_mode).lower()
+
+        try:
+            if getattr(self.client, "has", {}).get("fetchLeverage") and hasattr(self.client, "fetch_leverage"):
+                return self.client.fetch_leverage(normalized_symbol, params)
+        except ccxt.AuthenticationError as exc:
+            raise ExchangeAuthError(str(exc)) from exc
+        except Exception:
+            return None
+
+        return None
+
+    def set_leverage(self, *, leverage: float, symbol: str, margin_mode: str | None = None) -> dict[str, Any]:
+        if self.market_type != "swap":
+            return {"symbol": self.normalize_symbol(symbol), "leverage": float(leverage)}
+        self._require_credentials()
+        normalized_symbol = self.normalize_symbol(symbol)
+        if not getattr(self.client, "has", {}).get("setLeverage") or not hasattr(self.client, "set_leverage"):
+            raise ExchangeConfigurationError("Exchange adapter does not support setLeverage for swap markets.")
+        params: dict[str, Any] = {}
+        if margin_mode:
+            params["marginMode"] = str(margin_mode).lower()
+        try:
+            return self.client.set_leverage(int(round(float(leverage))), normalized_symbol, params)
+        except ccxt.AuthenticationError as exc:
+            raise ExchangeAuthError(str(exc)) from exc
+        except Exception as exc:
+            raise ExchangeConnectionError(str(exc)) from exc
+
+    def fetch_effective_leverage(self, *, symbol: str, margin_mode: str | None = None) -> dict[str, Any]:
+        normalized_symbol = self.normalize_symbol(symbol)
+
+        leverage_payload: dict[str, Any] | None = None
+        try:
+            leverage_payload = self.fetch_leverage(symbol=normalized_symbol, margin_mode=margin_mode)
+        except Exception:
+            leverage_payload = None
+
+        if isinstance(leverage_payload, dict):
+            long_lev = self._safe_float(leverage_payload.get("longLeverage"))
+            short_lev = self._safe_float(leverage_payload.get("shortLeverage"))
+            direct_lev = self._safe_float(leverage_payload.get("leverage"))
+
+            effective = None
+            for candidate in (direct_lev, long_lev, short_lev):
+                if candidate is not None and candidate > 0:
+                    effective = float(candidate)
+                    break
+
+            if effective is not None:
+                return {
+                    "symbol": normalized_symbol,
+                    "margin_mode": str(leverage_payload.get("marginMode") or margin_mode or "").lower() or None,
+                    "leverage": effective,
+                    "raw": leverage_payload,
+                    "source": "fetch_leverage",
+                }
+
+        positions = self.fetch_positions(normalized_symbol)
+        for position in positions or []:
+            raw_symbol = str(position.get("symbol") or "")
+            if raw_symbol != normalized_symbol:
+                continue
+
+            info = position.get("info") if isinstance(position.get("info"), dict) else {}
+            for candidate in (
+                position.get("leverage"),
+                info.get("lever"),
+                info.get("leverage"),
+            ):
+                lev = self._safe_float(candidate)
+                if lev is not None and lev > 0:
+                    return {
+                        "symbol": normalized_symbol,
+                        "margin_mode": str(
+                            position.get("marginMode")
+                            or info.get("margin_mode")
+                            or info.get("pos_margin_mode")
+                            or margin_mode
+                            or ""
+                        ).lower() or None,
+                        "leverage": float(lev),
+                        "raw": position,
+                        "source": "fetch_positions",
+                    }
+
+        return {
+            "symbol": normalized_symbol,
+            "margin_mode": str(margin_mode or "").lower() or None,
+            "leverage": None,
+            "raw": leverage_payload,
+            "source": "unknown",
+        }
 
     def create_order(
         self,
