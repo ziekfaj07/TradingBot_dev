@@ -3179,9 +3179,13 @@ class ModeController:
                     if self._state is not None and self._engine is not None:
                         fill = None
 
-                        position_qty = float(self._state.position_qty or 0.0)
+                        # v0.7.6.3: position_qty is stored as an absolute size.
+                        # Direction MUST come from state.side, not from the sign of qty.
+                        position_qty = abs(float(self._state.position_qty or 0.0))
+                        position_side = str(getattr(self._state, "side", None) or "").lower() or None
+                        is_flat = position_qty <= 0.0 or position_side is None
 
-                        if signal > 0 and position_qty < 0.0:
+                        if signal > 0 and position_side == "short" and cfg.exit_on_signal:
                             self._state, fill = self._engine.exit_short(
                                 ts_iso=str(int(processed_ts)),
                                 state=self._state,
@@ -3190,7 +3194,7 @@ class ModeController:
                                 trade_id=self._trade_id,
                             )
 
-                        elif signal > 0 and position_qty == 0.0:
+                        elif signal > 0 and is_flat:
                             entry_gate = self._check_entry_gate_locked(
                                 latest_price,
                                 now_ts=processed_ts,
@@ -3220,7 +3224,7 @@ class ModeController:
                                     },
                                 )
 
-                        elif cfg.exit_on_signal and signal < 0 and position_qty > 0.0:
+                        elif cfg.exit_on_signal and signal < 0 and position_side == "long":
                             self._state, fill = self._engine.exit_long(
                                 ts_iso=str(int(processed_ts)),
                                 state=self._state,
@@ -3229,7 +3233,7 @@ class ModeController:
                                 trade_id=self._trade_id,
                             )
 
-                        elif signal < 0 and position_qty == 0.0 and bool(cfg.allow_short) and is_derivatives_market(cfg.market_type):
+                        elif signal < 0 and is_flat and bool(cfg.allow_short) and is_derivatives_market(cfg.market_type):
                             entry_gate = self._check_entry_gate_locked(
                                 latest_price,
                                 now_ts=processed_ts,

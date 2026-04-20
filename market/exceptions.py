@@ -13,7 +13,6 @@ class ExchangeConnectionError(ExchangeAdapterError):
 class ExchangeAuthError(ExchangeAdapterError):
     pass
 
-
 class ExchangeOrderRejected(ExchangeAdapterError):
     pass
 
