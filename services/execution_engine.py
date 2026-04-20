@@ -2,6 +2,7 @@ import math
 from typing import Any, Optional, Tuple
 
 from core.execution_models import Fill, PortfolioState
+from core.market_types import is_derivatives_market, normalize_market_type
 
 
 class ExecutionEngine:
@@ -191,8 +192,8 @@ class ExecutionEngine:
         market_price: float,
         leverage: float,
     ) -> bool:
-        mt = (market_type or "spot").lower()
-        if mt != "futures":
+        mt = normalize_market_type(market_type)
+        if not is_derivatives_market(mt):
             return False
 
         if leverage <= 1.0:

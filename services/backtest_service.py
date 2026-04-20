@@ -4,6 +4,7 @@ import numpy as np
 
 from core.binance_vision_provider import BinanceVisionProvider
 from core.execution_models import PortfolioState
+from core.market_types import is_derivatives_market, is_spot_market, normalize_market_type
 from services.execution_engine import ExecutionEngine
 from services.margin_engine import normalize_maintenance_margin_override
 from services.risk_engine import RiskEngine
@@ -44,9 +45,10 @@ class BacktestService:
         atr_take_mult: float | None,
         atr_reference_mode: str = "entry",
     ) -> str | None:
-        mt = str(market_type or "spot").strip().lower()
-        if mt not in ("spot", "futures"):
-            return "market_type must be 'spot' or 'futures'"
+        try:
+            mt = normalize_market_type(market_type)
+        except ValueError as exc:
+            return str(exc)
 
         mmode = str(margin_mode or "isolated").strip().lower()
         if mmode not in ("isolated", "cross"):
@@ -138,21 +140,21 @@ class BacktestService:
             if atr_take_mult is not None and float(atr_take_mult) <= 0.0:
                 return "atr_take_mult must be > 0 when provided"
 
-        if mt == "spot":
+        if is_spot_market(mt):
             if allow_short:
-                return "allow_short is only supported for futures"
+                return "allow_short is only supported for swap/futures"
             if leverage != 1.0:
                 return "spot backtests must use leverage=1"
             if mmode != "isolated":
-                return "margin_mode is only meaningful for futures"
+                return "margin_mode is only meaningful for swap/futures"
             if enable_liquidation:
                 return "enable_liquidation must be false for spot"
             if use_mark_price_for_liquidation:
                 return "use_mark_price_for_liquidation must be false for spot"
             if maintenance_margin_override is not None:
-                return "maintenance_margin_override is only valid for futures"
+                return "maintenance_margin_override is only valid for swap/futures"
 
-        if mt == "futures":
+        if is_derivatives_market(mt):
             if leverage > 50.0:
                 return "leverage exceeds current engine max of 50"
             
@@ -201,18 +203,18 @@ class BacktestService:
         liquidation_fee_rate: float = 0.005,
         maintenance_margin_override: float | None = None,
     ):
-        market_type = (market_type or "spot").lower()
+        market_type = normalize_market_type(market_type)
         margin_mode = str(margin_mode or "isolated").strip().lower()
         mark_price_source = str(mark_price_source or "close").strip().lower()
 
-        if market_type == "spot":
+        if is_spot_market(market_type):
             leverage = 1.0
             allow_short = False
             margin_mode = "isolated"
             enable_liquidation = False
             use_mark_price_for_liquidation = False
             mark_price_source = "close"
-        if market_type == "spot":
+        if is_spot_market(market_type):
             leverage = 1.0
             allow_short = False
             margin_mode = "isolated"
@@ -259,7 +261,7 @@ class BacktestService:
         df = StrategyEngine.ema_crossover(df)
         df["signal"] = df["signal"].shift(1).fillna(0).astype(int)
 
-        if market_type != "futures":
+        if not is_derivatives_market(market_type):
             df.loc[df["signal"] < 0, "signal"] = 0
         elif not allow_short:
             # keep -1 only as long exit; do not allow flat-to-short entries

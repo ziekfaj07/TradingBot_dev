@@ -543,8 +543,11 @@ class LiveExecutionService:
                     if status in {"closed", "filled"} and filled_qty > 0.0:
                         refreshed["filled_at"] = refreshed.get("acknowledged_at")
                 final_order.update(refreshed)
-            except Exception:
-                pass
+            except Exception as exc:
+                final_order["post_submit_verified"] = False
+                final_order["post_submit_verification_error"] = f"{type(exc).__name__}: {exc}"
+        else:
+            final_order["post_submit_verified"] = bool(order_id)
 
         if final_order.get("filled_at") is None:
             status = str(final_order.get("status") or "").lower()
@@ -599,7 +602,19 @@ class LiveExecutionService:
         expected_price: float | None = None,
         expected_qty: float | None = None,
     ) -> Fill:
-        filled_qty = float(order.get("filled_base_qty") or order.get("amount_base_qty") or order.get("filled") or order.get("amount") or 0.0)
+        order_status = str(order.get("status") or "unknown").lower()
+        is_dry_run_order = bool(order.get("dry_run") or not self.can_submit_live_orders)
+
+        filled_qty = float(order.get("filled_base_qty") or order.get("filled") or 0.0)
+        if filled_qty <= 0.0 and is_dry_run_order:
+            filled_qty = float(order.get("amount_base_qty") or order.get("amount") or 0.0)
+
+        if not is_dry_run_order and filled_qty <= 0.0 and order_status not in {"closed", "filled"}:
+            raise RuntimeError(
+                f"Live order is not fill-confirmed yet; refusing to create fill. "
+                f"order_id={order.get('id') or ''} status={order_status}"
+            )
+
         price = float(order.get("average") or order.get("price") or market_price)
         fee_cost = self._extract_fee_cost(order)
         side = str(order.get("side") or "buy").lower()
@@ -608,8 +623,6 @@ class LiveExecutionService:
             logical_side = "short" if side == "sell" else "long"
         else:
             logical_side = side
-        order_status = str(order.get("status") or "unknown").lower()
-
         submitted_at = order.get("submitted_at")
         acknowledged_at = order.get("acknowledged_at")
         filled_at = order.get("filled_at")

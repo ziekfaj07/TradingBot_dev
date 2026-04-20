@@ -12,3 +12,15 @@ class ExchangeConnectionError(ExchangeAdapterError):
 
 class ExchangeAuthError(ExchangeAdapterError):
     pass
+
+
+class ExchangeOrderRejected(ExchangeAdapterError):
+    pass
+
+
+class ExchangeTimeoutError(ExchangeAdapterError):
+    pass
+
+
+class ExchangeRateLimitError(ExchangeAdapterError):
+    pass

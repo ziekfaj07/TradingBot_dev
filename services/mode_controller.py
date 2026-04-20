@@ -30,6 +30,7 @@ from core.database import (
     upsert_runtime_run,
 )
 from core.execution_models import Fill, PortfolioState
+from core.market_types import is_derivatives_market, is_spot_market, normalize_market_type
 from core.run_naming import make_run_id
 from services.execution_engine import ExecutionEngine
 from services.exchange_service import validate_live_config
@@ -2090,10 +2091,12 @@ class ModeController:
                 self._refresh_live_leverage_status_locked()
                 after = self._capture_live_exposure_signature_locked()
                 transition = self._describe_live_exposure_transition_locked(before, after)
+                active_positions = self._active_live_positions_locked()
                 self._live_recovery_summary = {
                     "symbol": cfg.symbol,
                     "open_order_count": len(self._live_open_orders),
-                    "position_count": len(self._live_positions),
+                    "position_count": len(active_positions),
+                    "raw_position_count": len(self._live_positions),
                     "orphan_open_orders_imported": orphan_count,
                     "transition": transition,
                     "last_sync_mode": "regular",
@@ -2135,7 +2138,8 @@ class ModeController:
                         "symbol": cfg.symbol,
                         "exchange": cfg.exchange_name,
                         "open_order_count": len(snapshot.get("open_orders") or []),
-                        "position_count": len(snapshot.get("positions") or []),
+                        "position_count": len(self._active_live_positions_locked()),
+                        "raw_position_count": len(snapshot.get("positions") or []),
                         "registry_count": len(self._live_order_registry),
                         "synced_at": snapshot.get("synced_at"),
                     },
@@ -3041,7 +3045,7 @@ class ModeController:
             return 0.0
 
         notional = self._state.cash * 0.95
-        if self._status.config.market_type == "futures":
+        if is_derivatives_market(self._status.config.market_type):
             notional *= self._status.config.leverage
 
         qty = min(notional / price, self._status.config.max_qty)
@@ -3063,7 +3067,7 @@ class ModeController:
 
         self._update_peak_equity_locked(price)
 
-        if self._status.config.market_type != "futures":
+        if not is_derivatives_market(self._status.config.market_type):
             return
 
         if float(self._state.position_qty or 0.0) == 0.0:
@@ -3175,7 +3179,18 @@ class ModeController:
                     if self._state is not None and self._engine is not None:
                         fill = None
 
-                        if signal > 0 and float(self._state.position_qty) <= 0.0:
+                        position_qty = float(self._state.position_qty or 0.0)
+
+                        if signal > 0 and position_qty < 0.0:
+                            self._state, fill = self._engine.exit_short(
+                                ts_iso=str(int(processed_ts)),
+                                state=self._state,
+                                close=latest_price,
+                                market_type=cfg.market_type,
+                                trade_id=self._trade_id,
+                            )
+
+                        elif signal > 0 and position_qty == 0.0:
                             entry_gate = self._check_entry_gate_locked(
                                 latest_price,
                                 now_ts=processed_ts,
@@ -3192,32 +3207,20 @@ class ModeController:
                                     trade_id=self._trade_id,
                                     qty_override=self._compute_entry_qty_locked(latest_price),
                                 )
-
-                                if fill is not None:
-                                    await self._append_fill(fill)
-                                    await self._broadcast_trace_event(
-                                        "signal_fill",
-                                        data={
-                                            "signal": signal,
-                                            "processed_bar_ts": int(processed_ts),
-                                            "price": latest_price,
-                                            "trade_id": getattr(fill, "trade_id", None),
-                                            "fill_type": getattr(fill, "type", None),
-                                        },
-                                    )
                             else:
                                 self._risk_halt_reason = entry_gate["reason"]
                                 await self._broadcast_trace_event(
                                     "entry_blocked",
-                                    note=f"Risk blocked entry: {entry_gate['reason']}",
+                                    note=f"Risk blocked long entry: {entry_gate['reason']}",
                                     data={
+                                        "side": "long",
                                         "processed_bar_ts": int(processed_ts),
                                         "price": latest_price,
                                         **(entry_gate.get("meta", {}) or {}),
                                     },
                                 )
 
-                        elif cfg.exit_on_signal and signal < 0 and float(self._state.position_qty) > 0.0:
+                        elif cfg.exit_on_signal and signal < 0 and position_qty > 0.0:
                             self._state, fill = self._engine.exit_long(
                                 ts_iso=str(int(processed_ts)),
                                 state=self._state,
@@ -3226,18 +3229,48 @@ class ModeController:
                                 trade_id=self._trade_id,
                             )
 
-                            if fill is not None:
-                                await self._append_fill(fill)
+                        elif signal < 0 and position_qty == 0.0 and bool(cfg.allow_short) and is_derivatives_market(cfg.market_type):
+                            entry_gate = self._check_entry_gate_locked(
+                                latest_price,
+                                now_ts=processed_ts,
+                            )
+
+                            if entry_gate["allowed"]:
+                                self._trade_id += 1
+                                self._state, fill = self._engine.enter_short(
+                                    ts_iso=str(int(processed_ts)),
+                                    state=self._state,
+                                    close=latest_price,
+                                    market_type=cfg.market_type,
+                                    leverage=cfg.leverage,
+                                    trade_id=self._trade_id,
+                                    qty_override=self._compute_entry_qty_locked(latest_price),
+                                )
+                            else:
+                                self._risk_halt_reason = entry_gate["reason"]
                                 await self._broadcast_trace_event(
-                                    "signal_fill",
+                                    "entry_blocked",
+                                    note=f"Risk blocked short entry: {entry_gate['reason']}",
                                     data={
-                                        "signal": signal,
+                                        "side": "short",
                                         "processed_bar_ts": int(processed_ts),
                                         "price": latest_price,
-                                        "trade_id": getattr(fill, "trade_id", None),
-                                        "fill_type": getattr(fill, "type", None),
+                                        **(entry_gate.get("meta", {}) or {}),
                                     },
                                 )
+
+                        if fill is not None:
+                            await self._append_fill(fill)
+                            await self._broadcast_trace_event(
+                                "signal_fill",
+                                data={
+                                    "signal": signal,
+                                    "processed_bar_ts": int(processed_ts),
+                                    "price": latest_price,
+                                    "trade_id": getattr(fill, "trade_id", None),
+                                    "fill_type": getattr(fill, "type", None),
+                                },
+                            )
 
                 self._persist_status()
                 self._persist_snapshot()
@@ -3736,6 +3769,32 @@ class ModeController:
                 },
             )
             
+    def _active_live_positions_locked(self) -> list[dict[str, Any]]:
+        active: list[dict[str, Any]] = []
+        for row in self._live_positions or []:
+            if not isinstance(row, dict):
+                continue
+            qty = 0.0
+            for key in (
+                "base_qty",
+                "contracts",
+                "contract_qty",
+                "size",
+                "positionAmt",
+                "position_amt",
+            ):
+                try:
+                    raw = row.get(key)
+                    if raw is None or raw == "":
+                        continue
+                    qty = abs(float(raw))
+                    break
+                except (TypeError, ValueError):
+                    continue
+            if qty > 0.0:
+                active.append(row)
+        return active
+
     async def _recover_live_state_from_exchange(self, *, force: bool = False) -> None:
         if self._status.mode != Mode.LIVE:
             return
@@ -3818,10 +3877,12 @@ class ModeController:
 
                 self._live_recovery_performed = True
                 self._live_recovered_from_exchange_at = snapshot.get("synced_at")
+                active_positions = self._active_live_positions_locked()
                 self._live_recovery_summary = {
                     "symbol": cfg.symbol,
                     "open_order_count": len(self._live_open_orders),
-                    "position_count": len(self._live_positions),
+                    "position_count": len(active_positions),
+                    "raw_position_count": len(self._live_positions),
                     "orphan_open_orders_imported": orphan_count,
                     "recent_trade_count": len(recent_trades or []),
                     "transition": transition,

@@ -3,6 +3,8 @@ import re
 import string
 from datetime import datetime
 
+from core.market_types import is_derivatives_market
+
 """
 This whole section creates naming covention for Run ID and csv filename
 
@@ -33,7 +35,7 @@ def sanitize_ticker(symbol: str) -> str:
 
 
 def market_code(market_type: str) -> str:
-    return "F" if str(market_type).lower() == "futures" else "S"
+    return "F" if is_derivatives_market(market_type) else "S"
 
 
 def mode_code(mode: str) -> str:

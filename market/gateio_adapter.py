@@ -10,7 +10,11 @@ from market.exceptions import (
     ExchangeAuthError,
     ExchangeConfigurationError,
     ExchangeConnectionError,
+    ExchangeOrderRejected,
+    ExchangeRateLimitError,
+    ExchangeTimeoutError,
 )
+from core.market_types import normalize_market_type
 from market.models import ExchangeCapabilities
 
 
@@ -56,22 +60,10 @@ class GateIOAdapter:
             self._enable_testnet_mode()
 
     def _normalize_market_type(self, market_type: str) -> str:
-        raw = str(market_type or "spot").strip().lower()
-        aliases = {
-            "spot": "spot",
-            "cash": "spot",
-            "swap": "swap",
-            "future": "swap",
-            "futures": "swap",
-            "perp": "swap",
-            "perpetual": "swap",
-        }
-        normalized = aliases.get(raw)
-        if normalized is None:
-            raise ExchangeConfigurationError(
-                f"Unsupported Gate.io market_type: {market_type!r}. Use 'spot' or 'swap'."
-            )
-        return normalized
+        try:
+            return normalize_market_type(market_type)
+        except ValueError as exc:
+            raise ExchangeConfigurationError(str(exc)) from exc
 
     def _enable_testnet_mode(self) -> None:
         if self.market_type == "spot":
@@ -584,6 +576,14 @@ class GateIOAdapter:
             )
         except ccxt.AuthenticationError as exc:
             raise ExchangeAuthError(str(exc)) from exc
+        except ccxt.InsufficientFunds as exc:
+            raise ExchangeOrderRejected(f"insufficient_funds: {exc}") from exc
+        except ccxt.InvalidOrder as exc:
+            raise ExchangeOrderRejected(f"invalid_order: {exc}") from exc
+        except ccxt.RequestTimeout as exc:
+            raise ExchangeTimeoutError(str(exc)) from exc
+        except ccxt.RateLimitExceeded as exc:
+            raise ExchangeRateLimitError(str(exc)) from exc
         except Exception as exc:
             raise ExchangeConnectionError(str(exc)) from exc
 

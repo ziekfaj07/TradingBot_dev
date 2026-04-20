@@ -7,6 +7,7 @@ from typing import Any
 import pandas as pd
 
 from core.execution_models import PortfolioState
+from core.market_types import is_derivatives_market, normalize_market_type
 from services.execution_engine import ExecutionEngine
 from services.margin_engine import derive_mark_price, evaluate_position_margin, normalize_maintenance_margin_override
 from services.risk_engine import RiskEngine
@@ -355,7 +356,7 @@ def run_signal_backed_loop(
         margin_snapshot = None
         should_liquidate = False
         if (
-            str(market_type or "spot").strip().lower() == "futures"
+            is_derivatives_market(market_type)
             and float(leverage) > 1.0
             and float(state.position_qty) != 0.0
         ):
