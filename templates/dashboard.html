@@ -122,14 +122,13 @@
       </div>
 
       <div class="actions">
-        <button id="configureBtn" type="button" class="btn-primary">Configure</button>
-        <button id="startBtn" type="button" class="btn-success">Start</button>
-        <button id="stopBtn" type="button" class="btn-danger">Stop</button>
-        <button id="forceExitBtn" type="button" class="btn-danger" disabled>Force Exit Live Position</button>
-        <button id="refreshStatusBtn" type="button" class="btn-neutral">Refresh Status</button>
-        <button id="showFillsBtn" type="button" class="btn-neutral">Show current run fills</button>
-        <button id="resetPaperBtn" type="button" class="btn-neutral">Reset Paper Account</button>
-        <button id="exportCsvBtn" type="button" class="btn-neutral">Export Fills CSV</button>
+        <button id="configureBtn" type="button">Configure</button>
+        <button id="startBtn" type="button">Start</button>
+        <button id="stopBtn" type="button">Stop</button>
+        <button id="refreshStatusBtn" type="button">Refresh Status</button>
+        <button id="showFillsBtn" type="button">Show current run fills</button>
+        <button id="resetPaperBtn" type="button">Reset Paper Account</button>
+        <button id="exportCsvBtn" type="button">Export Fills CSV</button>
       </div>
 
       <div id="actionMessage" class="action-message">Ready.</div>
@@ -138,10 +137,10 @@
     <section class="card mt-16">
       <h2>Runtime Summary</h2>
       <div class="status-grid">
-        <div class="stat"><div class="stat-label">Run ID</div><div id="runId" class="stat-value">-</div></div>
         <div class="stat"><div class="stat-label">Bot State</div><div id="botState" class="stat-value">Unknown</div></div>
         <div class="stat"><div class="stat-label">Last Signal</div><div id="lastSignal" class="stat-value">WAIT</div></div>
         <div class="stat"><div class="stat-label">Mode</div><div id="modeView" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Run ID</div><div id="runId" class="stat-value">-</div></div>
         <div class="stat"><div class="stat-label">Fill Count</div><div id="fillCount" class="stat-value">0</div></div>
         <div class="stat"><div class="stat-label">Cash</div><div id="cash" class="stat-value">-</div></div>
         <div class="stat"><div class="stat-label">Position Quantity</div><div id="positionQty" class="stat-value">-</div></div>
@@ -154,24 +153,6 @@
         <div class="stat"><div class="stat-label">Last Processed TS</div><div id="lastProcessedTs" class="stat-value">-</div></div>
         <div class="stat"><div class="stat-label">Bar Count</div><div id="barCount" class="stat-value">-</div></div>
         <div class="stat"><div class="stat-label">Started At</div><div id="startedAt" class="stat-value">-</div></div>
-      </div>
-    </section>
-
-    <section class="card mt-16">
-      <h2>Live Execution Deltas</h2>
-      <div class="status-grid">
-        <div class="stat"><div class="stat-label">Last Expected Price</div><div id="liveExpectedPrice" class="stat-value">-</div></div>
-        <div class="stat"><div class="stat-label">Last Fill Price</div><div id="liveFillPrice" class="stat-value">-</div></div>
-        <div class="stat"><div class="stat-label">Last Slippage (bps)</div><div id="liveSlippageBps" class="stat-value">-</div></div>
-        <div class="stat"><div class="stat-label">Last Expected Qty</div><div id="liveExpectedQty" class="stat-value">-</div></div>
-        <div class="stat"><div class="stat-label">Last Filled Qty</div><div id="liveFilledQty" class="stat-value">-</div></div>
-        <div class="stat"><div class="stat-label">Last Qty Delta %</div><div id="liveQtyDeltaPct" class="stat-value">-</div></div>
-        <div class="stat"><div class="stat-label">Last Submit → Ack (ms)</div><div id="liveAckMs" class="stat-value">-</div></div>
-        <div class="stat"><div class="stat-label">Last Submit → Fill (ms)</div><div id="liveFillMs" class="stat-value">-</div></div>
-        <div class="stat"><div class="stat-label">Avg Slippage (bps)</div><div id="liveAvgSlippageBps" class="stat-value">-</div></div>
-        <div class="stat"><div class="stat-label">Max |Slippage| (bps)</div><div id="liveMaxAbsSlippageBps" class="stat-value">-</div></div>
-        <div class="stat"><div class="stat-label">Avg Submit → Ack (ms)</div><div id="liveAvgAckMs" class="stat-value">-</div></div>
-        <div class="stat"><div class="stat-label">Avg Submit → Fill (ms)</div><div id="liveAvgFillMs" class="stat-value">-</div></div>
       </div>
     </section>
 
@@ -202,16 +183,11 @@
         <thead>
           <tr>
             <th>Time</th>
-            <th>Type</th>
             <th>Side</th>
-            <th>Expected Qty</th>
-            <th>Filled Qty</th>
-            <th>Expected Px</th>
-            <th>Fill Px</th>
-            <th>Slip (bps)</th>
-            <th>Ack (ms)</th>
-            <th>Fill (ms)</th>
-            <th>PnL</th>            
+            <th>Qty</th>
+            <th>Price</th>
+            <th>Fee</th>
+            <th>Realized PnL</th>
           </tr>
         </thead>
         <tbody id="fillsTableBody"></tbody>

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from core.market_types import market_type_error_label, normalize_market_type
 from core.run_naming import csv_filename_from_run_id
 from core.strategy_schemas import StrategyRegistry
 from services.controller_singleton import mode_controller
@@ -39,6 +40,7 @@ class ConfigureBody(BaseModel):
     maintenance_margin: float | None = None
     max_leverage: float | None = None
     max_qty: float | None = None
+
     include_equity: bool | None = None
     equity_stride: int | None = None
     include_trades: bool | None = None
@@ -47,6 +49,7 @@ class ConfigureBody(BaseModel):
     max_equity_points: int | None = None
     max_trades_returned: int | None = None
     max_risk_events_returned: int | None = None
+
     poll_seconds: float | None = None
     bar_confirmations: int | None = None
     max_reconnect_attempts: int | None = None
@@ -58,23 +61,30 @@ class ConfigureBody(BaseModel):
     strategy_params: dict[str, Any] | None = Field(default=None)
     candle_limit: int | None = None
     debug_stream: bool | None = None
+
     position_sizing_mode: str | None = None
     position_size_value: float | None = None
+
     enable_volatility_scaling: bool | None = None
     volatility_target_pct: float | None = None
     min_volatility_scale: float | None = None
     max_volatility_scale: float | None = None    
+
     max_drawdown_pct: float | None = None
     max_trades_per_day: int | None = None
     cooldown_seconds: int | None = None
+
     stop_loss_pct: float | None = None
     take_profit_pct: float | None = None
     exit_on_signal: bool | None = None
     exit_mode: str | None = None
+
     atr_period: int | None = None
     atr_stop_mult: float | None = None
     atr_take_mult: float | None = None
     atr_reference_mode: str | None = None
+
+    # v0.6.4 / v0.6.4.1 liquidation + margin config
     margin_mode: str | None = None
     enable_liquidation: bool | None = None
     use_mark_price_for_liquidation: bool | None = None
@@ -85,13 +95,8 @@ class ConfigureBody(BaseModel):
     exchange_api_key_env: str | None = None
     exchange_api_secret_env: str | None = None
     exchange_api_passphrase_env: str | None = None
-    exchange_live_api_key_env: str | None = None
-    exchange_live_api_secret_env: str | None = None
-    exchange_live_api_passphrase_env: str | None = None
-    exchange_demo_api_key_env: str | None = None
-    exchange_demo_api_secret_env: str | None = None
-    exchange_demo_api_passphrase_env: str | None = None    
     exchange_testnet: bool | None = None
+    exchange_base_url: str | None = None
     exchange_settle_currency: str | None = None
     enable_live_trading: bool | None = None
     live_dry_run: bool | None = None
@@ -99,9 +104,6 @@ class ConfigureBody(BaseModel):
     cancel_open_orders_on_stop: bool | None = None
     client_order_id_prefix: str | None = None
     live_poll_seconds: float | None = None
-
-    recover_live_state_on_start: bool | None = None
-    live_reconcile_lookback_minutes: int | None = None
 
     @model_validator(mode="after")
     def validate_strategy_block(self) -> "ConfigureBody":
@@ -117,103 +119,25 @@ class ConfigureBody(BaseModel):
         self.strategy_params = normalized_params
 
         if self.exchange_name is not None:
-            raw_exchange = str(self.exchange_name).strip().lower()
-            aliases = {"gate": "gateio", "gate.io": "gateio", "gateio": "gateio"}
-            normalized_exchange = aliases.get(raw_exchange)
-            if normalized_exchange is None:
-                raise ValueError("exchange_name must currently be Gate.io / gateio")
-            self.exchange_name = normalized_exchange
+            raw_exchange = str(self.exchange_name).strip().lower().replace(".", "")
+            aliases = {"gate": "gateio", "gateio": "gateio"}
+            self.exchange_name = aliases.get(raw_exchange, raw_exchange)
+            if not self.exchange_name:
+                raise ValueError("exchange_name is required when provided")
 
         if self.market_type is not None:
             raw_market_type = str(self.market_type).strip().lower()
-            aliases = {
-                "spot": "spot",
-                "cash": "spot",
-                "swap": "swap",
-                "future": "swap",
-                "futures": "swap",
-                "perp": "swap",
-                "perpetual": "swap",
-            }
-            normalized_market_type = aliases.get(raw_market_type)
-            if normalized_market_type is None:
-                raise ValueError("market_type must be 'spot' or 'swap'")
-            self.market_type = normalized_market_type
+            allowed = {"spot", "cash", "future", "futures", "swap", "perp", "perpetual", "derivative", "derivatives"}
+            if raw_market_type not in allowed:
+                raise ValueError(market_type_error_label())
+            self.market_type = normalize_market_type(raw_market_type)
 
         return self
-
-
-class StartBody(BaseModel):
-    arm_live_run: bool = False
-    confirm_symbol: str | None = None
-    confirm_exchange_testnet: bool | None = None
-    confirm_submission_mode: Literal["dry_run", "live_submit"] | None = None
-
 
 class DevActionBody(BaseModel):
     price: float | None = None
     note: str | None = None
 
-
-class LiveForceExitBody(BaseModel):
-    confirm: bool = False
-    note: str | None = None
-    
-
-@router.post("/mode")
-async def set_mode(body: SetModeBody):
-    try:
-        return await mode_controller.set_mode(body.mode)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.post("/configure")
-async def configure(body: ConfigureBody):
-    try:
-        updates = {k: v for k, v in body.model_dump().items() if v is not None}
-        return await mode_controller.configure(**updates)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.post("/start")
-async def start(body: StartBody = StartBody()):
-    try:
-        return await mode_controller.start(
-            arm_live_run=body.arm_live_run,
-            confirm_symbol=body.confirm_symbol,
-            confirm_exchange_testnet=body.confirm_exchange_testnet,
-            confirm_submission_mode=body.confirm_submission_mode,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.post("/stop")
-async def stop():
-    try:
-        return await mode_controller.stop()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.post("/live/force-exit")
-async def force_live_exit(body: LiveForceExitBody = LiveForceExitBody()):
-    try:
-        return await mode_controller.force_live_exit(confirm=body.confirm, note=body.note)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.post("/backtest")
-async def run_backtest(body: ConfigureBody):
-    try:
-        overrides = {k: v for k, v in body.model_dump().items() if v is not None}
-        return await mode_controller.run_backtest(**overrides)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    
 
 @router.get("/status")
 async def status():
@@ -285,9 +209,59 @@ async def flatten(body: DevActionBody = DevActionBody()):
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@router.get("/paper/metrics")
+async def paper_metrics():
+    try:
+        return mode_controller.get_paper_metrics()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @router.post("/paper/reset")
 async def reset_paper():
     try:
         return await mode_controller.reset_paper()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/mode")
+async def set_mode(body: SetModeBody):
+    try:
+        return await mode_controller.set_mode(body.mode)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/configure")
+async def configure(body: ConfigureBody):
+    try:
+        updates = {k: v for k, v in body.model_dump().items() if v is not None}
+        return await mode_controller.configure(**updates)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/start")
+async def start():
+    try:
+        return await mode_controller.start()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/stop")
+async def stop():
+    try:
+        return await mode_controller.stop()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/backtest")
+async def run_backtest(body: ConfigureBody):
+    try:
+        overrides = {k: v for k, v in body.model_dump().items() if v is not None}
+        return await mode_controller.run_backtest(**overrides)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

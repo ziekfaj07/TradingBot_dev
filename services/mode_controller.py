@@ -30,11 +30,10 @@ from core.database import (
     upsert_runtime_run,
 )
 from core.execution_models import Fill, PortfolioState
-from core.market_types import is_derivatives_market, is_spot_market, normalize_market_type
+from core.market_types import is_derivatives_market, normalize_market_type
 from core.run_naming import make_run_id
 from services.execution_engine import ExecutionEngine
 from services.exchange_service import validate_live_config
-from services.live_execution_service import LiveExecutionService
 from services.margin_engine import evaluate_position_margin
 from services.market_data_service import CoinGeckoService, GateIOService
 from services.risk_engine import RiskEngine
@@ -46,6 +45,7 @@ from services.ws_manager import ws_manager
 class Mode(str, Enum):
     BACKTEST = "backtest"
     PAPER = "paper"
+    DEMO = "demo"
     LIVE = "live"
 
 
@@ -130,28 +130,16 @@ class RunConfig:
     exchange_name: str = "gateio"
     exchange_api_key_env: str = "GATEIO_API_KEY"
     exchange_api_secret_env: str = "GATEIO_API_SECRET"
-    exchange_api_passphrase_env: str | None = None
-
-    exchange_live_api_key_env: str | None = None
-    exchange_live_api_secret_env: str | None = None
-    exchange_live_api_passphrase_env: str | None = None
-
-    exchange_demo_api_key_env: str | None = None
-    exchange_demo_api_secret_env: str | None = None
-    exchange_demo_api_passphrase_env: str | None = None    
-
+    exchange_api_passphrase_env: str | None = "GATEIO_API_PASSPHRASE"
     exchange_testnet: bool = False
+    exchange_base_url: str | None = None
     exchange_settle_currency: str = "usdt"
-
     enable_live_trading: bool = False
     live_dry_run: bool = True
     sync_positions_on_start: bool = True
     cancel_open_orders_on_stop: bool = False
     client_order_id_prefix: str = "tb"
     live_poll_seconds: float = 3.0
-
-    recover_live_state_on_start: bool = True
-    live_reconcile_lookback_minutes: int = 240    
 
 
 @dataclass
@@ -189,6 +177,8 @@ class ModeController:
         self._fills: list[Fill] = []
         self._equity_points: list[dict[str, Any]] = []
         self._trace: list[dict[str, Any]] = []
+        self._paper_metrics_cache: dict[str, Any] | None = None
+        self._paper_metrics_dirty: bool = True
 
         self._risk_engine = RiskEngine()
         self._peak_equity: float = 0.0
@@ -202,27 +192,6 @@ class ModeController:
         self._recent_fill_key_set: set[str] = set()
         self._reconnect_attempts: int = 0
         self._last_fetch_error: str | None = None
-        self._live_execution: LiveExecutionService | None = None
-        self._live_balance: dict[str, Any] | None = None
-        self._live_open_orders: list[dict[str, Any]] = []
-        self._live_positions: list[dict[str, Any]] = []
-        self._live_order_registry: dict[str, dict[str, Any]] = {}
-        self._live_fill_id_set: set[str] = set()
-        self._live_trade_since_ms: int | None = None
-        self._live_private_stream_connected: bool = False
-        self._live_run_armed: bool = False
-        self._live_kill_switch_triggered: bool = False
-        self._live_kill_switch_reason: str | None = None
-        self._live_start_equity: float | None = None        
-        self._live_last_sync_at: str | None = None
-        self._live_last_sync_error: str | None = None
-        self._live_recovery_performed: bool = False
-        self._live_recovered_from_exchange_at: str | None = None
-        self._live_recovery_summary: dict[str, Any] | None = None        
-        self._live_exchange_leverage: float | None = None
-        self._live_exchange_margin_mode: str | None = None
-        self._live_leverage_match: bool | None = None
-        self._live_margin_mode_match: bool | None = None
 
         init_runtime_db()
         self._restore_paper_session()
@@ -375,14 +344,7 @@ class ModeController:
             strategy_params=self._resolved_strategy_params_from_config(cfg),
         )
 
-    async def start(
-        self,
-        *,
-        arm_live_run: bool = False,
-        confirm_symbol: str | None = None,
-        confirm_exchange_testnet: bool | None = None,
-        confirm_submission_mode: str | None = None,
-    ) -> dict:
+    async def start(self) -> dict:
         async with self._lock:
             if self._status.state != EngineState.IDLE:
                 raise RuntimeError("Engine must be idle before starting.")
@@ -390,65 +352,27 @@ class ModeController:
             if self._status.mode == Mode.BACKTEST:
                 raise RuntimeError("Use run_backtest() for backtest mode.")
 
-            requested_arm = False
-
-            if self._status.mode == Mode.LIVE:
-                cfg = self._status.config
-
+            if self._status.mode in (Mode.DEMO, Mode.LIVE):
+                exchange_testnet = bool(self._status.config.exchange_testnet or self._status.mode == Mode.DEMO)
+                dry_run_live = bool(self._status.config.live_dry_run if self._status.mode == Mode.LIVE else False)
                 live_validation = validate_live_config(
-                    exchange_name=cfg.exchange_name,
-                    market_type=cfg.market_type,
-                    symbol=cfg.symbol,
-                    testnet=cfg.exchange_testnet,
-                    settle_currency=cfg.exchange_settle_currency,
-                    enable_live_trading=cfg.enable_live_trading,
-                    dry_run_live=cfg.live_dry_run,
-                    api_key_env=cfg.exchange_api_key_env,
-                    api_secret_env=cfg.exchange_api_secret_env,
-                    api_passphrase_env=cfg.exchange_api_passphrase_env,
-                    live_api_key_env=cfg.exchange_live_api_key_env,
-                    live_api_secret_env=cfg.exchange_live_api_secret_env,
-                    live_api_passphrase_env=cfg.exchange_live_api_passphrase_env,
-                    demo_api_key_env=cfg.exchange_demo_api_key_env,
-                    demo_api_secret_env=cfg.exchange_demo_api_secret_env,
-                    demo_api_passphrase_env=cfg.exchange_demo_api_passphrase_env,
+                    exchange_name=self._status.config.exchange_name,
+                    market_type=self._status.config.market_type,
+                    symbol=self._status.config.symbol,
+                    enable_live_trading=self._status.config.enable_live_trading,
+                    dry_run_live=dry_run_live,
+                    testnet=exchange_testnet,
+                    base_url=self._status.config.exchange_base_url,
+                    api_key_env=self._status.config.exchange_api_key_env,
+                    api_secret_env=self._status.config.exchange_api_secret_env,
+                    api_passphrase_env=self._status.config.exchange_api_passphrase_env,
                 )
                 if not live_validation.get("ok"):
-                    errors = "; ".join(live_validation.get("errors", [])) or "live config invalid"
-                    raise RuntimeError(f"Live startup blocked: {errors}")
-
-                if arm_live_run:
-                    if not cfg.enable_live_trading:
-                        raise RuntimeError(
-                            "Live arming blocked: enable_live_trading must be true for an armed live run."
-                        )
-                    if cfg.live_dry_run:
-                        raise RuntimeError(
-                            "Live arming blocked: live_dry_run is true. Set live_dry_run=false before arming."
-                        )
-
-                    expected_mode = "live_submit"
-                    if confirm_submission_mode != expected_mode:
-                        raise RuntimeError(
-                            f"Live arming blocked: confirm_submission_mode must be '{expected_mode}'."
-                        )
-
-                    if confirm_symbol is None or str(confirm_symbol).strip().upper() != str(cfg.symbol).strip().upper():
-                        raise RuntimeError(
-                            f"Live arming blocked: confirm_symbol must exactly match configured symbol '{cfg.symbol.upper()}'."
-                        )
-
-                    if confirm_exchange_testnet is None or bool(confirm_exchange_testnet) != bool(cfg.exchange_testnet):
-                        env_name = "demo/testnet" if cfg.exchange_testnet else "production/mainnet"
-                        raise RuntimeError(
-                            f"Live arming blocked: confirm_exchange_testnet must match configured environment ({env_name})."
-                        )
-
-                    requested_arm = True
-                else:
-                    requested_arm = False
+                    errors = "; ".join(live_validation.get("errors", [])) or f"{self._status.mode.value} config invalid"
+                    raise RuntimeError(f"{self._status.mode.value.capitalize()} startup blocked: {errors}")
 
             self._status.state = EngineState.STARTING
+
             self._status.started_at = time.time()
             self._status.stopped_at = None
             self._status.last_error = None
@@ -462,65 +386,31 @@ class ModeController:
             self._reset_runtime_memory()
             self._build_runtime_objects()
 
-            self._live_run_armed = requested_arm
-            self._live_kill_switch_triggered = False
-            self._live_kill_switch_reason = None
-            self._live_start_equity = None
-
-            if self._status.mode == Mode.LIVE:
-                self._build_live_service_locked(armed=requested_arm)
-
             self._stop_event = asyncio.Event()
             self._persist_status()
             self._persist_snapshot()
 
-        if self._status.mode == Mode.LIVE:
-            if self._status.config.sync_positions_on_start or self._status.config.recover_live_state_on_start:
-                await self._recover_live_state_from_exchange(force=True)            
-
-        async with self._lock:
             self._task = asyncio.create_task(self._run_loop())
+
             self._status.state = EngineState.RUNNING
             self._persist_status()
 
-        if self._status.mode == Mode.PAPER:
-            await self._broadcast_trace_event(
-                "paper_started",
-                data={
-                    "run_id": self._status.run_id,
-                    "symbol": self._status.config.symbol,
-                    "interval": self._status.config.interval,
-                },
-            )
-        elif self._status.mode == Mode.LIVE:
-            await self._broadcast_trace_event(
-                "live_started",
-                data={
-                    "run_id": self._status.run_id,
-                    "symbol": self._status.config.symbol,
-                    "interval": self._status.config.interval,
-                    "live_dry_run": self._status.config.live_dry_run,
-                    "enable_live_trading": self._status.config.enable_live_trading,
-                    "armed_for_this_run": self._live_run_armed,
-                    "submission_mode": (
-                        "live_submit"
-                        if self._live_execution is not None and self._live_execution.can_submit_live_orders
-                        else ("dry_run" if self._status.config.live_dry_run else "disarmed")
-                    ),
-                },
-            )
+            if self._status.mode in (Mode.PAPER, Mode.DEMO):
+                await self._broadcast_trace_event(
+                    f"{self._status.mode.value}_started",
+                    data={
+                        "run_id": self._status.run_id,
+                        "symbol": self._status.config.symbol,
+                        "interval": self._status.config.interval,
+                    },
+                )
 
-        return self.status()
+            return self.status()
 
     async def stop(self) -> dict:
         async with self._lock:
             if self._status.state not in (EngineState.STARTING, EngineState.RUNNING):
                 raise RuntimeError("Engine is not running.")
-
-            current_mode = self._status.mode
-            cancel_live_orders = bool(
-                current_mode == Mode.LIVE and self._status.config.cancel_open_orders_on_stop
-            )
 
             self._status.state = EngineState.STOPPING
             self._persist_status()
@@ -533,9 +423,6 @@ class ModeController:
             except asyncio.CancelledError:
                 pass
 
-        if cancel_live_orders:
-            await self._cancel_live_open_orders_best_effort()
-
         async with self._lock:
             self._task = None
             self._status.state = EngineState.IDLE
@@ -543,24 +430,11 @@ class ModeController:
             self._persist_status()
             self._persist_snapshot()
 
-            if self._status.mode == Mode.PAPER:
+            if self._status.mode in (Mode.PAPER, Mode.DEMO):
                 await self._broadcast_trace_event(
-                    "paper_stopped",
+                    f"{self._status.mode.value}_stopped",
                     data={"run_id": self._status.run_id},
                 )
-            elif self._status.mode == Mode.LIVE:
-                await self._broadcast_trace_event(
-                    "live_stopped",
-                    data={"run_id": self._status.run_id},
-                )
-
-            self._live_run_armed = False
-            self._live_kill_switch_triggered = False
-            self._live_kill_switch_reason = None
-            self._live_start_equity = None
-            if self._live_execution is not None:
-                self._live_execution.set_armed(False)
-                self._live_execution.set_dry_run(True)
 
             return self.status()
 
@@ -744,52 +618,6 @@ class ModeController:
                 self._persist_status()
             raise
 
-    def _build_live_execution_summary(self) -> dict:
-        live_fills: list[dict[str, Any]] = []
-
-        for item in self._fills:
-            row = item.to_dict() if isinstance(item, Fill) else dict(getattr(item, "__dict__", item))
-            source = str(row.get("execution_source") or "")
-            if source.startswith("live_"):
-                live_fills.append(row)
-
-        recent = live_fills[-50:]
-        last_fill = recent[-1] if recent else None
-
-        def _nums(key: str) -> list[float]:
-            vals: list[float] = []
-            for row in recent:
-                value = row.get(key)
-                if value is None:
-                    continue
-                try:
-                    vals.append(float(value))
-                except (TypeError, ValueError):
-                    continue
-            return vals
-
-        slip_bps = _nums("price_slippage_bps")
-        ack_ms = _nums("submit_to_ack_ms")
-        fill_ms = _nums("submit_to_fill_ms")
-        qty_pct = _nums("qty_delta_pct")
-
-        avg_slip_bps = (sum(slip_bps) / len(slip_bps)) if slip_bps else None
-        max_abs_slip_bps = max((abs(v) for v in slip_bps), default=None)
-        avg_ack_ms = (sum(ack_ms) / len(ack_ms)) if ack_ms else None
-        avg_fill_ms = (sum(fill_ms) / len(fill_ms)) if fill_ms else None
-        avg_qty_delta_pct = (sum(qty_pct) / len(qty_pct)) if qty_pct else None
-
-        return {
-            "live_fill_count": len(live_fills),
-            "recent_live_fill_count": len(recent),
-            "avg_slippage_bps": avg_slip_bps,
-            "max_abs_slippage_bps": max_abs_slip_bps,
-            "avg_submit_to_ack_ms": avg_ack_ms,
-            "avg_submit_to_fill_ms": avg_fill_ms,
-            "avg_qty_delta_pct": avg_qty_delta_pct,
-            "last_fill": last_fill,
-        }
-
     def status(self) -> dict:
         cfg = asdict(self._status.config)
 
@@ -805,7 +633,10 @@ class ModeController:
             "fills": [getattr(f, "__dict__", f) for f in reversed(self._fills[-10:])],
             "latest_equity": self._equity_points[-1] if self._equity_points else None,
             "paper_state": self._serialize_state(),
-            "paper_metrics": self._build_metrics_payload(),
+            "paper_metrics": {
+                "available": bool(self._status.run_id or self._fills or self._equity_points),
+                "endpoint": "/api/run/paper/metrics",
+            },
             "chart_symbol": cfg.get("symbol"),
             "chart_interval": cfg.get("interval"),
             "reconnect_attempts": self._reconnect_attempts,
@@ -814,66 +645,13 @@ class ModeController:
             "live": {
                 "exchange_name": cfg.get("exchange_name"),
                 "exchange_testnet": cfg.get("exchange_testnet"),
-                "market_type": cfg.get("market_type"),
-                "settle_currency": cfg.get("exchange_settle_currency"),
+                "exchange_base_url_configured": bool(cfg.get("exchange_base_url")),
+                "effective_execution_mode": "demo" if self._status.mode == Mode.DEMO else ("live" if self._status.mode == Mode.LIVE else self._status.mode.value),
                 "enable_live_trading": cfg.get("enable_live_trading"),
                 "live_dry_run": cfg.get("live_dry_run"),
-                "submission_mode": (
-                    "live_submit"
-                    if self._live_execution is not None and self._live_execution.can_submit_live_orders
-                    else ("dry_run" if cfg.get("live_dry_run") else "disarmed")
-                ),
                 "sync_positions_on_start": cfg.get("sync_positions_on_start"),
                 "cancel_open_orders_on_stop": cfg.get("cancel_open_orders_on_stop"),
                 "client_order_id_prefix": cfg.get("client_order_id_prefix"),
-                "can_submit_live_orders": bool(
-                    self._live_execution is not None and self._live_execution.can_submit_live_orders
-                ),
-                "credential_profile": (
-                    getattr(self._live_execution, "credential_profile", None)
-                    if self._live_execution is not None
-                    else None
-                ),
-                "resolved_api_key_env": (
-                    getattr(self._live_execution, "resolved_api_key_env", None)
-                    if self._live_execution is not None
-                    else None
-                ),
-                "resolved_api_secret_env": (
-                    getattr(self._live_execution, "resolved_api_secret_env", None)
-                    if self._live_execution is not None
-                    else None
-                ),
-                "environment": (
-                    getattr(getattr(self._live_execution, "adapter", None), "describe", lambda: {})().get("environment")
-                    if self._live_execution is not None
-                    else None
-                ),
-                "armed_for_this_run": self._live_run_armed,
-                "kill_switch_triggered": self._live_kill_switch_triggered,
-                "kill_switch_reason": self._live_kill_switch_reason,
-                "live_start_equity": self._live_start_equity,
-                "max_loss_rule": {
-                    "max_drawdown_pct": cfg.get("max_drawdown_pct"),
-                },                
-                "last_sync_at": self._live_last_sync_at,
-                "last_sync_error": self._live_last_sync_error,
-                "balance": self._live_balance,
-                "open_orders": self._live_open_orders[-20:],
-                "positions": self._live_positions[-20:],
-                "order_registry": list(self._live_order_registry.values())[-50:],
-                "private_stream_connected": self._live_private_stream_connected,
-                "position_mode": (self._live_balance or {}).get("position_mode") if isinstance(self._live_balance, dict) else None,
-                "recovery_performed": self._live_recovery_performed,
-                "recovered_from_exchange_at": self._live_recovered_from_exchange_at,
-                "recovery_summary": self._live_recovery_summary,
-                "configured_leverage": self._status.config.leverage,
-                "exchange_leverage": self._live_exchange_leverage,
-                "leverage_match": self._live_leverage_match,
-                "configured_margin_mode": self._status.config.margin_mode,
-                "exchange_margin_mode": self._live_exchange_margin_mode,
-                "margin_mode_match": self._live_margin_mode_match,                
-                "execution": self._build_live_execution_summary(),
             },
         }
 
@@ -1010,7 +788,7 @@ class ModeController:
     def get_paper_metrics(self) -> dict:
         return {
             "run_id": self._status.run_id,
-            "metrics": self._build_metrics_payload(),
+            "metrics": self._get_cached_metrics_payload(),
         }
 
     def export_paper_equity_csv(self) -> str:
@@ -1061,9 +839,6 @@ class ModeController:
 
     def _fill_dedupe_key(self, fill: Fill | Mapping[str, Any]) -> str:
         data = self._fill_to_dict(fill)
-        fill_id = str(data.get("fill_id") or data.get("order_id") or "")
-        if fill_id:
-            return "|".join([str(self._status.run_id or ""), fill_id, str(data.get("type", "")), str(data.get("side", ""))])
         return "|".join(
             [
                 str(self._status.run_id or ""),
@@ -1244,146 +1019,6 @@ class ModeController:
                 },
             )
             return self.status()
-
-    async def force_live_exit(self, *, confirm: bool = False, note: str | None = None) -> dict:
-        if not confirm:
-            raise RuntimeError("Force exit confirmation required.")
-
-        async with self._lock:
-            if self._status.mode != Mode.LIVE:
-                raise RuntimeError("Live force exit is only available in live mode.")
-
-            if self._status.state in (EngineState.STARTING, EngineState.STOPPING):
-                raise RuntimeError("Wait for the engine transition to finish first.")
-
-            cfg = self._status.config
-            if not cfg.enable_live_trading:
-                raise RuntimeError("Live trading is disabled in the current configuration.")
-            if cfg.live_dry_run:
-                raise RuntimeError("Live force exit is unavailable while live_dry_run=true.")
-
-            if self._live_execution is None:
-                self._build_live_service_locked(armed=False)
-
-        await self._sync_live_account(force=True)
-
-        async with self._lock:
-            cfg = self._status.config
-            current_side = self._live_position_side_locked()
-            current_qty = self._live_position_qty_locked()
-
-            if current_side not in {"long", "short"} or current_qty <= 0.0:
-                raise RuntimeError("No open live position to force exit.")
-
-            order_side = "sell" if current_side == "long" else "buy"
-
-            market_price = None
-            if self._latest_bar and self._latest_bar.get("close") is not None:
-                try:
-                    market_price = float(self._latest_bar.get("close"))
-                except (TypeError, ValueError):
-                    market_price = None
-            if market_price is None:
-                for position in self._live_positions or []:
-                    side = str(position.get("side") or "").strip().lower()
-                    if current_side == "long" and side not in {"long", "buy"}:
-                        continue
-                    if current_side == "short" and side not in {"short", "sell"}:
-                        continue
-                    for key in ("mark_price", "entry_price"):
-                        try:
-                            value = float(position.get(key) or 0.0)
-                        except (TypeError, ValueError):
-                            value = 0.0
-                        if value > 0.0:
-                            market_price = value
-                            break
-                    if market_price is not None:
-                        break
-            if market_price is None:
-                raise RuntimeError("No live market price available for force exit.")
-
-            live_execution = self._live_execution
-            if live_execution is not None and live_execution.can_submit_live_orders:
-                submitter = live_execution
-            else:
-                submitter = LiveExecutionService(
-                    exchange_name=cfg.exchange_name,
-                    market_type=cfg.market_type,
-                    testnet=cfg.exchange_testnet,
-                    settle_currency=str(cfg.exchange_settle_currency or "USDT").upper(),
-                    api_key_env=cfg.exchange_api_key_env,
-                    api_secret_env=cfg.exchange_api_secret_env,
-                    api_passphrase_env=cfg.exchange_api_passphrase_env,
-                    live_api_key_env=cfg.exchange_live_api_key_env,
-                    live_api_secret_env=cfg.exchange_live_api_secret_env,
-                    live_api_passphrase_env=cfg.exchange_live_api_passphrase_env,
-                    demo_api_key_env=cfg.exchange_demo_api_key_env,
-                    demo_api_secret_env=cfg.exchange_demo_api_secret_env,
-                    demo_api_passphrase_env=cfg.exchange_demo_api_passphrase_env,
-                    client_order_id_prefix=cfg.client_order_id_prefix,
-                    armed=True,
-                    dry_run=False,
-                )
-
-            client_order_id = self._build_live_client_order_id(side=order_side, reduce_only=True)
-            self._validate_live_position_mode_locked()
-
-            result = await asyncio.to_thread(
-                submitter.submit_order,
-                symbol=cfg.symbol,
-                side=order_side,
-                qty=float(current_qty),
-                order_type="market",
-                price=None,
-                reduce_only=True,
-                client_order_id=client_order_id,
-            )
-
-            self._register_live_order_locked(
-                order=result.order,
-                requested_qty=float(current_qty),
-                requested_side=order_side,
-                reduce_only=True,
-                fill_type="EXIT",
-            )
-
-            fill = submitter.fill_from_order(
-                order=result.order,
-                fill_type="EXIT",
-                market_price=float(market_price),
-                trade_id=(self._trade_id if self._trade_id > 0 else None),
-                expected_price=float(market_price),
-                expected_qty=float(current_qty),
-            )
-
-            await self._apply_live_fill_to_shadow_state_locked(
-                fill=fill,
-                processed_ts=self._last_processed_bar_ts,
-                market_price=float(market_price),
-            )
-            await self._append_fill(fill)
-
-            self._persist_status()
-            self._persist_snapshot()
-
-            await self._broadcast_trace_event(
-                "live_force_exit",
-                note=note or "Manual live force exit executed.",
-                data={
-                    "run_id": self._status.run_id,
-                    "symbol": cfg.symbol,
-                    "position_side": current_side,
-                    "position_qty": float(current_qty),
-                    "side": order_side,
-                    "reduce_only": True,
-                    "order": result.order,
-                },
-            )
-
-        await self._sync_live_account(force=True)
-        await self._broadcast_runtime_update()
-        return self.status()
 
     async def flatten_position(self, price: float | None = None, note: str | None = None) -> dict:
         async with self._lock:
@@ -1612,7 +1247,14 @@ class ModeController:
             market_price = float(self._state.entry_price)
 
         balance = float(self._state.cash)
-        equity = float(self._state.equity or balance)
+        if self._engine is not None and market_price is not None:
+            equity = float(self._engine.mark_equity(
+                state=self._state,
+                market_type=self._status.config.market_type,
+                market_price=float(market_price),
+            ))
+        else:
+            equity = float(self._state.equity or balance)
         realized_pnl = float(self._state.realized_pnl or 0.0)
 
         unrealized_pnl = 0.0
@@ -1717,6 +1359,7 @@ class ModeController:
                 return
 
         self._equity_points.append(point)
+        self._paper_metrics_dirty = True
         if len(self._equity_points) > 10000:
             self._equity_points = self._equity_points[-10000:]
 
@@ -1733,6 +1376,14 @@ class ModeController:
                 realized_pnl=self._safe_float_value(point.get("realized_pnl"), 0.0),
                 drawdown_pct=self._safe_float_value(point.get("drawdown_pct"), 0.0),
             )
+
+    def _get_cached_metrics_payload(self) -> dict:
+        # Keep /status lightweight for the v0.8 UI. Full metrics are rebuilt only
+        # after a fill or equity append marks the cache dirty.
+        if self._paper_metrics_cache is None or self._paper_metrics_dirty:
+            self._paper_metrics_cache = self._build_metrics_payload()
+            self._paper_metrics_dirty = False
+        return dict(self._paper_metrics_cache)
 
     def _build_metrics_payload(self) -> dict:
         raw_fills = []
@@ -1899,7 +1550,7 @@ class ModeController:
             )
             if restored_state
             else None
-        )        
+        )
 
         self._fills = []
         self._recent_fill_keys = []
@@ -1915,6 +1566,8 @@ class ModeController:
             item for item in restored_points_raw if isinstance(item, Mapping)
         ]
         self._equity_points = self._normalize_equity_points(restored_points)
+        self._paper_metrics_cache = None
+        self._paper_metrics_dirty = True
         self._reset_risk_runtime_locked()
         for fill in self._fills:
             self._register_fill_for_risk_locked(fill)
@@ -1951,31 +1604,12 @@ class ModeController:
         self._fills = []
         self._equity_points = []
         self._trace = []
+        self._paper_metrics_cache = None
+        self._paper_metrics_dirty = True
         self._recent_fill_keys = []
         self._recent_fill_key_set = set()
         self._reconnect_attempts = 0
         self._last_fetch_error = None
-        self._live_execution = None
-        self._live_balance = None
-        self._live_open_orders = []
-        self._live_positions = []
-        self._live_order_registry = {}
-        self._live_fill_id_set = set()
-        self._live_trade_since_ms = None
-        self._live_private_stream_connected = False
-        self._live_order_registry = {}
-        self._live_fill_id_set = set()
-        self._live_trade_since_ms = None
-        self._live_private_stream_connected = False
-        self._live_last_sync_at = None
-        self._live_last_sync_error = None
-        self._live_recovery_performed = False
-        self._live_recovered_from_exchange_at = None
-        self._live_recovery_summary = None
-        self._live_exchange_leverage = None
-        self._live_exchange_margin_mode = None
-        self._live_leverage_match = None
-        self._live_margin_mode_match = None
         self._reset_risk_runtime_locked()
 
     def _build_runtime_objects(self) -> None:
@@ -2037,910 +1671,6 @@ class ModeController:
         self._status.stopped_at = None
         self._status.last_error = None
 
-    def _build_live_service_locked(self, *, armed: bool | None = None) -> None:
-        cfg = self._status.config
-        effective_armed = self._live_run_armed if armed is None else bool(armed)
-
-        self._live_execution = LiveExecutionService(
-            exchange_name=cfg.exchange_name,
-            market_type=cfg.market_type,
-            testnet=cfg.exchange_testnet,
-            settle_currency=str(cfg.exchange_settle_currency or "USDT").upper(),
-            api_key_env=cfg.exchange_api_key_env,
-            api_secret_env=cfg.exchange_api_secret_env,
-            api_passphrase_env=cfg.exchange_api_passphrase_env,
-            live_api_key_env=cfg.exchange_live_api_key_env,
-            live_api_secret_env=cfg.exchange_live_api_secret_env,
-            live_api_passphrase_env=cfg.exchange_live_api_passphrase_env,
-            demo_api_key_env=cfg.exchange_demo_api_key_env,
-            demo_api_secret_env=cfg.exchange_demo_api_secret_env,
-            demo_api_passphrase_env=cfg.exchange_demo_api_passphrase_env,
-            client_order_id_prefix=cfg.client_order_id_prefix,
-            armed=effective_armed,
-            dry_run=cfg.live_dry_run,
-        )
-
-    async def _sync_live_account(self, *, force: bool = False) -> None:
-        if self._status.mode != Mode.LIVE:
-            return
-
-        live_execution = self._live_execution
-        if live_execution is None:
-            return
-
-        cfg = self._status.config
-
-        try:
-            snapshot = await asyncio.to_thread(
-                live_execution.sync_account,
-                symbol=cfg.symbol,
-            )
-
-            async with self._lock:
-                before = self._capture_live_exposure_signature_locked()                
-                self._live_balance = dict(snapshot.get("balance") or {})
-                self._live_balance["position_mode"] = snapshot.get("position_mode")
-                self._live_open_orders = list(snapshot.get("open_orders") or [])
-                self._live_positions = list(snapshot.get("positions") or [])
-                self._live_last_sync_at = snapshot.get("synced_at")
-                self._live_last_sync_error = None
-                orphan_count = self._import_orphan_live_open_orders_locked()                
-                self._merge_live_open_orders_into_registry_locked()
-                await self._reconcile_live_orders_locked(force=force)
-                self._sync_shadow_state_from_live_account_locked()
-                self._refresh_live_leverage_status_locked()
-                after = self._capture_live_exposure_signature_locked()
-                transition = self._describe_live_exposure_transition_locked(before, after)
-                active_positions = self._active_live_positions_locked()
-                self._live_recovery_summary = {
-                    "symbol": cfg.symbol,
-                    "open_order_count": len(self._live_open_orders),
-                    "position_count": len(active_positions),
-                    "raw_position_count": len(self._live_positions),
-                    "orphan_open_orders_imported": orphan_count,
-                    "transition": transition,
-                    "last_sync_mode": "regular",
-                }
-                self._rebuild_trade_identity_from_live_position_locked()                
-
-                await self._check_live_max_loss_kill_switch()                
-
-                ticker = dict(snapshot.get("ticker") or {})
-                last_price = ticker.get("last")
-
-                if last_price is not None:
-                    try:
-                        price_value = float(last_price)
-                        self._latest_bar = {
-                            "timestamp": snapshot.get("synced_at"),
-                            "open": price_value,
-                            "high": price_value,
-                            "low": price_value,
-                            "close": price_value,
-                            "volume": 0.0,
-                            "source": "live_sync",
-                        }
-                        if self._state is not None:
-                            await self._mark_to_market(price_value)
-                    except (TypeError, ValueError):
-                        pass
-
-                self._persist_status()
-                self._persist_snapshot()
-
-            await self._broadcast_runtime_update()
-
-            if force:
-                await self._broadcast_trace_event(
-                    "live_account_sync",
-                    data={
-                        "run_id": self._status.run_id,
-                        "symbol": cfg.symbol,
-                        "exchange": cfg.exchange_name,
-                        "open_order_count": len(snapshot.get("open_orders") or []),
-                        "position_count": len(self._active_live_positions_locked()),
-                        "raw_position_count": len(snapshot.get("positions") or []),
-                        "registry_count": len(self._live_order_registry),
-                        "synced_at": snapshot.get("synced_at"),
-                    },
-                )
-
-        except Exception as e:
-            async with self._lock:
-                self._live_last_sync_error = str(e)
-                self._persist_status()
-                self._persist_snapshot()
-
-            if force:
-                await self._broadcast_trace_event(
-                    "live_account_sync_error",
-                    data={
-                        "run_id": self._status.run_id,
-                        "symbol": cfg.symbol,
-                        "exchange": cfg.exchange_name,
-                        "error": str(e),
-                    },
-                )
-
-    def _capture_live_exposure_signature_locked(self) -> dict[str, Any]:
-        side = None
-        qty = 0.0
-        entry_price = None
-
-        if self._state is not None and float(self._state.position_qty or 0.0) > 0.0:
-            side = str(self._state.side or "").strip().lower() or None
-            qty = abs(float(self._state.position_qty or 0.0))
-            entry_price = self._state.entry_price
-
-        return {
-            "side": side,
-            "qty": float(qty),
-            "entry_price": entry_price,
-        }
-
-    def _primary_live_position_locked(self) -> dict[str, Any] | None:
-        best: dict[str, Any] | None = None
-        best_qty = 0.0
-
-        for position in self._live_positions or []:
-            try:
-                base_qty = abs(float(position.get("base_qty") or 0.0))
-            except (TypeError, ValueError):
-                base_qty = 0.0
-            if base_qty <= 0.0:
-                continue
-            if base_qty > best_qty:
-                best = position
-                best_qty = base_qty
-
-        return best
-
-    def _infer_live_registry_fill_type_locked(self, row: dict[str, Any]) -> str:
-        if bool(row.get("reduce_only")):
-            return "EXIT"
-        side = str(row.get("side") or "").strip().lower()
-        if side in {"buy", "sell"}:
-            return "ENTRY"
-        return "ENTRY"
-
-    def _import_orphan_live_open_orders_locked(self) -> int:
-        imported = 0
-        for row in self._live_open_orders or []:
-            order_id = str(row.get("id") or "")
-            if not order_id:
-                continue
-
-            registry = self._live_order_registry.get(order_id, {})
-            if not registry:
-                imported += 1
-
-            registry.update({
-                "order_id": order_id,
-                "client_order_id": row.get("client_order_id"),
-                "symbol": row.get("symbol"),
-                "requested_side": row.get("side"),
-                "reduce_only": bool(row.get("reduce_only") or False),
-                "fill_type": registry.get("fill_type") or self._infer_live_registry_fill_type_locked(row),
-                "requested_base_qty": float(
-                    row.get("amount_base_qty")
-                    or row.get("filled_base_qty")
-                    or registry.get("requested_base_qty")
-                    or 0.0
-                ),
-                "filled_base_qty": float(row.get("filled_base_qty") or 0.0),
-                "remaining_base_qty": float(row.get("remaining_base_qty") or 0.0),
-                "status": str(row.get("status") or registry.get("status") or "open"),
-                "submitted_at": row.get("submitted_at") or registry.get("submitted_at"),
-                "acknowledged_at": row.get("acknowledged_at") or registry.get("acknowledged_at"),
-                "filled_at": row.get("filled_at") or registry.get("filled_at"),
-                "avg_price": row.get("average") or row.get("price") or registry.get("avg_price"),
-                "fee_cost": float(row.get("fee_cost") or registry.get("fee_cost") or 0.0),
-                "contract_size": row.get("contract_size") or registry.get("contract_size"),
-                "recovered_from_exchange": True,
-                "raw_order": row,
-                "fills_seen": registry.get("fills_seen", []),
-            })
-            self._live_order_registry[order_id] = registry
-
-        return imported
-
-    def _rebuild_trade_identity_from_live_position_locked(self) -> dict[str, Any]:
-        summary = {
-            "recovered_position": False,
-            "active_trade_id": None,
-            "position_side": None,
-            "position_qty": 0.0,
-            "position_entry_price": None,
-        }
-
-        if self._state is None:
-            return summary
-
-        qty = abs(float(self._state.position_qty or 0.0))
-        if qty <= 0.0:
-            self._state.active_trade_id = None
-            self._position_peak_price = None
-            return summary
-
-        current_trade_id = int(self._trade_id or 0)
-        active_trade_id = getattr(self._state, "active_trade_id", None)
-
-        if active_trade_id is None:
-            current_trade_id += 1
-            self._trade_id = current_trade_id
-            self._state.active_trade_id = current_trade_id
-        else:
-            self._trade_id = max(current_trade_id, int(active_trade_id))
-
-        mark_ref = self._latest_bar.get("close") if isinstance(self._latest_bar, dict) else None
-        try:
-            self._position_peak_price = float(mark_ref or self._state.entry_price or 0.0) or None
-        except Exception:
-            self._position_peak_price = self._state.entry_price
-
-        summary.update({
-            "recovered_position": True,
-            "active_trade_id": self._state.active_trade_id,
-            "position_side": self._state.side,
-            "position_qty": qty,
-            "position_entry_price": self._state.entry_price,
-        })
-        return summary
-
-    def _describe_live_exposure_transition_locked(
-        self,
-        before: dict[str, Any],
-        after: dict[str, Any],
-    ) -> dict[str, Any]:
-        before_side = str(before.get("side") or "")
-        after_side = str(after.get("side") or "")
-        before_qty = float(before.get("qty") or 0.0)
-        after_qty = float(after.get("qty") or 0.0)
-
-        if before_qty <= 0.0 and after_qty <= 0.0:
-            return {"transition": "flat_to_flat"}
-
-        if before_qty <= 0.0 and after_qty > 0.0:
-            return {"transition": "flat_to_open", "side": after_side, "qty": after_qty}
-
-        if before_qty > 0.0 and after_qty <= 0.0:
-            return {"transition": "open_to_flat", "side": before_side, "qty": before_qty}
-
-        if before_side != after_side:
-            return {
-                "transition": "side_flip",
-                "from_side": before_side,
-                "to_side": after_side,
-                "from_qty": before_qty,
-                "to_qty": after_qty,
-            }
-
-        if after_qty < before_qty:
-            return {
-                "transition": "partial_reduce",
-                "side": after_side,
-                "from_qty": before_qty,
-                "to_qty": after_qty,
-                "delta_qty": before_qty - after_qty,
-            }
-
-        if after_qty > before_qty:
-            return {
-                "transition": "scale_in",
-                "side": after_side,
-                "from_qty": before_qty,
-                "to_qty": after_qty,
-                "delta_qty": after_qty - before_qty,
-            }
-
-        entry_before = before.get("entry_price")
-        entry_after = after.get("entry_price")
-        if entry_before != entry_after:
-            return {
-                "transition": "entry_price_changed",
-                "side": after_side,
-                "qty": after_qty,
-                "from_entry_price": entry_before,
-                "to_entry_price": entry_after,
-            }
-
-        return {"transition": "unchanged"}
-
-    def _live_position_side_locked(self) -> str | None:
-        if self._state is not None and float(self._state.position_qty or 0.0) > 0.0:
-            side = str(self._state.side or "").strip().lower()
-            if side in {"long", "short"}:
-                return side
-
-        for position in self._live_positions or []:
-            side = str(position.get("side") or "").strip().lower()
-            try:
-                base_qty = abs(float(position.get("base_qty") or 0.0))
-            except (TypeError, ValueError):
-                base_qty = 0.0
-            if base_qty > 0.0 and side in {"long", "short", "buy", "sell"}:
-                return "short" if side in {"short", "sell"} else "long"
-        return None
-
-    def _live_has_open_long_locked(self) -> bool:
-        return self._live_position_side_locked() == "long"
-
-    def _live_has_open_short_locked(self) -> bool:
-        return self._live_position_side_locked() == "short"
-
-    def _live_position_qty_locked(self) -> float:
-        if self._state is not None:
-            qty = abs(float(self._state.position_qty or 0.0))
-            if qty > 0.0:
-                return qty
-
-        for position in self._live_positions or []:
-            try:
-                base_qty = abs(float(position.get("base_qty") or 0.0))
-            except (TypeError, ValueError):
-                base_qty = 0.0
-            if base_qty > 0.0:
-                return base_qty
-
-        return 0.0
-
-    def _live_side_safe_order_intent(self, *, signal: int) -> dict[str, Any] | None:
-        current_side = self._live_position_side_locked()
-        allow_short = bool(self._status.config.allow_short) and str(self._status.config.market_type).lower() == "swap"
-        if signal > 0:
-            if current_side == "long":
-                return None
-            if current_side == "short":
-                return {"action": "exit_short", "side": "buy", "reduce_only": True, "fill_type": "EXIT"}
-            return {"action": "enter_long", "side": "buy", "reduce_only": False, "fill_type": "ENTRY"}
-        if signal < 0:
-            if current_side == "long":
-                return {"action": "exit_long", "side": "sell", "reduce_only": True, "fill_type": "EXIT"}
-            if current_side == "short":
-                return None
-            if allow_short:
-                return {"action": "enter_short", "side": "sell", "reduce_only": False, "fill_type": "ENTRY"}
-        return None
-
-    def _register_live_order_locked(self, *, order: dict[str, Any], requested_qty: float, requested_side: str, reduce_only: bool, fill_type: str) -> None:
-        order_id = str(order.get("id") or "")
-        if not order_id:
-            return
-        registry = self._live_order_registry.get(order_id, {})
-        registry.update({
-            "order_id": order_id,
-            "client_order_id": order.get("client_order_id"),
-            "symbol": order.get("symbol"),
-            "requested_side": requested_side,
-            "reduce_only": bool(reduce_only),
-            "fill_type": fill_type,
-            "requested_base_qty": float(requested_qty),
-            "filled_base_qty": float(order.get("filled_base_qty") or 0.0),
-            "remaining_base_qty": float(order.get("remaining_base_qty") or 0.0),
-            "status": str(order.get("status") or "open"),
-            "submitted_at": order.get("submitted_at"),
-            "acknowledged_at": order.get("acknowledged_at"),
-            "filled_at": order.get("filled_at"),
-            "avg_price": order.get("average") or order.get("price"),
-            "fee_cost": float(order.get("fee_cost") or 0.0),
-            "contract_size": order.get("contract_size"),
-            "fills_seen": registry.get("fills_seen", []),
-            "raw_order": order,
-        })
-        self._live_order_registry[order_id] = registry
-
-    def _merge_live_open_orders_into_registry_locked(self) -> None:
-        for row in self._live_open_orders or []:
-            order_id = str(row.get("id") or "")
-            if not order_id:
-                continue
-            registry = self._live_order_registry.get(order_id, {})
-            registry.update({
-                "order_id": order_id,
-                "client_order_id": row.get("client_order_id"),
-                "symbol": row.get("symbol"),
-                "status": str(row.get("status") or registry.get("status") or "open"),
-                "filled_base_qty": float(row.get("filled_base_qty") or registry.get("filled_base_qty") or 0.0),
-                "remaining_base_qty": float(row.get("remaining_base_qty") or registry.get("remaining_base_qty") or 0.0),
-                "avg_price": row.get("average") or row.get("price") or registry.get("avg_price"),
-                "fee_cost": float(row.get("fee_cost") or registry.get("fee_cost") or 0.0),
-                "contract_size": row.get("contract_size") or registry.get("contract_size"),
-                "raw_order": row,
-                "fills_seen": registry.get("fills_seen", []),
-            })
-            self._live_order_registry[order_id] = registry
-
-        live_open_ids = {str(row.get("id") or "") for row in self._live_open_orders or [] if str(row.get("id") or "")}
-        for order_id, registry in list(self._live_order_registry.items()):
-            if registry.get("status") in {"open", "partially_filled"} and order_id not in live_open_ids:
-                registry["status"] = "closed" if float(registry.get("filled_base_qty") or 0.0) > 0.0 else "canceled"
-
-    async def _reconcile_live_orders_locked(self, *, force: bool = False) -> None:
-        if self._live_execution is None or not self._live_order_registry:
-            return
-        now_ms = int(time.time() * 1000)
-        if self._live_trade_since_ms is None:
-            self._live_trade_since_ms = now_ms - 15 * 60 * 1000
-
-        for order_id, registry in list(self._live_order_registry.items()):
-            current_status = str(registry.get("status") or "open").lower()
-            if not force and current_status in {"closed", "canceled"}:
-                continue
-            try:
-                reconciled = await asyncio.to_thread(
-                    self._live_execution.reconcile_order,
-                    symbol=self._status.config.symbol,
-                    order_id=order_id,
-                    since_ms=self._live_trade_since_ms,
-                    expected_client_order_id=registry.get("client_order_id"),
-                )
-            except Exception:
-                continue
-
-            registry.update({
-                "status": str(reconciled.get("status") or registry.get("status") or "open"),
-                "filled_base_qty": float(reconciled.get("filled_base_qty") or registry.get("filled_base_qty") or 0.0),
-                "remaining_base_qty": float(reconciled.get("remaining_base_qty") or registry.get("remaining_base_qty") or 0.0),
-                "avg_price": reconciled.get("average") or reconciled.get("price") or registry.get("avg_price"),
-                "fee_cost": float(reconciled.get("fee_cost") or registry.get("fee_cost") or 0.0),
-                "filled_at": reconciled.get("filled_at") or registry.get("filled_at"),
-                "raw_order": reconciled,
-            })
-            fills_seen = set(registry.get("fills_seen") or [])
-            for trade in reconciled.get("fills") or []:
-                fill_id = str(trade.get("id") or "")
-                if not fill_id or fill_id in fills_seen or fill_id in self._live_fill_id_set:
-                    continue
-                fills_seen.add(fill_id)
-                self._live_fill_id_set.add(fill_id)
-                self._live_trade_since_ms = max(self._live_trade_since_ms or 0, int((self._safe_int_value(trade.get("timestamp"), 0) or 0) * 1000))
-            registry["fills_seen"] = sorted(fills_seen)
-            self._live_order_registry[order_id] = registry
-
-    async def _apply_live_fill_to_shadow_state_locked(
-        self,
-        *,
-        fill: Fill,
-        processed_ts: int | None,
-        market_price: float,
-    ) -> None:
-        if self._engine is None or self._state is None:
-            return
-
-        effective_ts = int(processed_ts or time.time())
-        fill_type = str(fill.type or "").upper()
-        exec_price = float(fill.price or market_price or 0.0)
-        exec_qty = abs(float(fill.qty or 0.0))
-
-        if exec_price <= 0.0 or exec_qty <= 0.0:
-            return
-
-        current_side = str(self._state.side or "").strip().lower() if self._state is not None else ""
-        if fill_type == "ENTRY" and float(self._state.position_qty or 0.0) <= 0.0:
-            self._trade_id = max(int(self._trade_id or 0), int(fill.trade_id or 0))
-            if str(fill.side or "").lower() == "short":
-                self._state, shadow_fill = self._engine.enter_short(
-                    ts_iso=str(effective_ts),
-                    state=self._state,
-                    close=exec_price,
-                    market_type=self._status.config.market_type,
-                    leverage=self._status.config.leverage,
-                    trade_id=int(fill.trade_id or self._trade_id or 1),
-                    qty_override=exec_qty,
-                    fee_override=float(fill.fee or 0.0),
-                )
-            else:
-                self._state, shadow_fill = self._engine.enter_long(
-                    ts_iso=str(effective_ts),
-                    state=self._state,
-                    close=exec_price,
-                    market_type=self._status.config.market_type,
-                    leverage=self._status.config.leverage,
-                    trade_id=int(fill.trade_id or self._trade_id or 1),
-                    qty_override=exec_qty,
-                    fee_override=float(fill.fee or 0.0),
-                )
-
-            if shadow_fill is not None:
-                fill.trade_id = shadow_fill.trade_id
-                fill.entry_price = shadow_fill.entry_price
-                fill.equity_after = float(shadow_fill.equity_after or 0.0)
-
-            await self._mark_to_market(exec_price)
-            if self._state is not None and (fill.equity_after is None or float(fill.equity_after or 0.0) <= 0.0):
-                fill.equity_after = float(self._state.equity or 0.0)
-            return
-
-        if fill_type in {"EXIT", "LIQUIDATION"} and float(self._state.position_qty or 0.0) > 0.0:
-            if current_side == "short":
-                self._state, shadow_fill = self._engine.exit_short(
-                    ts_iso=str(effective_ts),
-                    state=self._state,
-                    close=exec_price,
-                    market_type=self._status.config.market_type,
-                    trade_id=int(fill.trade_id or self._trade_id or 1),
-                    fee_override=float(fill.fee or 0.0),
-                )
-            else:
-                self._state, shadow_fill = self._engine.exit_long(
-                    ts_iso=str(effective_ts),
-                    state=self._state,
-                    close=exec_price,
-                    market_type=self._status.config.market_type,
-                    trade_id=int(fill.trade_id or self._trade_id or 1),
-                    fee_override=float(fill.fee or 0.0),
-                )
-
-            if shadow_fill is not None:
-                fill.trade_id = shadow_fill.trade_id
-                fill.exit_price = shadow_fill.exit_price
-                fill.pnl = shadow_fill.pnl
-                fill.equity_after = float(shadow_fill.equity_after or 0.0)
-
-            await self._mark_to_market(exec_price)
-            if self._state is not None and (fill.equity_after is None or float(fill.equity_after or 0.0) <= 0.0):
-                fill.equity_after = float(self._state.equity or 0.0)
-            return
-
-    def _refresh_live_leverage_status_locked(self) -> None:
-        configured_leverage = None
-        try:
-            configured_leverage = float(self._status.config.leverage or 1.0)
-        except Exception:
-            configured_leverage = None
-        configured_margin_mode = str(getattr(self._status.config, "margin_mode", "cross") or "cross").strip().lower()
-
-        exchange_leverage = None
-        exchange_margin_mode = None
-
-        primary = self._primary_live_position_locked()
-        if isinstance(primary, dict):
-            try:
-                value = primary.get("leverage")
-                if value is not None:
-                    exchange_leverage = float(value)
-            except Exception:
-                exchange_leverage = None
-            raw_mode = primary.get("margin_mode")
-            if raw_mode is not None:
-                exchange_margin_mode = str(raw_mode).strip().lower() or None
-
-        if exchange_margin_mode is None or exchange_leverage is None:
-            preflight = getattr(self._live_execution, "last_risk_preflight", None) if self._live_execution is not None else None
-            if isinstance(preflight, dict):
-                raw_mode = preflight.get("exchange_margin_mode")
-                if raw_mode is not None:
-                    exchange_margin_mode = str(raw_mode).strip().lower() or None
-                try:
-                    raw_lev = preflight.get("exchange_leverage")
-                    if raw_lev is not None:
-                        exchange_leverage = float(raw_lev)
-                except Exception:
-                    pass
-
-        self._live_exchange_leverage = exchange_leverage
-        self._live_exchange_margin_mode = exchange_margin_mode
-        self._live_leverage_match = (
-            None
-            if configured_leverage is None or exchange_leverage is None
-            else abs(float(configured_leverage) - float(exchange_leverage)) <= 1e-9
-        )
-        self._live_margin_mode_match = (
-            None if exchange_margin_mode is None else exchange_margin_mode == configured_margin_mode
-        )
-
-    def _validate_live_position_mode_locked(self) -> None:
-        if self._status.config.market_type != "swap" or self._live_execution is None:
-            return
-        position_mode = (self._live_balance or {}).get("position_mode") if isinstance(self._live_balance, dict) else None
-        if position_mode is None:
-            position_mode = self._live_execution.get_position_mode()
-        if position_mode and str(position_mode).strip().lower() not in {"single", "oneway", "one_way"}:
-            raise RuntimeError(f"Live swap trading requires single/one-way position mode. Current mode: {position_mode}")
-
-    def _build_live_client_order_id(self, *, side: str, reduce_only: bool) -> str:
-        run_tail = str(self._status.run_id or "live").split("-")[-1]
-        ts_tail = str(int(time.time() * 1000))[-8:]
-        side_tag = "b" if str(side).lower() == "buy" else "s"
-        ro_tag = "r" if reduce_only else "n"
-        return f"t-{run_tail}-{side_tag}{ro_tag}-{ts_tail}"[:28]
-
-    async def _submit_live_signal_order(
-        self,
-        *,
-        side: str,
-        qty: float,
-        reduce_only: bool,
-        fill_type: str,
-        market_price: float,
-        processed_ts: int | None,
-    ) -> None:
-        live_execution = self._live_execution
-        if live_execution is None:
-            raise RuntimeError("Live execution service is not initialized.")
-
-        if qty <= 0.0:
-            raise RuntimeError("Live order qty must be > 0.")
-
-        client_order_id = self._build_live_client_order_id(
-            side=side,
-            reduce_only=reduce_only,
-        )
-        self._validate_live_position_mode_locked()
-
-        try:
-            result = await asyncio.to_thread(
-                live_execution.submit_order,
-                symbol=self._status.config.symbol,
-                side=side,
-                qty=float(qty),
-                order_type="market",
-                price=None,
-                reduce_only=reduce_only,
-                client_order_id=client_order_id,
-                leverage=self._status.config.leverage,
-                margin_mode=self._status.config.margin_mode,
-            )
-        except Exception as exc:
-            self._refresh_live_leverage_status_locked()
-            self._status.last_error = str(exc)
-            await self._broadcast_trace_event(
-                "live_order_risk_preflight_error",
-                note="Live leverage/margin verification blocked the order.",
-                data={
-                    "run_id": self._status.run_id,
-                    "symbol": self._status.config.symbol,
-                    "side": side,
-                    "reduce_only": bool(reduce_only),
-                    "configured_leverage": self._status.config.leverage,
-                    "exchange_leverage": self._live_exchange_leverage,
-                    "leverage_match": self._live_leverage_match,
-                    "configured_margin_mode": self._status.config.margin_mode,
-                    "exchange_margin_mode": self._live_exchange_margin_mode,
-                    "margin_mode_match": self._live_margin_mode_match,
-                    "error": str(exc),
-                },
-            )
-            raise        
-
-        self._register_live_order_locked(
-            order=result.order,
-            requested_qty=float(qty),
-            requested_side=side,
-            reduce_only=reduce_only,
-            fill_type=fill_type,
-        )
-
-        fill = live_execution.fill_from_order(
-            order=result.order,
-            fill_type=fill_type,
-            market_price=float(market_price),
-            trade_id=(self._trade_id if self._trade_id > 0 else None),
-            expected_price=float(market_price),
-            expected_qty=float(qty),
-        )
-
-        await self._apply_live_fill_to_shadow_state_locked(
-            fill=fill,
-            processed_ts=processed_ts,
-            market_price=float(market_price),
-        )
-        await self._append_fill(fill)
-
-        self._refresh_live_leverage_status_locked()
-        self._persist_status()
-        self._persist_snapshot()
-
-        await self._broadcast_trace_event(
-            "live_order_submitted",
-            data={
-                "run_id": self._status.run_id,
-                "symbol": self._status.config.symbol,
-                "side": side,
-                "qty": float(qty),
-                "reduce_only": bool(reduce_only),
-                "fill_type": fill_type,
-                "dry_run": result.dry_run,
-                "armed": result.armed,
-                "order": result.order,
-            },
-        )
-
-        await self._sync_live_account(force=True)
-
-    async def _run_live_loop(self) -> None:
-        try:
-            while not self._stop_event.is_set():
-                cfg = self._status.config
-
-                await self._sync_live_account(force=False)
-
-                bars = await asyncio.to_thread(
-                    self._fetch_recent_bars,
-                    cfg.symbol,
-                    cfg.interval,
-                    max(50, int(cfg.candle_limit or 300)),
-                )
-
-                if not bars:
-                    raise RuntimeError("No bars returned from market data service.")
-
-                self._reconnect_attempts = 0
-                self._last_fetch_error = None
-
-                latest_bar = bars[-1]
-                self._latest_bar = latest_bar
-                self._bars = bars[-max(1000, int(cfg.candle_limit or 300)) :]
-
-                latest_price = float(latest_bar["close"])
-                if self._state is not None:
-                    await self._mark_to_market(latest_price)
-
-                if self._live_kill_switch_triggered:
-                    self._persist_status()
-                    self._persist_snapshot()
-                    await self._sleep_or_stop(float(getattr(cfg, "live_poll_seconds", 3.0) or 3.0))
-                    continue
-
-                if self._live_has_open_long_locked():
-                    static_exit = self._check_static_exit_locked(latest_price)
-                    if static_exit.get("should_exit"):
-                        exit_qty = self._live_position_qty_locked()
-                        if exit_qty > 0.0:
-                            await self._submit_live_signal_order(
-                                side="sell",
-                                qty=exit_qty,
-                                reduce_only=(cfg.market_type == "swap"),
-                                fill_type="EXIT",
-                                market_price=latest_price,
-                                processed_ts=self._safe_int_value(latest_bar.get("timestamp"), int(time.time())),
-                            )
-                            await self._broadcast_trace_event(
-                                "live_risk_exit",
-                                note=f"Live {static_exit.get('reason')} triggered.",
-                                data={
-                                    "reason": static_exit.get("reason"),
-                                    "market_price": latest_price,
-                                    "meta": static_exit.get("meta", {}) or {},
-                                },
-                            )
-                            await self._sleep_or_stop(float(getattr(cfg, "live_poll_seconds", 3.0) or 3.0))
-                            continue
-
-                stable_bars, processed_ts = self._stable_bars_for_signal(bars)
-
-                if (
-                    processed_ts is not None
-                    and (
-                        self._last_processed_bar_ts is None
-                        or int(processed_ts) > int(self._last_processed_bar_ts)
-                    )
-                ):
-                    signal = int(self._latest_signal_from_bars(stable_bars, cfg))
-                    self._last_signal = signal
-                    self._last_processed_bar_ts = int(processed_ts)
-
-                    await self._broadcast_trace_event(
-                        "live_signal_evaluated",
-                        data={
-                            "processed_bar_ts": int(processed_ts),
-                            "signal": signal,
-                            "bar_count": len(stable_bars),
-                            "latest_close": float(stable_bars[-1]["close"]) if stable_bars else None,
-                            "source": stable_bars[-1].get("source") if stable_bars else None,
-                            "strategy_name": self._resolved_strategy_name_from_config(cfg),
-                            "strategy_params": self._resolved_strategy_params_from_config(cfg),
-                        },
-                    )
-
-                    intent = self._live_side_safe_order_intent(signal=signal)
-                    if intent is not None:
-                        is_entry = str(intent.get("fill_type")) == "ENTRY"
-                        submit_qty = self._live_position_qty_locked()
-                        if is_entry:
-                            entry_gate = self._check_entry_gate_locked(
-                                latest_price,
-                                now_ts=processed_ts,
-                            )
-                            if not entry_gate["allowed"]:
-                                self._risk_halt_reason = entry_gate["reason"]
-                                await self._broadcast_trace_event(
-                                    "live_entry_blocked",
-                                    note=f"Risk blocked live entry: {entry_gate['reason']}",
-                                    data={
-                                        "processed_bar_ts": int(processed_ts),
-                                        "price": latest_price,
-                                        **(entry_gate.get("meta", {}) or {}),
-                                    },
-                                )
-                                submit_qty = 0.0
-                            else:
-                                submit_qty = float(self._compute_entry_qty_locked(latest_price) or 0.0)
-                                if submit_qty > 0.0:
-                                    self._trade_id += 1
-                        if not is_entry:
-                            submit_qty = self._live_position_qty_locked()
-
-                        if submit_qty > 0.0:
-                            await self._submit_live_signal_order(
-                                side=str(intent.get("side") or "buy"),
-                                qty=float(submit_qty),
-                                reduce_only=bool(intent.get("reduce_only")),
-                                fill_type=str(intent.get("fill_type") or "ENTRY"),
-                                market_price=latest_price,
-                                processed_ts=int(processed_ts),
-                            )
-                            await self._broadcast_trace_event(
-                                "live_signal_fill",
-                                data={
-                                    "signal": signal,
-                                    "processed_bar_ts": int(processed_ts),
-                                    "price": latest_price,
-                                    "trade_id": self._trade_id,
-                                    "fill_type": str(intent.get("fill_type") or "ENTRY"),
-                                    "action": intent.get("action"),
-                                },
-                            )
-                        elif is_entry:
-                            await self._broadcast_trace_event(
-                                "live_entry_skipped",
-                                note="Computed live entry qty was zero.",
-                                data={
-                                    "processed_bar_ts": int(processed_ts),
-                                    "price": latest_price,
-                                },
-                            )
-
-                self._persist_status()
-                self._persist_snapshot()
-                await self._broadcast_runtime_update()
-                await self._sleep_or_stop(float(getattr(cfg, "live_poll_seconds", 3.0) or 3.0))
-
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            self._reconnect_attempts += 1
-            self._last_fetch_error = str(e)
-
-            self._persist_status()
-            self._persist_snapshot()
-
-            await self._broadcast_trace_event(
-                "live_reconnect_wait",
-                note="Live loop fetch/process error. Retrying.",
-                data={
-                    "attempt": self._reconnect_attempts,
-                    "error": str(e),
-                },
-            )
-
-            max_attempts = max(1, int(self._status.config.max_reconnect_attempts or 8))
-            backoff_base = max(1.0, float(self._status.config.reconnect_backoff_base or 1.5))
-
-            if self._reconnect_attempts >= max_attempts:
-                self._status.state = EngineState.ERROR
-                self._status.last_error = (
-                    f"Live loop stopped after {self._reconnect_attempts} reconnect attempts: {e}"
-                )
-                self._status.stopped_at = time.time()
-                self._persist_status()
-                self._persist_snapshot()
-
-                await self._broadcast_trace_event(
-                    "live_error",
-                    note="Reconnect limit reached. Live loop stopped.",
-                    data={
-                        "attempts": self._reconnect_attempts,
-                        "error": str(e),
-                    },
-                )
-                return
-
-            delay = min(30.0, backoff_base ** max(0, self._reconnect_attempts - 1))
-            await self._sleep_or_stop(delay)
-            if not self._stop_event.is_set():
-                await self._run_live_loop()
-
     async def _broadcast_runtime_update(self) -> None:
         latest_price = None
         latest_candle = None
@@ -2975,22 +1705,7 @@ class ModeController:
 
     def _fetch_recent_bars(self, symbol: str, interval: str, limit: int) -> list[dict]:
         try:
-            if (
-                self._status.mode == Mode.LIVE
-                and self._live_execution is not None
-            ):
-                bars = self._live_execution.adapter.fetch_ohlcv(
-                    symbol=symbol,
-                    timeframe=interval,
-                    limit=limit,
-                )
-                return bars or []
-
-            bars = self.market_data.get_candles(
-                symbol=symbol,
-                interval=interval,
-                limit=limit,
-            )
+            bars = self.market_data.get_candles(symbol=symbol, interval=interval, limit=limit)
             return bars or []
         except Exception:
             return []
@@ -3012,6 +1727,7 @@ class ModeController:
             return
 
         self._fills.append(normalized)
+        self._paper_metrics_dirty = True
         if len(self._fills) > 5000:
             self._fills = self._fills[-5000:]
 
@@ -3112,10 +1828,6 @@ class ModeController:
             await self._append_fill(fill)
 
     async def _run_loop(self) -> None:
-        if self._status.mode == Mode.LIVE:
-            await self._run_live_loop()
-            return
-
         try:
             while not self._stop_event.is_set():
                 cfg = self._status.config
@@ -3178,14 +1890,12 @@ class ModeController:
 
                     if self._state is not None and self._engine is not None:
                         fill = None
-
-                        # v0.7.6.3: position_qty is stored as an absolute size.
-                        # Direction MUST come from state.side, not from the sign of qty.
-                        position_qty = abs(float(self._state.position_qty or 0.0))
+                        qty_now = float(self._state.position_qty or 0.0)
                         position_side = str(getattr(self._state, "side", None) or "").lower() or None
-                        is_flat = position_qty <= 0.0 or position_side is None
+                        is_flat = abs(qty_now) <= 1e-12
 
-                        if signal > 0 and position_side == "short" and cfg.exit_on_signal:
+                        # side-aware marker: signal > 0 and position_side == 'short' means cover short first.
+                        if cfg.exit_on_signal and signal > 0 and position_side == "short":
                             self._state, fill = self._engine.exit_short(
                                 ts_iso=str(int(processed_ts)),
                                 state=self._state,
@@ -3193,13 +1903,24 @@ class ModeController:
                                 market_type=cfg.market_type,
                                 trade_id=self._trade_id,
                             )
+                            if fill is not None:
+                                await self._append_fill(fill)
+                                await self._broadcast_trace_event(
+                                    "signal_fill",
+                                    data={
+                                        "signal": signal,
+                                        "processed_bar_ts": int(processed_ts),
+                                        "price": latest_price,
+                                        "trade_id": getattr(fill, "trade_id", None),
+                                        "fill_type": getattr(fill, "type", None),
+                                    },
+                                )
+                            qty_now = float(self._state.position_qty or 0.0)
+                            position_side = str(getattr(self._state, "side", None) or "").lower() or None
+                            is_flat = abs(qty_now) <= 1e-12
 
-                        elif signal > 0 and is_flat:
-                            entry_gate = self._check_entry_gate_locked(
-                                latest_price,
-                                now_ts=processed_ts,
-                            )
-
+                        if signal > 0 and is_flat:
+                            entry_gate = self._check_entry_gate_locked(latest_price, now_ts=processed_ts)
                             if entry_gate["allowed"]:
                                 self._trade_id += 1
                                 self._state, fill = self._engine.enter_long(
@@ -3211,19 +1932,31 @@ class ModeController:
                                     trade_id=self._trade_id,
                                     qty_override=self._compute_entry_qty_locked(latest_price),
                                 )
+                                if fill is not None:
+                                    await self._append_fill(fill)
+                                    await self._broadcast_trace_event(
+                                        "signal_fill",
+                                        data={
+                                            "signal": signal,
+                                            "processed_bar_ts": int(processed_ts),
+                                            "price": latest_price,
+                                            "trade_id": getattr(fill, "trade_id", None),
+                                            "fill_type": getattr(fill, "type", None),
+                                        },
+                                    )
                             else:
                                 self._risk_halt_reason = entry_gate["reason"]
                                 await self._broadcast_trace_event(
                                     "entry_blocked",
-                                    note=f"Risk blocked long entry: {entry_gate['reason']}",
+                                    note=f"Risk blocked entry: {entry_gate['reason']}",
                                     data={
-                                        "side": "long",
                                         "processed_bar_ts": int(processed_ts),
                                         "price": latest_price,
                                         **(entry_gate.get("meta", {}) or {}),
                                     },
                                 )
 
+                        # side-aware marker: signal < 0 and position_side == 'long' means exit long first.
                         elif cfg.exit_on_signal and signal < 0 and position_side == "long":
                             self._state, fill = self._engine.exit_long(
                                 ts_iso=str(int(processed_ts)),
@@ -3232,13 +1965,49 @@ class ModeController:
                                 market_type=cfg.market_type,
                                 trade_id=self._trade_id,
                             )
+                            if fill is not None:
+                                await self._append_fill(fill)
+                                await self._broadcast_trace_event(
+                                    "signal_fill",
+                                    data={
+                                        "signal": signal,
+                                        "processed_bar_ts": int(processed_ts),
+                                        "price": latest_price,
+                                        "trade_id": getattr(fill, "trade_id", None),
+                                        "fill_type": getattr(fill, "type", None),
+                                    },
+                                )
+                            qty_now = float(self._state.position_qty or 0.0)
+                            position_side = str(getattr(self._state, "side", None) or "").lower() or None
+                            is_flat = abs(qty_now) <= 1e-12
 
+                            if cfg.allow_short and is_flat and is_derivatives_market(cfg.market_type):
+                                self._trade_id += 1
+                                self._state, fill = self._engine.enter_short(
+                                    ts_iso=str(int(processed_ts)),
+                                    state=self._state,
+                                    close=latest_price,
+                                    market_type=cfg.market_type,
+                                    leverage=cfg.leverage,
+                                    trade_id=self._trade_id,
+                                    qty_override=self._compute_entry_qty_locked(latest_price),
+                                )
+                                if fill is not None:
+                                    await self._append_fill(fill)
+                                    await self._broadcast_trace_event(
+                                        "signal_fill",
+                                        data={
+                                            "signal": signal,
+                                            "processed_bar_ts": int(processed_ts),
+                                            "price": latest_price,
+                                            "trade_id": getattr(fill, "trade_id", None),
+                                            "fill_type": getattr(fill, "type", None),
+                                        },
+                                    )
+
+                        # side-aware marker: signal < 0 and is_flat and bool(cfg.allow_short) and is_derivatives_market(cfg.market_type) opens a fresh short.
                         elif signal < 0 and is_flat and bool(cfg.allow_short) and is_derivatives_market(cfg.market_type):
-                            entry_gate = self._check_entry_gate_locked(
-                                latest_price,
-                                now_ts=processed_ts,
-                            )
-
+                            entry_gate = self._check_entry_gate_locked(latest_price, now_ts=processed_ts)
                             if entry_gate["allowed"]:
                                 self._trade_id += 1
                                 self._state, fill = self._engine.enter_short(
@@ -3250,32 +2019,29 @@ class ModeController:
                                     trade_id=self._trade_id,
                                     qty_override=self._compute_entry_qty_locked(latest_price),
                                 )
+                                if fill is not None:
+                                    await self._append_fill(fill)
+                                    await self._broadcast_trace_event(
+                                        "signal_fill",
+                                        data={
+                                            "signal": signal,
+                                            "processed_bar_ts": int(processed_ts),
+                                            "price": latest_price,
+                                            "trade_id": getattr(fill, "trade_id", None),
+                                            "fill_type": getattr(fill, "type", None),
+                                        },
+                                    )
                             else:
                                 self._risk_halt_reason = entry_gate["reason"]
                                 await self._broadcast_trace_event(
                                     "entry_blocked",
                                     note=f"Risk blocked short entry: {entry_gate['reason']}",
                                     data={
-                                        "side": "short",
                                         "processed_bar_ts": int(processed_ts),
                                         "price": latest_price,
                                         **(entry_gate.get("meta", {}) or {}),
                                     },
                                 )
-
-                        if fill is not None:
-                            await self._append_fill(fill)
-                            await self._broadcast_trace_event(
-                                "signal_fill",
-                                data={
-                                    "signal": signal,
-                                    "processed_bar_ts": int(processed_ts),
-                                    "price": latest_price,
-                                    "trade_id": getattr(fill, "trade_id", None),
-                                    "fill_type": getattr(fill, "type", None),
-                                },
-                            )
-
                 self._persist_status()
                 self._persist_snapshot()
                 await self._sleep_or_stop(cfg.poll_seconds)
@@ -3367,27 +2133,11 @@ class ModeController:
                 fallback_equity = self._status.config.initial_balance
             return float(fallback_equity or 0.0)
 
-        try:
-            marked = self._engine.mark_equity(
-                self._state,
-                self._status.config.market_type,
-                float(resolved_price),
-            )
-            if marked is None:
-                fallback_equity = self._state.equity
-                if fallback_equity is None:
-                    fallback_equity = self._state.cash
-                if fallback_equity is None:
-                    fallback_equity = self._status.config.initial_balance
-                return float(fallback_equity or 0.0)
-            return float(marked)
-        except Exception:
-            fallback_equity = self._state.equity
-            if fallback_equity is None:
-                fallback_equity = self._state.cash
-            if fallback_equity is None:
-                fallback_equity = self._status.config.initial_balance
-            return float(fallback_equity or 0.0)
+        return float(self._engine.mark_equity(
+            state=self._state,
+            market_type=self._status.config.market_type,
+            market_price=float(resolved_price),
+        ))
 
     def _reset_risk_runtime_locked(self) -> None:
         self._trade_day_key = self._risk_day_key_now()
@@ -3614,314 +2364,6 @@ class ModeController:
             },
         )
         return True
-
-    def _sync_shadow_state_from_live_account_locked(self) -> None:
-        if self._state is None:
-            return
-
-        live_total = self._extract_live_total_equity(self._live_balance)
-        primary = self._primary_live_position_locked()
-
-        unrealized = 0.0
-        if primary is not None:
-            try:
-                unrealized = float(primary.get("unrealized_pnl") or 0.0)
-            except (TypeError, ValueError):
-                unrealized = 0.0
-
-        if live_total is not None:
-            try:
-                self._state.cash = float(live_total) - float(unrealized)
-                self._state.equity = float(live_total)
-            except Exception:
-                pass
-
-        if primary is None:
-            self._state.position_qty = 0.0
-            self._state.entry_price = None
-            self._state.side = None
-            self._state.open_fee_paid = 0.0
-            self._state.active_trade_id = None
-            self._position_peak_price = None
-            return
-
-        try:
-            self._state.position_qty = abs(float(primary.get("base_qty") or 0.0))
-        except (TypeError, ValueError):
-            self._state.position_qty = 0.0
-
-        try:
-            self._state.entry_price = (
-                float(primary.get("entry_price"))
-                if primary.get("entry_price") is not None
-                else None
-            )
-        except (TypeError, ValueError):
-            self._state.entry_price = None
-
-        side = str(primary.get("side") or "").strip().lower()
-        if side in {"buy", "long"}:
-            self._state.side = "long"
-        elif side in {"sell", "short"}:
-            self._state.side = "short"
-        else:
-            self._state.side = None
-
-        try:
-            self._state.open_fee_paid = abs(float(
-                (primary.get("raw") or {}).get("realizedPnl")
-                or (primary.get("raw") or {}).get("realized_pnl")
-                or 0.0
-            ))
-        except Exception:
-            pass
-
-    def _extract_live_total_equity(self, balance: dict[str, Any] | None) -> float | None:
-        if not balance:
-            return None
-
-        total = dict(balance.get("total") or {})
-        settle = str(self._status.config.exchange_settle_currency or "USDT").upper()
-        candidates = [settle, settle.lower(), "USDT", "usd", "USD"]
-
-        for key in candidates:
-            value = total.get(key)
-            if value is None:
-                continue
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                continue
-
-        for value in total.values():
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                continue
-
-        return None
-
-    async def _trigger_live_kill_switch(self, reason: str) -> None:
-        if self._live_kill_switch_triggered:
-            return
-
-        self._live_kill_switch_triggered = True
-        self._live_kill_switch_reason = str(reason or "live_kill_switch")
-
-        if self._live_execution is not None:
-            self._live_execution.set_armed(False)
-
-        await self._broadcast_trace_event(
-            "live_kill_switch_triggered",
-            data={
-                "run_id": self._status.run_id,
-                "reason": self._live_kill_switch_reason,
-            },
-        )
-
-        await self._cancel_live_open_orders_best_effort()
-        self._stop_event.set()
-
-    async def _check_live_max_loss_kill_switch(self) -> None:
-        if self._status.mode != Mode.LIVE:
-            return
-
-        max_dd = self._status.config.max_drawdown_pct
-        if max_dd is None or max_dd <= 0:
-            return
-
-        live_equity = self._extract_live_total_equity(self._live_balance)
-        if live_equity is None:
-            return
-
-        if self._live_start_equity is None:
-            self._live_start_equity = live_equity
-            return
-
-        baseline = float(self._live_start_equity)
-        if baseline <= 0:
-            return
-
-        drawdown_pct = ((baseline - live_equity) / baseline) * 100.0
-        if drawdown_pct >= float(max_dd):
-            await self._trigger_live_kill_switch(
-                f"max_drawdown_pct breached: start_equity={baseline:.8f}, "
-                f"live_equity={live_equity:.8f}, drawdown_pct={drawdown_pct:.4f}, "
-                f"limit={float(max_dd):.4f}"
-            )
-
-    async def _cancel_live_open_orders_best_effort(self) -> None:
-        if self._live_execution is None:
-            return
-        try:
-            result = self._live_execution.cancel_all_open_orders(symbol=self._status.config.symbol)
-            self._live_open_orders = []
-            await self._broadcast_trace_event(
-                "live_open_orders_canceled",
-                data={
-                    "run_id": self._status.run_id,
-                    "result": result,
-                },
-            )
-        except Exception as exc:
-            self._live_last_sync_error = str(exc)
-            await self._broadcast_trace_event(
-                "live_cancel_open_orders_failed",
-                data={
-                    "run_id": self._status.run_id,
-                    "error": str(exc),
-                },
-            )
-            
-    def _active_live_positions_locked(self) -> list[dict[str, Any]]:
-        active: list[dict[str, Any]] = []
-        for row in self._live_positions or []:
-            if not isinstance(row, dict):
-                continue
-            qty = 0.0
-            for key in (
-                "base_qty",
-                "contracts",
-                "contract_qty",
-                "size",
-                "positionAmt",
-                "position_amt",
-            ):
-                try:
-                    raw = row.get(key)
-                    if raw is None or raw == "":
-                        continue
-                    qty = abs(float(raw))
-                    break
-                except (TypeError, ValueError):
-                    continue
-            if qty > 0.0:
-                active.append(row)
-        return active
-
-    async def _recover_live_state_from_exchange(self, *, force: bool = False) -> None:
-        if self._status.mode != Mode.LIVE:
-            return
-
-        live_execution = self._live_execution
-        if live_execution is None:
-            return
-
-        cfg = self._status.config
-
-        try:
-            lookback_minutes = max(5, int(cfg.live_reconcile_lookback_minutes or 240))
-            since_ms = int(time.time() * 1000) - (lookback_minutes * 60 * 1000)
-
-            snapshot, recent_trades = await asyncio.gather(
-                asyncio.to_thread(
-                    live_execution.sync_account,
-                    symbol=cfg.symbol,
-                ),
-                asyncio.to_thread(
-                    live_execution.fetch_recent_trades,
-                    symbol=cfg.symbol,
-                    since_ms=since_ms,
-                    limit=200,
-                ),
-            )
-
-            async with self._lock:
-                before = self._capture_live_exposure_signature_locked()
-
-                self._live_balance = dict(snapshot.get("balance") or {})
-                self._live_balance["position_mode"] = snapshot.get("position_mode")
-                self._live_open_orders = list(snapshot.get("open_orders") or [])
-                self._live_positions = list(snapshot.get("positions") or [])
-                self._live_last_sync_at = snapshot.get("synced_at")
-                self._live_last_sync_error = None
-
-                orphan_count = self._import_orphan_live_open_orders_locked()
-                self._merge_live_open_orders_into_registry_locked()
-
-                for trade in recent_trades or []:
-                    fill_id = str(trade.get("id") or "")
-                    if fill_id:
-                        self._live_fill_id_set.add(fill_id)
-
-                if recent_trades:
-                    newest_trade_ms = 0
-                    for trade in recent_trades:
-                        ts = self._safe_int_value(trade.get("timestamp"), 0) or 0
-                        newest_trade_ms = max(newest_trade_ms, int(ts * 1000))
-                    if newest_trade_ms > 0:
-                        self._live_trade_since_ms = newest_trade_ms
-
-                await self._reconcile_live_orders_locked(force=True)
-                self._sync_shadow_state_from_live_account_locked()
-                self._refresh_live_leverage_status_locked()                
-                trade_identity = self._rebuild_trade_identity_from_live_position_locked()
-
-                ticker = dict(snapshot.get("ticker") or {})
-                last_price = ticker.get("last")
-                if last_price is not None:
-                    try:
-                        price_value = float(last_price)
-                        self._latest_bar = {
-                            "timestamp": snapshot.get("synced_at"),
-                            "open": price_value,
-                            "high": price_value,
-                            "low": price_value,
-                            "close": price_value,
-                            "volume": 0.0,
-                            "source": "live_recovery",
-                        }
-                        if self._state is not None:
-                            await self._mark_to_market(price_value)
-                    except (TypeError, ValueError):
-                        pass
-
-                after = self._capture_live_exposure_signature_locked()
-                transition = self._describe_live_exposure_transition_locked(before, after)
-
-                self._live_recovery_performed = True
-                self._live_recovered_from_exchange_at = snapshot.get("synced_at")
-                active_positions = self._active_live_positions_locked()
-                self._live_recovery_summary = {
-                    "symbol": cfg.symbol,
-                    "open_order_count": len(self._live_open_orders),
-                    "position_count": len(active_positions),
-                    "raw_position_count": len(self._live_positions),
-                    "orphan_open_orders_imported": orphan_count,
-                    "recent_trade_count": len(recent_trades or []),
-                    "transition": transition,
-                    "trade_identity": trade_identity,
-                }
-
-                self._persist_status()
-                self._persist_snapshot()
-
-            await self._broadcast_runtime_update()
-            await self._broadcast_trace_event(
-                "live_state_recovered",
-                data={
-                    "run_id": self._status.run_id,
-                    "symbol": cfg.symbol,
-                    "summary": self._live_recovery_summary,
-                    "synced_at": self._live_recovered_from_exchange_at,
-                },
-            )
-
-        except Exception as e:
-            async with self._lock:
-                self._live_last_sync_error = str(e)
-                self._persist_status()
-                self._persist_snapshot()
-
-            if force:
-                await self._broadcast_trace_event(
-                    "live_state_recovery_error",
-                    data={
-                        "run_id": self._status.run_id,
-                        "symbol": cfg.symbol,
-                        "error": str(e),
-                    },
-                )
 
 
 mode_controller = ModeController()

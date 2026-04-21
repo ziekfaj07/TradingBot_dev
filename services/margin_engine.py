@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 from core.execution_models import PortfolioState
-from core.market_types import is_derivatives_market, normalize_market_type
+from core.market_types import is_derivatives_market
 
 
 @dataclass(frozen=True)
@@ -228,7 +228,7 @@ def evaluate_position_margin(
     resolver: MarginTierResolver | None = None,
     maintenance_margin_override: float | None = None,
 ) -> MarginSnapshot | None:
-    mt = normalize_market_type(market_type)
+    mt = str(market_type or "spot").strip().lower()
     if not is_derivatives_market(mt):
         return None
 

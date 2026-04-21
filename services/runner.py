@@ -7,7 +7,7 @@ from typing import Any
 import pandas as pd
 
 from core.execution_models import PortfolioState
-from core.market_types import is_derivatives_market, normalize_market_type
+from core.market_types import is_derivatives_market
 from services.execution_engine import ExecutionEngine
 from services.margin_engine import derive_mark_price, evaluate_position_margin, normalize_maintenance_margin_override
 from services.risk_engine import RiskEngine
@@ -292,7 +292,6 @@ def run_signal_backed_loop(
     stop_loss_pct: float | None = None,
     take_profit_pct: float | None = None,
 ) -> RunOutput:
-    _ = allow_short
     _ = margin_mode
     _ = use_mark_price_for_liquidation
     _ = mark_price_source
@@ -517,6 +516,18 @@ def run_signal_backed_loop(
                         }
                     )
 
+        if (not bar_was_liquidated) and exit_on_signal and signal == 1 and state.position_qty < 0.0:
+            trade_id += 1
+            state, fill = engine.exit_short(ts_iso, state, close, market_type, trade_id)
+            if fill:
+                realized_pnl = _clean_money(float(fill.equity_after) - float(open_trade_equity_baseline))
+                fill.pnl = realized_pnl
+                fill.equity_after = _clean_money(fill.equity_after)
+                trades.append(_clean_fill_for_output(fill))
+                open_trade_equity_baseline = _clean_money(fill.equity_after)
+                last_exit_ts = getattr(fill, "timestamp", None) or ts_iso
+                position_peak_price = None
+
         if (not bar_was_liquidated) and signal == 1 and state.position_qty == 0.0:
             gate = risk_engine.evaluate_entry_gate(
                 now_ts=ts,
@@ -612,6 +623,33 @@ def run_signal_backed_loop(
                 open_trade_equity_baseline = _clean_money(fill.equity_after)
                 last_exit_ts = getattr(fill, "timestamp", None) or ts_iso
                 position_peak_price = None
+
+        if (not bar_was_liquidated) and allow_short and signal == -1 and state.position_qty == 0.0 and is_derivatives_market(market_type):
+            gate = risk_engine.evaluate_entry_gate(
+                now_ts=ts, current_equity=current_equity, peak_equity=peak_equity,
+                trades_today=trades_today, last_exit_ts=last_exit_ts,
+                max_drawdown_pct=max_drawdown_pct, max_trades_per_day=max_trades_per_day,
+                cooldown_seconds=cooldown_seconds,
+            )
+            if gate.allowed:
+                qty_override, sizing_meta = risk_engine.compute_entry_qty_with_meta(
+                    state=state, market_type=market_type, entry_price=close, leverage=leverage,
+                    fee_rate=engine.fee_rate, max_leverage=engine.max_leverage, max_qty=engine.max_qty,
+                    sizing_mode=position_sizing_mode, sizing_value=position_size_value,
+                    current_equity=current_equity, stop_loss_pct=stop_loss_pct, exit_mode=exit_mode,
+                    atr_value=atr_value, atr_stop_mult=atr_stop_mult,
+                    enable_volatility_scaling=enable_volatility_scaling, volatility_target_pct=volatility_target_pct,
+                    min_volatility_scale=min_volatility_scale, max_volatility_scale=max_volatility_scale,
+                )
+                trade_id += 1
+                state, fill = engine.enter_short(ts_iso, state, close, market_type, leverage, trade_id, qty_override=qty_override)
+                if fill:
+                    fill.equity_after = _clean_money(getattr(fill, "equity_after", 0.0))
+                    trades.append(_clean_fill_for_output(fill))
+                    open_trade_equity_baseline = _clean_money(engine.mark_equity(state, market_type, close))
+                    trades_today += 1
+            else:
+                risk_events.append({"timestamp": ts_iso, "event": "entry_blocked", "reason": gate.reason, "meta": gate.meta or {}})
 
         eq = _clean_money(engine.mark_equity(state, market_type, close))
         peak_equity = max(peak_equity, float(eq))

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Any
-
 import pandas as pd
 
 from services.strategies.base import BaseStrategy
@@ -11,57 +9,54 @@ class BollingerMeanReversion(BaseStrategy):
     name = "bollinger_mean_reversion"
     display_name = "Bollinger Mean Reversion"
     description = (
-        "Mean-reversion strategy: long after lower-band re-entry; "
-        "short/exit after upper-band re-entry."
+        "Enter long when price re-enters from below the lower Bollinger band; "
+        "optionally emit short signals when price re-enters from above the upper band."
     )
-    default_params: dict[str, Any] = {
+    default_params = {
         "length": 20,
-        "stddev": 2.0,
-        "min_bandwidth_pct": 0.0,
+        "std_dev": 2.0,
+        "min_bandwidth": 0.01,
+        "allow_short": False,
     }
     min_bars = 22
 
     def apply(self, df: pd.DataFrame) -> pd.DataFrame:
+        if "close" not in df.columns:
+            raise ValueError("Bollinger mean reversion strategy requires a 'close' column.")
+
         d = df.copy()
-        if d.empty or "close" not in d.columns:
-            d["signal"] = 0
-            return d
+        d["signal"] = 0
 
         length = max(2, int(self.params.get("length", 20)))
-        # Backward-compatible aliases from the early BB draft.
-        stddev = float(
-            self.params.get(
-                "stddev",
-                self.params.get("std_dev", 2.0),
-            )
-        )
-        min_bandwidth_pct = float(
-            self.params.get(
-                "min_bandwidth_pct",
-                self.params.get("min_bandwidth", 0.0),
-            )
-        )
+        std_dev = float(self.params.get("std_dev", 2.0))
+        min_bandwidth = max(0.0, float(self.params.get("min_bandwidth", 0.01)))
+        allow_short = bool(self.params.get("allow_short", False))
+
+        if len(d) < length + 2:
+            return d
 
         close = pd.to_numeric(d["close"], errors="coerce")
-        mid = close.rolling(length).mean()
-        std = close.rolling(length).std()
+        mid = close.rolling(length, min_periods=length).mean()
+        std = close.rolling(length, min_periods=length).std()
+        upper = mid + std_dev * std
+        lower = mid - std_dev * std
+        width = (upper - lower) / mid.replace(0, pd.NA)
 
         d["bb_mid"] = mid
-        d["bb_std"] = std
-        d["bb_upper"] = mid + stddev * std
-        d["bb_lower"] = mid - stddev * std
-        d["bb_width_pct"] = ((d["bb_upper"] - d["bb_lower"]) / mid.abs()) * 100.0
+        d["bb_upper"] = upper
+        d["bb_lower"] = lower
+        d["bb_width"] = width
 
-        d["signal"] = 0
+        valid = width >= min_bandwidth
         prev_close = close.shift(1)
-        prev_lower = d["bb_lower"].shift(1)
-        prev_upper = d["bb_upper"].shift(1)
+        prev_lower = lower.shift(1)
+        prev_upper = upper.shift(1)
 
-        vol_ok = d["bb_width_pct"].fillna(0.0) >= min_bandwidth_pct
-        long_reentry = (prev_close < prev_lower) & (close > d["bb_lower"])
-        short_reentry = (prev_close > prev_upper) & (close < d["bb_upper"])
+        long_reentry = (prev_close < prev_lower) & (close > lower) & valid
+        d.loc[long_reentry.fillna(False), "signal"] = 1
 
-        d.loc[long_reentry & vol_ok, "signal"] = 1
-        d.loc[short_reentry & vol_ok, "signal"] = -1
-        d["signal"] = d["signal"].fillna(0).astype(int)
+        if allow_short:
+            short_reentry = (prev_close > prev_upper) & (close < upper) & valid
+            d.loc[short_reentry.fillna(False), "signal"] = -1
+
         return d

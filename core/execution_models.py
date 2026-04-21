@@ -16,7 +16,6 @@ class PortfolioState:
     borrowed: float = 0.0
     isolated_margin: float = 0.0
     margin_mode: str = "cross"
-    open_fee_paid: float = 0.0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -38,7 +37,6 @@ class PortfolioState:
             borrowed=float(data.get("borrowed", 0.0)),
             isolated_margin=float(data.get("isolated_margin", 0.0)),
             margin_mode=str(data.get("margin_mode", "cross") or "cross"),
-            open_fee_paid=float(data.get("open_fee_paid", 0.0)),
         )
 
 
@@ -55,7 +53,6 @@ class Fill:
     exit_price: Optional[float] = None
     trade_id: Optional[int] = None
     pnl: Optional[float] = None
-
     exchange: Optional[str] = None
     symbol: Optional[str] = None
     market_type: Optional[str] = None
@@ -65,24 +62,6 @@ class Fill:
     execution_source: Optional[str] = None
     reduce_only: Optional[bool] = None
     dry_run: Optional[bool] = None
-
-    # v0.7.4 live execution telemetry
-    expected_price: Optional[float] = None
-    expected_qty: Optional[float] = None
-    submitted_at: Optional[str] = None
-    acknowledged_at: Optional[str] = None
-    filled_at: Optional[str] = None
-    submit_to_ack_ms: Optional[float] = None
-    submit_to_fill_ms: Optional[float] = None
-    price_slippage: Optional[float] = None
-    price_slippage_bps: Optional[float] = None
-    qty_delta: Optional[float] = None
-    qty_delta_pct: Optional[float] = None
-    fill_id: Optional[str] = None
-    order_state: Optional[str] = None
-    cumulative_qty: Optional[float] = None
-    remaining_qty: Optional[float] = None
-    contract_size: Optional[float] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -112,20 +91,4 @@ class Fill:
             execution_source=data.get("execution_source"),
             reduce_only=data.get("reduce_only"),
             dry_run=data.get("dry_run"),
-            expected_price=data.get("expected_price"),
-            expected_qty=data.get("expected_qty"),
-            submitted_at=data.get("submitted_at"),
-            acknowledged_at=data.get("acknowledged_at"),
-            filled_at=data.get("filled_at"),
-            submit_to_ack_ms=data.get("submit_to_ack_ms"),
-            submit_to_fill_ms=data.get("submit_to_fill_ms"),
-            price_slippage=data.get("price_slippage"),
-            price_slippage_bps=data.get("price_slippage_bps"),
-            qty_delta=data.get("qty_delta"),
-            qty_delta_pct=data.get("qty_delta_pct"),
-            fill_id=data.get("fill_id"),
-            order_state=data.get("order_state"),
-            cumulative_qty=data.get("cumulative_qty"),
-            remaining_qty=data.get("remaining_qty"),
-            contract_size=data.get("contract_size"),
         )

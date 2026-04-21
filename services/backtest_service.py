@@ -4,7 +4,7 @@ import numpy as np
 
 from core.binance_vision_provider import BinanceVisionProvider
 from core.execution_models import PortfolioState
-from core.market_types import is_derivatives_market, is_spot_market, normalize_market_type
+from core.market_types import is_derivatives_market, is_spot_market, market_type_error_label, normalize_market_type
 from services.execution_engine import ExecutionEngine
 from services.margin_engine import normalize_maintenance_margin_override
 from services.risk_engine import RiskEngine
@@ -45,10 +45,9 @@ class BacktestService:
         atr_take_mult: float | None,
         atr_reference_mode: str = "entry",
     ) -> str | None:
-        try:
-            mt = normalize_market_type(market_type)
-        except ValueError as exc:
-            return str(exc)
+        mt = normalize_market_type(market_type)
+        if not (is_spot_market(mt) or is_derivatives_market(mt)):
+            return market_type_error_label()
 
         mmode = str(margin_mode or "isolated").strip().lower()
         if mmode not in ("isolated", "cross"):
@@ -142,17 +141,17 @@ class BacktestService:
 
         if is_spot_market(mt):
             if allow_short:
-                return "allow_short is only supported for swap/futures"
+                return "allow_short is only supported for derivatives markets"
             if leverage != 1.0:
                 return "spot backtests must use leverage=1"
             if mmode != "isolated":
-                return "margin_mode is only meaningful for swap/futures"
+                return "margin_mode is only meaningful for derivatives markets"
             if enable_liquidation:
                 return "enable_liquidation must be false for spot"
             if use_mark_price_for_liquidation:
                 return "use_mark_price_for_liquidation must be false for spot"
             if maintenance_margin_override is not None:
-                return "maintenance_margin_override is only valid for swap/futures"
+                return "maintenance_margin_override is only valid for derivatives markets"
 
         if is_derivatives_market(mt):
             if leverage > 50.0:

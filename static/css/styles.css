@@ -130,16 +130,6 @@ textarea {
   cursor: pointer;
 }
 
-button:hover {
-  opacity: 0.75;
-}
-
-.btn-primary { background: #1d4ed8; }
-.btn-success { background: #15803d; }
-.btn-danger  { background: #b91c1c; }
-.btn-neutral { background: #334155; }
-.btn-warn    { background: #a16207; }
-
 .pill {
   display: inline-block;
   padding: 4px 10px;

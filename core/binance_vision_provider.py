@@ -11,8 +11,6 @@ from typing import Iterable, TypeAlias
 import pandas as pd
 import requests
 
-from core.market_types import is_derivatives_market, normalize_market_type
-
 from core.data_provider import DataProvider
 
 UtcTimestamp: TypeAlias = pd.Timestamp
@@ -112,7 +110,10 @@ class BinanceVisionProvider(DataProvider):
         return str(symbol or "").strip().upper()
 
     def _normalize_market_type(self, market_type: str) -> str:
-        return normalize_market_type(market_type)
+        mt = str(market_type or "spot").strip().lower()
+        if mt not in ("spot", "futures"):
+            raise ValueError("market_type must be 'spot' or 'futures'")
+        return mt
 
     def _normalize_interval(self, interval: str) -> str:
         iv = str(interval or "1m").strip().lower()
@@ -240,12 +241,12 @@ class BinanceVisionProvider(DataProvider):
             current = current + pd.offsets.MonthBegin(1)
 
     def _market_paths(self, market_type: str) -> list[str]:
-        mt = normalize_market_type(market_type)
+        mt = market_type.lower()
         if mt == "spot":
             return ["spot"]
-        if is_derivatives_market(mt):
+        if mt == "futures":
             return ["futures/um", "futures/cm"]
-        raise ValueError("market_type must be 'spot' or 'swap'")
+        raise ValueError("market_type must be 'spot' or 'futures'")
 
     def _kline_folders(self, market_type: str) -> list[str]:
         return ["klines"]

@@ -1,3 +1,5 @@
+import os
+
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,14 +14,28 @@ from routers.run_router import router as run_router
 from routers.strategy_router import router as strategy_router
 from routers.ws_router import router as ws_router
 
+
+def _cors_origins() -> list[str]:
+    raw = os.getenv("TRADINGBOT_CORS_ORIGINS", "")
+    origins = [item.strip() for item in raw.split(",") if item.strip()]
+    if origins:
+        return origins
+    return [
+        "http://127.0.0.1:8000",
+        "http://localhost:8000",
+        "http://127.0.0.1:3000",
+        "http://localhost:3000",
+    ]
+
+
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins(),
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept"],
 )
 
 app.include_router(dashboard_router)

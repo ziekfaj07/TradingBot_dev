@@ -59,43 +59,12 @@ window.uiController = {
     };
   },
 
-
-  _currentLivePositionInfo(data) {
-    const positions = data?.runtime?.live?.positions || [];
-    for (const position of positions) {
-      const rawSide = String(position?.side || "").toLowerCase();
-      const side = rawSide === "sell" ? "short" : rawSide === "buy" ? "long" : rawSide;
-      const qty = Number(position?.base_qty || 0);
-      if (qty > 0 && (side === "long" || side === "short")) {
-        return { side, qty };
-      }
-    }
-    return null;
-  },
-
-  updateForceExitButton(data) {
-    const btn = qs("forceExitBtn");
-    if (!btn) return;
-
-    const isLiveMode = String(data?.mode || "").toLowerCase() === "live";
-    const position = this._currentLivePositionInfo(data);
-    const canForceExit = isLiveMode && !!position;
-
-    btn.disabled = !canForceExit;
-    btn.title = canForceExit
-      ? `Force-exit ${position.side} position (${fmtNum(position.qty)} units) with a reduce-only market order.`
-      : "No open live position to force exit.";
-  },
-
   renderStatus(data) {
     state.latestStatus = data;
 
     const runtime = data?.runtime || {};
     const paper = runtime.paper_state || {};
     const latestBar = runtime.latest_bar || {};
-    const live = runtime.live || {};
-    const execution = live.execution || {};
-    const lastLiveFill = execution.last_fill || {};    
 
     qs("botState").textContent = data?.state || "unknown";
     qs("lastSignal").textContent = String(runtime.last_signal ?? "WAIT");
@@ -113,25 +82,11 @@ window.uiController = {
     qs("lastProcessedTs").textContent = fmtTs(runtime.last_processed_bar_ts);
     qs("barCount").textContent = fmtNum(runtime.bar_count ?? 0, 0);
     qs("startedAt").textContent = fmtTs(data?.started_at);
-    qs("liveExpectedPrice").textContent = fmtNum(lastLiveFill.expected_price);
-    qs("liveFillPrice").textContent = fmtNum(lastLiveFill.price);
-    qs("liveSlippageBps").textContent = fmtNum(lastLiveFill.price_slippage_bps);
-    qs("liveExpectedQty").textContent = fmtNum(lastLiveFill.expected_qty);
-    qs("liveFilledQty").textContent = fmtNum(lastLiveFill.qty);
-    qs("liveQtyDeltaPct").textContent = fmtNum(lastLiveFill.qty_delta_pct);
-    qs("liveAckMs").textContent = fmtNum(lastLiveFill.submit_to_ack_ms);
-    qs("liveFillMs").textContent = fmtNum(lastLiveFill.submit_to_fill_ms);
-    qs("liveAvgSlippageBps").textContent = fmtNum(execution.avg_slippage_bps);
-    qs("liveMaxAbsSlippageBps").textContent = fmtNum(execution.max_abs_slippage_bps);
-    qs("liveAvgAckMs").textContent = fmtNum(execution.avg_submit_to_ack_ms);
-    qs("liveAvgFillMs").textContent = fmtNum(execution.avg_submit_to_fill_ms);
 
     qs("chartSymbolView").textContent =
       runtime.chart_symbol || data?.config?.symbol || "-";
     qs("chartIntervalView").textContent =
       runtime.chart_interval || data?.config?.interval || "-";
-
-    this.updateForceExitButton(data);
 
     if (paper.equity !== null && paper.equity !== undefined) {
       equityModule.push(paper.equity);
@@ -181,31 +136,6 @@ window.uiController = {
     } catch (err) {
       console.error(err);
       this.setActionMessage(`Stop failed: ${err.message}`, "bad");
-    }
-  },
-
-  async forceExitLive() {
-    const data = state.latestStatus || {};
-    const position = this._currentLivePositionInfo(data);
-    if (!position) {
-      this.setActionMessage("No open live position to force exit.", "warn");
-      return;
-    }
-
-    const ok = window.confirm(
-      `Force-exit the current ${position.side.toUpperCase()} live position of ${fmtNum(position.qty)} units with a reduce-only market order? This sends a real order immediately.`
-    );
-    if (!ok) return;
-
-    try {
-      const response = await api.forceLiveExit(`Manual force exit from dashboard (${position.side})`);
-      this.renderStatus(response);
-      await fillsModule.load();
-      await chartModule.loadBootstrap(true);
-      this.setActionMessage(`Force exit submitted for ${position.side} live position.`, "warn");
-    } catch (err) {
-      console.error(err);
-      this.setActionMessage(`Force exit failed: ${err.message}`, "bad");
     }
   },
 
@@ -299,7 +229,6 @@ window.uiController = {
     qs("configureBtn")?.addEventListener("click", () => this.configureBot());
     qs("startBtn")?.addEventListener("click", () => this.startBot());
     qs("stopBtn")?.addEventListener("click", () => this.stopBot());
-    qs("forceExitBtn")?.addEventListener("click", () => this.forceExitLive());
     qs("refreshStatusBtn")?.addEventListener("click", () => this.loadStatus());
     qs("showFillsBtn")?.addEventListener("click", () => fillsModule.load());
     qs("resetPaperBtn")?.addEventListener("click", () => this.resetPaper());
