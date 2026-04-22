@@ -144,6 +144,14 @@ async def status():
     return mode_controller.status()
 
 
+@router.get("/metrics")
+async def metrics():
+    try:
+        return mode_controller.metrics()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @router.get("/paper/chart")
 async def paper_chart(limit: int = 300):
     try:

@@ -20,9 +20,11 @@
         <div>
           <label for="mode">Mode</label>
           <select id="mode">
+            <option value="backtest">Backtest</option>
+            <option value="demo">Demo</option>            
             <option value="live">Live</option>
             <option value="paper">Paper</option>
-            <option value="backtest">Backtest</option>
+
           </select>
         </div>
         <div>
@@ -118,6 +120,46 @@
         <div>
           <label for="end">End</label>
           <input id="end" />
+        </div>
+      </div>
+
+      <div class="panel-subsection">
+        <h3>Exchange Settings</h3>
+        <div class="form-grid">
+          <div>
+            <label for="exchange_name">Exchange</label>
+            <input id="exchange_name" value="gateio" />
+          </div>
+
+          <div>
+            <label for="exchange_environment_display">Exchange Environment</label>
+            <input id="exchange_environment_display" value="Auto: Paper / Local" disabled />
+          </div>            
+
+          <div>
+            <label for="exchange_settle_currency">Settle Currency</label>
+            <input id="exchange_settle_currency" value="usdt" />
+          </div>
+
+          <div>
+            <label for="enable_live_trading">Enable Exchange Orders</label>
+            <select id="enable_live_trading">
+              <option value="false">Disabled</option>
+              <option value="true">Enabled</option>
+            </select>
+          </div>
+
+          <div>
+            <label for="live_dry_run">Dry Run</label>
+            <select id="live_dry_run">
+              <option value="true">Dry Run</option>
+              <option value="false">Submit Orders</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="safety-note">
+          Execution environment is handled automatically from the selected mode. Demo uses testnet/demo exchange routing. Live uses live exchange routing and requires confirmation before start.
         </div>
       </div>
 

@@ -4,6 +4,7 @@ from datetime import datetime
 
 import asyncio
 import math
+import os
 import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
@@ -218,6 +219,11 @@ class ModeController:
 
             config_dict = asdict(self._status.config)
 
+            if kwargs.get("market_type") is not None:
+                kwargs["market_type"] = self._backend_market_type(str(kwargs["market_type"]))
+
+            kwargs = self._apply_mode_derived_execution_config(kwargs)
+
             if self._status.mode == Mode.PAPER:
                 self._prepare_fresh_idle_config_locked()
 
@@ -356,6 +362,29 @@ class ModeController:
             if self._status.mode in (Mode.DEMO, Mode.LIVE):
                 exchange_testnet = bool(self._status.config.exchange_testnet or self._status.mode == Mode.DEMO)
                 dry_run_live = bool(self._status.config.live_dry_run if self._status.mode == Mode.LIVE else False)
+
+                if self._status.mode == Mode.DEMO:
+                    self._status.config.exchange_testnet = True
+
+                if self._status.mode == Mode.LIVE and self._status.config.exchange_testnet:
+                    raise RuntimeError(
+                        "Live mode cannot start with exchange_testnet=true. "
+                        "Use demo mode for testnet/demo exchange execution."
+                    )
+                
+                if (
+                    self._status.mode == Mode.LIVE
+                    and self._status.config.enable_live_trading
+                    and not self._status.config.live_dry_run
+                    and not self._live_submit_env_armed()
+                ):
+                    raise RuntimeError(
+                        "Live submit is blocked by backend safety guard. "
+                        "To allow real live order submission, set "
+                        "TRADINGBOT_ALLOW_LIVE_SUBMIT=true in .env and restart the server. "
+                        "For live monitoring without real orders, use live_dry_run=true."
+                    )                
+
                 live_validation = validate_live_config(
                     exchange_name=self._status.config.exchange_name,
                     market_type=self._status.config.market_type,
@@ -620,10 +649,65 @@ class ModeController:
                 self._persist_status()
             raise
 
-    def status(self) -> dict:
-        cfg = asdict(self._status.config)
+    def _ui_market_type(self, market_type: str | None = None) -> str:
+        raw = (market_type or self._status.config.market_type or "spot").strip().lower()
+        if raw in ("swap", "future", "futures", "perp", "perpetual"):
+            return "futures"
+        return "spot"
 
-        runtime = {
+    def _mode_exchange_testnet(self) -> bool:
+        if self._status.mode == Mode.DEMO:
+            return True
+        return False
+
+    def _mode_client_order_prefix(self) -> str:
+        if self._status.mode == Mode.DEMO:
+            return "tb-demo"
+        if self._status.mode == Mode.LIVE:
+            return "tb-live"
+        if self._status.mode == Mode.PAPER:
+            return "tb-paper"
+        return "tb-backtest"
+
+    def _live_submit_env_armed(self) -> bool:
+        raw = os.getenv("TRADINGBOT_ALLOW_LIVE_SUBMIT", "").strip().lower()
+        return raw in ("1", "true", "yes", "y", "on")
+
+    def _apply_mode_derived_execution_config(self, config_dict: dict) -> dict:
+        config_dict["exchange_testnet"] = self._mode_exchange_testnet()
+        config_dict["client_order_id_prefix"] = self._mode_client_order_prefix()
+
+        if self._status.mode in (Mode.BACKTEST, Mode.PAPER):
+            config_dict["enable_live_trading"] = False
+            config_dict["live_dry_run"] = True
+
+        return config_dict
+
+    def _backend_market_type(self, market_type: str | None = None) -> str:
+        raw = (market_type or self._status.config.market_type or "spot").strip().lower()
+        if raw in ("future", "futures", "perp", "perpetual"):
+            return "swap"
+        if raw == "swap":
+            return "swap"
+        return "spot"
+
+    def _config_payload(self) -> dict:
+        cfg = asdict(self._status.config)
+        backend_market_type = self._backend_market_type(cfg.get("market_type"))
+        ui_market_type = self._ui_market_type(backend_market_type)
+
+        cfg["market_type"] = ui_market_type
+        cfg["market_type_ui"] = ui_market_type
+        cfg["market_type_backend"] = backend_market_type
+        cfg["exchange_testnet"] = self._mode_exchange_testnet()
+        cfg["client_order_id_prefix"] = self._mode_client_order_prefix()
+
+        return cfg
+
+    def _runtime_light_payload(self) -> dict:
+        cfg = self._config_payload()
+
+        return {
             "has_engine": self._engine is not None,
             "has_state": self._state is not None,
             "latest_bar": self._latest_bar,
@@ -632,23 +716,23 @@ class ModeController:
             "last_signal": self._last_signal,
             "fill_count": len(self._fills),
             "equity_point_count": len(self._equity_points),
-            "fills": [getattr(f, "__dict__", f) for f in reversed(self._fills[-10:])],
             "latest_equity": self._equity_points[-1] if self._equity_points else None,
             "paper_state": self._serialize_state(),
-            "paper_metrics": {
-                "available": bool(self._status.run_id or self._fills or self._equity_points),
-                "endpoint": "/api/run/paper/metrics",
-            },
             "chart_symbol": cfg.get("symbol"),
             "chart_interval": cfg.get("interval"),
             "reconnect_attempts": self._reconnect_attempts,
             "last_fetch_error": self._last_fetch_error,
-            "risk": self._build_risk_payload(),
+            "risk_halt_reason": self._risk_halt_reason,
+            "exchange": {
+                "name": cfg.get("exchange_name"),
+                "market_type": cfg.get("market_type_ui"),
+                "backend_market_type": cfg.get("market_type_backend"),
+                "testnet": cfg.get("exchange_testnet"),
+                "settle_currency": cfg.get("exchange_settle_currency"),
+            },
             "live": {
                 "exchange_name": cfg.get("exchange_name"),
                 "exchange_testnet": cfg.get("exchange_testnet"),
-                "exchange_base_url_configured": bool(cfg.get("exchange_base_url")),
-                "effective_execution_mode": "demo" if self._status.mode == Mode.DEMO else ("live" if self._status.mode == Mode.LIVE else self._status.mode.value),
                 "enable_live_trading": cfg.get("enable_live_trading"),
                 "live_dry_run": cfg.get("live_dry_run"),
                 "sync_positions_on_start": cfg.get("sync_positions_on_start"),
@@ -656,6 +740,25 @@ class ModeController:
                 "client_order_id_prefix": cfg.get("client_order_id_prefix"),
             },
         }
+
+    def metrics(self) -> dict:
+        return {
+            "run_id": self._status.run_id,
+            "run_label": self._status.run_label,
+            "mode": self._status.mode.value,
+            "state": self._status.state.value,
+            "runtime": {
+                "fills": [getattr(f, "__dict__", f) for f in reversed(self._fills[-10:])],
+                "paper_metrics": self._build_metrics_payload(),
+                "risk": self._build_risk_payload(),
+                "latest_equity": self._equity_points[-1] if self._equity_points else None,
+                "equity_point_count": len(self._equity_points),
+                "fill_count": len(self._fills),
+            },
+        }
+
+    def status(self) -> dict:
+        cfg = self._config_payload()
 
         return {
             "mode": self._status.mode.value,
@@ -666,7 +769,7 @@ class ModeController:
             "stopped_at": self._status.stopped_at,
             "last_error": self._status.last_error,
             "config": cfg,
-            "runtime": runtime,
+            "runtime": self._runtime_light_payload(),
         }
 
     def latest_bar(self, symbol: str | None = None) -> dict | None:

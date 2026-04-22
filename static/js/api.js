@@ -49,6 +49,10 @@ window.api = {
     return await this.request("/api/run/status");
   },
 
+  async getMetrics() {
+    return await this.request("/api/run/metrics");
+  },  
+
   async setMode(mode) {
     return await this.request("/api/run/mode", {
       method: "POST",

@@ -26,13 +26,24 @@ window.uiController = {
       "ema_short",
       "ema_long",
       "candle_limit",
+      "exchange_name",
+      "exchange_settle_currency",
+      "enable_live_trading",
+      "live_dry_run",
     ];
 
     for (const key of fields) {
       const el = qs(key);
       if (!el || cfg[key] === undefined || cfg[key] === null) continue;
-      el.value = String(cfg[key]);
+      if (key === "market_type") {
+        el.value = cfg.market_type_ui || cfg.market_type || "spot";
+      } else {
+        el.value = String(cfg[key]);
+      }
+
     }
+
+    this.syncModeDerivedFields();
   },
 
   readConfigForm() {
@@ -56,7 +67,57 @@ window.uiController = {
       ema_short: Number(qs("ema_short").value),
       ema_long: Number(qs("ema_long").value),
       candle_limit: Number(qs("candle_limit").value),
+      exchange_name: qs("exchange_name").value,
+      exchange_settle_currency: qs("exchange_settle_currency").value,
+      enable_live_trading: qs("enable_live_trading").value === "true",
+      live_dry_run: qs("live_dry_run").value === "true",
     };
+
+    const selectedMode = qs("mode").value;
+
+    const payload = {
+      symbol: qs("symbol").value,
+      interval: qs("interval").value,
+      market_type: qs("market_type").value,
+
+      initial_balance: Number(qs("initial_balance").value),
+      fee_rate: Number(qs("fee_rate").value),
+      slippage_bps: Number(qs("slippage_bps").value),
+      allow_short: qs("allow_short").value === "true",
+      leverage: Number(qs("leverage").value),
+      maintenance_margin: Number(qs("maintenance_margin").value),
+      max_leverage: Number(qs("max_leverage").value),
+      max_qty: Number(qs("max_qty").value),
+
+      include_equity: qs("include_equity").value === "true",
+      equity_stride: Number(qs("equity_stride").value),
+      poll_seconds: Number(qs("poll_seconds").value),
+
+      ema_short: Number(qs("ema_short").value),
+      ema_long: Number(qs("ema_long").value),
+      candle_limit: Number(qs("candle_limit").value),
+
+      exchange_name: qs("exchange_name").value,
+      exchange_settle_currency: qs("exchange_settle_currency").value,
+      enable_live_trading: qs("enable_live_trading").value === "true",
+      live_dry_run: qs("live_dry_run").value === "true",
+    };
+
+    if (selectedMode === "demo") {
+      payload.exchange_testnet = true;
+      payload.client_order_id_prefix = "tb-demo";
+    } else if (selectedMode === "live") {
+      payload.exchange_testnet = false;
+      payload.client_order_id_prefix = "tb-live";
+    } else if (selectedMode === "paper") {
+      payload.exchange_testnet = false;
+      payload.client_order_id_prefix = "tb-paper";
+    } else {
+      payload.exchange_testnet = false;
+      payload.client_order_id_prefix = "tb-backtest";
+    }
+
+    return payload;    
   },
 
   renderStatus(data) {
@@ -117,11 +178,54 @@ window.uiController = {
 
   async startBot() {
     try {
-      await api.setMode(qs("mode").value);
+      const selectedMode = qs("mode").value;
+      const payload = this.readConfigForm();
+
+      if (selectedMode === "demo") {
+        payload.exchange_testnet = true;
+      }
+
+      if (selectedMode === "live") {
+        payload.exchange_testnet = false;
+
+        const liveConfirmed = window.confirm(
+          "LIVE MODE WARNING\n\n" +
+          "This can submit real orders to the live exchange if exchange orders are enabled.\n\n" +
+          "Checklist:\n" +
+          "- You are using the correct live API key\n" +
+          "- Position size and leverage are correct\n" +
+          "- Market type is correct\n" +
+          "- You accept the risk of real loss\n\n" +
+          "Continue?"
+        );
+
+        if (!liveConfirmed) {
+          this.setActionMessage("Live start cancelled.", "warn");
+          return;
+        }
+      }
+
+      if (selectedMode === "demo") {
+        const demoConfirmed = window.confirm(
+          "DEMO MODE CONFIRMATION\n\n" +
+          "This should submit orders only to the exchange demo/testnet environment.\n\n" +
+          "Continue?"
+        );
+
+        if (!demoConfirmed) {
+          this.setActionMessage("Demo start cancelled.", "warn");
+          return;
+        }
+      }
+
+      await api.setMode(selectedMode);
+      await api.configure(payload);
+
       const data = await api.start();
       this.renderStatus(data);
       await chartModule.loadBootstrap(true);
-      this.setActionMessage("Bot started.", "good");
+
+      this.setActionMessage(`${selectedMode.toUpperCase()} bot started.`, "good");
     } catch (err) {
       console.error(err);
       this.setActionMessage(`Start failed: ${err.message}`, "bad");
@@ -165,11 +269,41 @@ window.uiController = {
       const data = await api.getStatus();
       this.renderStatus(data);
       this.applyConfigToForm(data.config || {});
+
+      try {
+        const metrics = await api.getMetrics();
+        if (metrics?.runtime) {
+          data.runtime = { ...(data.runtime || {}), ...metrics.runtime };
+          this.renderStatus(data);
+        }
+      } catch (metricsErr) {
+        console.warn("Metrics load skipped:", metricsErr);
+      }
+
       await fillsModule.load();
-      await chartModule.loadBootstrap(true);
+      await chartModule.loadBootstrap(true);      
     } catch (err) {
       console.error(err);
       this.setActionMessage(`Status load failed: ${err.message}`, "bad");
+    }
+  },
+
+  syncModeDerivedFields() {
+    const modeEl = qs("mode");
+    const envEl = qs("exchange_environment_display");
+
+    if (!modeEl || !envEl) return;
+
+    const mode = modeEl.value;
+
+    if (mode === "demo") {
+      envEl.value = "Auto: Demo / Testnet";
+    } else if (mode === "live") {
+      envEl.value = "Auto: Live Exchange";
+    } else if (mode === "paper") {
+      envEl.value = "Auto: Paper / Local";
+    } else {
+      envEl.value = "Auto: Backtest / Local";
     }
   },
 
@@ -228,6 +362,13 @@ window.uiController = {
   bindEvents() {
     qs("configureBtn")?.addEventListener("click", () => this.configureBot());
     qs("startBtn")?.addEventListener("click", () => this.startBot());
+    const modeEl = qs("mode");
+    if (modeEl) {
+      modeEl.addEventListener("change", () => this.syncModeDerivedFields());
+    }
+
+    this.syncModeDerivedFields();    
+
     qs("stopBtn")?.addEventListener("click", () => this.stopBot());
     qs("refreshStatusBtn")?.addEventListener("click", () => this.loadStatus());
     qs("showFillsBtn")?.addEventListener("click", () => fillsModule.load());
