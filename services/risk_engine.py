@@ -8,6 +8,7 @@ from typing import Any, Optional
 import copy
 
 from core.execution_models import PortfolioState
+from core.math_utils import safe_float, safe_float_or_none, safe_int
 
 
 @dataclass
@@ -43,63 +44,13 @@ class RiskEngine:
     """
 
     def _safe_float(self, value: Any, default: float = 0.0) -> float:
-        if value is None:
-            return default
-        if isinstance(value, bool):
-            return float(int(value))
-        if isinstance(value, (int, float)):
-            v = float(value)
-            return v if math.isfinite(v) else default
-        if isinstance(value, str):
-            text = value.strip()
-            if not text:
-                return default
-            try:
-                v = float(text)
-                return v if math.isfinite(v) else default
-            except ValueError:
-                return default
-        return default
+        return safe_float(value, default)
 
     def _safe_float_or_none(self, value: Any) -> float | None:
-        if value is None:
-            return None
-        if isinstance(value, bool):
-            return float(int(value))
-        if isinstance(value, (int, float)):
-            v = float(value)
-            return v if math.isfinite(v) else None
-        if isinstance(value, str):
-            text = value.strip()
-            if not text:
-                return None
-            try:
-                v = float(text)
-                return v if math.isfinite(v) else None
-            except ValueError:
-                return None
-        return None
+        return safe_float_or_none(value)
 
     def _safe_int(self, value: Any, default: int = 0) -> int:
-        if value is None:
-            return default
-        if isinstance(value, bool):
-            return int(value)
-        if isinstance(value, int):
-            return value
-        if isinstance(value, float):
-            if not math.isfinite(value):
-                return default
-            return int(value)
-        if isinstance(value, str):
-            text = value.strip()
-            if not text:
-                return default
-            try:
-                return int(float(text))
-            except ValueError:
-                return default
-        return default
+        return safe_int(value, default)
 
     def _normalize_mode(self, value: Any) -> str:
         mode = str(value or "all_in").strip().lower()
@@ -644,19 +595,30 @@ class RiskEngine:
         entry_price: float,
         stop_loss_pct: float | None,
         take_profit_pct: float | None,
+        fee_rate: float = 0.0,
     ) -> ExitLevels:
         sl = self._safe_float(stop_loss_pct, 0.0)
         tp = self._safe_float(take_profit_pct, 0.0)
+        round_trip_fee = max(0.0, self._safe_float(fee_rate, 0.0) * 2.0)
 
         stop_price: float | None = None
         take_price: float | None = None
 
+        # IMPORTANT:
+        # Stop loss is pure price distance. Do not subtract fees here.
         if sl > 0.0:
             stop_price = entry_price * (1.0 - sl / 100.0)
-        if tp > 0.0:
-            take_price = entry_price * (1.0 + tp / 100.0)
 
-        return ExitLevels(stop_price=stop_price, take_price=take_price, exit_family="static")
+        # Take profit may widen by round-trip fee so the configured TP can net correctly.
+        if tp > 0.0:
+            gross_take_pct = (tp / 100.0) + round_trip_fee
+            take_price = entry_price * (1.0 + gross_take_pct)
+
+        return ExitLevels(
+            stop_price=stop_price,
+            take_price=take_price,
+            exit_family="static",
+        )
 
     def _resolve_atr_long_exit_levels(
         self,
@@ -693,6 +655,7 @@ class RiskEngine:
         atr_value: float | None = None,
         atr_stop_mult: float | None = None,
         atr_take_mult: float | None = None,
+        fee_rate: float = 0.0,
     ) -> ExitLevels:
         ep = self._safe_float(entry_price, 0.0)
         if ep <= 0.0:
@@ -711,6 +674,7 @@ class RiskEngine:
             entry_price=ep,
             stop_loss_pct=stop_loss_pct,
             take_profit_pct=take_profit_pct,
+            fee_rate=fee_rate,
         )
 
     def evaluate_long_exit(
@@ -726,6 +690,7 @@ class RiskEngine:
         atr_take_mult: float | None = None,
         atr_reference_mode: str = "entry",
         peak_price_since_entry: float | None = None,
+        fee_rate: float = 0.0,
     ) -> ExitSignal:
         ep = self._safe_float(entry_price, 0.0)
         mp = self._safe_float(market_price, 0.0)
@@ -786,6 +751,7 @@ class RiskEngine:
 
         sl = self._safe_float(stop_loss_pct, 0.0)
         tp = self._safe_float(take_profit_pct, 0.0)
+        round_trip_fee = max(0.0, 2.0 * self._safe_float(fee_rate, 0.0))
 
         if sl > 0.0:
             stop_price = ep * (1.0 - sl / 100.0)
@@ -802,7 +768,8 @@ class RiskEngine:
                 )
 
         if tp > 0.0:
-            take_price = ep * (1.0 + tp / 100.0)
+            gross_take_pct = (tp / 100.0) + round_trip_fee
+            take_price = ep * (1.0 + gross_take_pct)
             if mp >= take_price:
                 return ExitSignal(
                     should_exit=True,
@@ -811,8 +778,115 @@ class RiskEngine:
                         "entry_price": ep,
                         "market_price": mp,
                         "take_profit_pct": tp,
+                        "round_trip_fee_pct": round_trip_fee * 100.0,
                         "take_price": take_price,
                     },
                 )
 
         return ExitSignal(should_exit=False)
+
+    def evaluate_short_exit(
+        self,
+        *,
+        entry_price: float | None,
+        market_price: float,
+        stop_loss_pct: float | None,
+        take_profit_pct: float | None,
+        exit_mode: str = "static",
+        atr_value: float | None = None,
+        atr_stop_mult: float | None = None,
+        atr_take_mult: float | None = None,
+        atr_reference_mode: str = "entry",
+        trough_price_since_entry: float | None = None,
+        fee_rate: float = 0.0,
+    ) -> ExitSignal:
+        ep = self._safe_float(entry_price, 0.0)
+        mp = self._safe_float(market_price, 0.0)
+        if ep <= 0.0 or mp <= 0.0:
+            return ExitSignal(should_exit=False)
+
+        mode = self._normalize_exit_mode(exit_mode)
+
+        if mode == "atr":
+            atr = self._safe_float(atr_value, 0.0)
+            stop_mult = self._safe_float(atr_stop_mult, 0.0)
+            take_mult = self._safe_float(atr_take_mult, 0.0)
+            ref_mode = self._normalize_atr_reference_mode(atr_reference_mode)
+
+            if atr <= 0.0:
+                return ExitSignal(should_exit=False)
+
+            trough = self._safe_float(trough_price_since_entry, ep)
+            stop_anchor = min(ep, trough) if ref_mode == "floating" else ep
+
+            if stop_mult > 0.0:
+                stop_price = stop_anchor + (atr * stop_mult)
+                if mp >= stop_price:
+                    return ExitSignal(
+                        should_exit=True,
+                        reason="atr_stop_loss",
+                        meta={
+                            "entry_price": ep,
+                            "market_price": mp,
+                            "atr_value": atr,
+                            "atr_stop_mult": stop_mult,
+                            "atr_reference_mode": ref_mode,
+                            "trough_price_since_entry": trough,
+                            "stop_anchor": stop_anchor,
+                            "stop_price": stop_price,
+                        },
+                    )
+
+            if take_mult > 0.0:
+                take_price = ep - (atr * take_mult)
+                if mp <= take_price:
+                    return ExitSignal(
+                        should_exit=True,
+                        reason="atr_take_profit",
+                        meta={
+                            "entry_price": ep,
+                            "market_price": mp,
+                            "atr_value": atr,
+                            "atr_take_mult": take_mult,
+                            "take_price": take_price,
+                        },
+                    )
+
+            return ExitSignal(should_exit=False)
+
+        sl = self._safe_float(stop_loss_pct, 0.0)
+        tp = self._safe_float(take_profit_pct, 0.0)
+        round_trip_fee = max(0.0, 2.0 * self._safe_float(fee_rate, 0.0))
+
+        if sl > 0.0:
+            stop_price = ep * (1.0 + sl / 100.0)
+            if mp >= stop_price:
+                return ExitSignal(
+                    should_exit=True,
+                    reason="stop_loss",
+                    meta={
+                        "entry_price": ep,
+                        "market_price": mp,
+                        "stop_loss_pct": sl,
+                        "stop_price": stop_price,
+                    },
+                )
+
+        if tp > 0.0:
+            gross_take_pct = (tp / 100.0) + round_trip_fee
+            take_price = ep * (1.0 - gross_take_pct)
+            if mp <= take_price:
+                return ExitSignal(
+                    should_exit=True,
+                    reason="take_profit",
+                    meta={
+                        "entry_price": ep,
+                        "market_price": mp,
+                        "take_profit_pct": tp,
+                        "round_trip_fee_pct": round_trip_fee * 100.0,
+                        "take_price": take_price,
+                    },
+                )
+
+        return ExitSignal(should_exit=False)
+

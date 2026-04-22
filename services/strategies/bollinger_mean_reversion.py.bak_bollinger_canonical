@@ -1,0 +1,108 @@
+from __future__ import annotations
+
+import pandas as pd
+
+from services.strategies.base import BaseStrategy
+
+
+class BollingerMeanReversion(BaseStrategy):
+    name = "bollinger_mean_reversion"
+    display_name = "Bollinger Mean Reversion"
+    description = (
+        "Enter long when price re-enters from below the lower Bollinger band; "
+        "optionally emit short signals when price re-enters from above the upper band."
+    )
+
+    # Canonical names used by the strategy, API schema, saved configs, and UI.
+    # Legacy spellings are accepted by normalize_params(), but new configs should
+    # emit these names only.
+    default_params = {
+        "length": 20,
+        "std_dev": 2.0,
+        "min_band_width_pct": 0.01,
+        "exit_on_mid": True,
+        "allow_short": False,
+    }
+
+    min_bars = 22
+
+    @classmethod
+    def normalize_params(cls, params: dict | None = None) -> dict:
+        """Return canonical Bollinger params while accepting legacy aliases."""
+        raw = dict(params or {})
+        aliases = {
+            "std_dev": "std_dev",
+            "std_dev": "std_dev",
+            "min_band_width_pct": "min_band_width_pct",
+            "min_band_width_pct": "min_band_width_pct",
+            "min_band_width": "min_band_width_pct",
+            "window": "length",
+        }
+
+        normalized = dict(cls.default_params)
+        for key, value in raw.items():
+            normalized[aliases.get(str(key), str(key))] = value
+
+        normalized["length"] = max(2, int(normalized.get("length", cls.default_params["length"])))
+        normalized["std_dev"] = float(normalized.get("std_dev", cls.default_params["std_dev"]))
+        normalized["min_band_width_pct"] = float(
+            normalized.get("min_band_width_pct", cls.default_params["min_band_width_pct"])
+        )
+        normalized["exit_on_mid"] = bool(normalized.get("exit_on_mid", cls.default_params["exit_on_mid"]))
+        normalized["allow_short"] = bool(normalized.get("allow_short", cls.default_params["allow_short"]))
+        return normalized
+
+    @classmethod
+    def generate(cls, df, params: dict | None = None):
+        """Generate Bollinger mean-reversion signals.
+
+        signal:
+            1  = long entry / bullish signal
+           -1  = short entry / bearish signal when allow_short=True
+            0  = no signal
+        """
+        p = cls.normalize_params(params)
+        length = p["length"]
+        std_dev = p["std_dev"]
+        min_band_width_pct = p["min_band_width_pct"]
+        allow_short = p["allow_short"]
+
+        out = df.copy()
+        close = out["close"].astype(float)
+
+        mid = close.rolling(length, min_periods=length).mean()
+        std = close.rolling(length, min_periods=length).std()
+        upper = mid + (std_dev * std)
+        lower = mid - (std_dev * std)
+
+        band_width_pct = ((upper - lower) / mid).replace([float("inf"), float("-inf")], 0.0).fillna(0.0)
+
+        prev_close = close.shift(1)
+        prev_upper = upper.shift(1)
+        prev_lower = lower.shift(1)
+
+        long_signal = (
+            (prev_close < prev_lower)
+            & (close >= lower)
+            & (band_width_pct >= min_band_width_pct)
+        )
+        short_signal = (
+            (prev_close > prev_upper)
+            & (close <= upper)
+            & (band_width_pct >= min_band_width_pct)
+        )
+
+        out["bb_mid"] = mid
+        out["bb_upper"] = upper
+        out["bb_lower"] = lower
+        out["bb_band_width_pct"] = band_width_pct
+        out["signal"] = 0
+        out.loc[long_signal, "signal"] = 1
+        if allow_short:
+            out.loc[short_signal, "signal"] = -1
+
+        return out
+
+    @classmethod
+    def apply(cls, df, params: dict | None = None):
+        return cls.generate(df, params)

@@ -29,6 +29,7 @@ from core.database import (
     update_run_state,
     upsert_runtime_run,
 )
+from core.indicators import latest_atr_value
 from core.execution_models import Fill, PortfolioState
 from core.market_types import is_derivatives_market, normalize_market_type
 from core.run_naming import make_run_id
@@ -514,6 +515,7 @@ class ModeController:
                 state=state,
                 market_type=cfg.market_type,
                 leverage=cfg.leverage,
+                interval=cfg.interval,
                 allow_short=cfg.allow_short,                
                 include_equity=cfg.include_equity,
                 equity_stride=cfg.equity_stride,
@@ -1267,7 +1269,7 @@ class ModeController:
                 float(market_price) - float(self._state.entry_price)
             )
 
-        peak = max([float(p["equity"]) for p in self._equity_points], default=equity)
+        peak = max(float(self._peak_equity or 0.0), float(equity))
         drawdown_pct = 0.0 if peak <= 0 else ((peak - equity) / peak) * 100.0
 
         ts = None
@@ -1828,268 +1830,269 @@ class ModeController:
             await self._append_fill(fill)
 
     async def _run_loop(self) -> None:
-        try:
-            while not self._stop_event.is_set():
-                cfg = self._status.config
+        while not self._stop_event.is_set():
+            try:
+                while not self._stop_event.is_set():
+                    cfg = self._status.config
 
-                bars = await asyncio.to_thread(
-                    self._fetch_recent_bars,
-                    cfg.symbol,
-                    cfg.interval,
-                    max(50, int(cfg.candle_limit or 300)),
-                )
+                    bars = await asyncio.to_thread(
+                        self._fetch_recent_bars,
+                        cfg.symbol,
+                        cfg.interval,
+                        max(50, int(cfg.candle_limit or 300)),
+                    )
 
-                if not bars:
-                    raise RuntimeError("No bars returned from market data service.")
+                    if not bars:
+                        raise RuntimeError("No bars returned from market data service.")
 
-                self._reconnect_attempts = 0
-                self._last_fetch_error = None
+                    self._reconnect_attempts = 0
+                    self._last_fetch_error = None
 
-                latest_bar = bars[-1]
-                self._latest_bar = latest_bar
-                self._bars = bars[-max(1000, int(cfg.candle_limit or 300)) :]
+                    latest_bar = bars[-1]
+                    self._latest_bar = latest_bar
+                    self._bars = bars[-max(1000, int(cfg.candle_limit or 300)) :]
 
-                latest_price = float(latest_bar["close"])
-                await self._mark_to_market(latest_price)
+                    latest_price = float(latest_bar["close"])
+                    await self._mark_to_market(latest_price)
 
-                static_exit_done = await self._maybe_execute_static_exit_locked(
-                    market_price=latest_price,
-                    now_ts=latest_bar.get("timestamp"),
-                )
-                if static_exit_done:
+                    static_exit_done = await self._maybe_execute_static_exit_locked(
+                        market_price=latest_price,
+                        now_ts=latest_bar.get("timestamp"),
+                    )
+                    if static_exit_done:
+                        self._persist_status()
+                        self._persist_snapshot()
+                        await self._sleep_or_stop(cfg.poll_seconds)
+                        continue
+
+                    if bool(getattr(cfg, "debug_stream", False)):
+                        print(
+                            "[paper-loop]",
+                            f"run_id={self._status.run_id}",
+                            f"symbol={cfg.symbol}",
+                            f"interval={cfg.interval}",
+                            f"bar_ts={latest_bar.get('timestamp')}",
+                            f"close={latest_price}",
+                            f"position_qty={self._state.position_qty if self._state else 0.0}",
+                            f"signal={self._last_signal}",
+                            flush=True,
+                        )
+
+                    stable_bars, processed_ts = self._stable_bars_for_signal(bars)
+
+                    if (
+                        processed_ts is not None
+                        and (
+                            self._last_processed_bar_ts is None
+                            or int(processed_ts) > int(self._last_processed_bar_ts)
+                        )
+                    ):
+                        signal = int(self._latest_signal_from_bars(stable_bars, cfg))
+                        self._last_signal = signal
+                        self._last_processed_bar_ts = int(processed_ts)
+
+                        if self._state is not None and self._engine is not None:
+                            fill = None
+                            qty_now = float(self._state.position_qty or 0.0)
+                            position_side = str(getattr(self._state, "side", None) or "").lower() or None
+                            is_flat = abs(qty_now) <= 1e-12
+
+                            # side-aware marker: signal > 0 and position_side == 'short' means cover short first.
+                            if cfg.exit_on_signal and signal > 0 and position_side == "short":
+                                self._state, fill = self._engine.exit_short(
+                                    ts_iso=str(int(processed_ts)),
+                                    state=self._state,
+                                    close=latest_price,
+                                    market_type=cfg.market_type,
+                                    trade_id=self._trade_id,
+                                )
+                                if fill is not None:
+                                    await self._append_fill(fill)
+                                    await self._broadcast_trace_event(
+                                        "signal_fill",
+                                        data={
+                                            "signal": signal,
+                                            "processed_bar_ts": int(processed_ts),
+                                            "price": latest_price,
+                                            "trade_id": getattr(fill, "trade_id", None),
+                                            "fill_type": getattr(fill, "type", None),
+                                        },
+                                    )
+                                qty_now = float(self._state.position_qty or 0.0)
+                                position_side = str(getattr(self._state, "side", None) or "").lower() or None
+                                is_flat = abs(qty_now) <= 1e-12
+
+                            if signal > 0 and is_flat:
+                                entry_gate = self._check_entry_gate_locked(latest_price, now_ts=processed_ts)
+                                if entry_gate["allowed"]:
+                                    self._trade_id += 1
+                                    self._state, fill = self._engine.enter_long(
+                                        ts_iso=str(int(processed_ts)),
+                                        state=self._state,
+                                        close=latest_price,
+                                        market_type=cfg.market_type,
+                                        leverage=cfg.leverage,
+                                        trade_id=self._trade_id,
+                                        qty_override=self._compute_entry_qty_locked(latest_price),
+                                    )
+                                    if fill is not None:
+                                        await self._append_fill(fill)
+                                        await self._broadcast_trace_event(
+                                            "signal_fill",
+                                            data={
+                                                "signal": signal,
+                                                "processed_bar_ts": int(processed_ts),
+                                                "price": latest_price,
+                                                "trade_id": getattr(fill, "trade_id", None),
+                                                "fill_type": getattr(fill, "type", None),
+                                            },
+                                        )
+                                else:
+                                    self._risk_halt_reason = entry_gate["reason"]
+                                    await self._broadcast_trace_event(
+                                        "entry_blocked",
+                                        note=f"Risk blocked entry: {entry_gate['reason']}",
+                                        data={
+                                            "processed_bar_ts": int(processed_ts),
+                                            "price": latest_price,
+                                            **(entry_gate.get("meta", {}) or {}),
+                                        },
+                                    )
+
+                            # side-aware marker: signal < 0 and position_side == 'long' means exit long first.
+                            elif cfg.exit_on_signal and signal < 0 and position_side == "long":
+                                self._state, fill = self._engine.exit_long(
+                                    ts_iso=str(int(processed_ts)),
+                                    state=self._state,
+                                    close=latest_price,
+                                    market_type=cfg.market_type,
+                                    trade_id=self._trade_id,
+                                )
+                                if fill is not None:
+                                    await self._append_fill(fill)
+                                    await self._broadcast_trace_event(
+                                        "signal_fill",
+                                        data={
+                                            "signal": signal,
+                                            "processed_bar_ts": int(processed_ts),
+                                            "price": latest_price,
+                                            "trade_id": getattr(fill, "trade_id", None),
+                                            "fill_type": getattr(fill, "type", None),
+                                        },
+                                    )
+                                qty_now = float(self._state.position_qty or 0.0)
+                                position_side = str(getattr(self._state, "side", None) or "").lower() or None
+                                is_flat = abs(qty_now) <= 1e-12
+
+                                if cfg.allow_short and is_flat and is_derivatives_market(cfg.market_type):
+                                    self._trade_id += 1
+                                    self._state, fill = self._engine.enter_short(
+                                        ts_iso=str(int(processed_ts)),
+                                        state=self._state,
+                                        close=latest_price,
+                                        market_type=cfg.market_type,
+                                        leverage=cfg.leverage,
+                                        trade_id=self._trade_id,
+                                        qty_override=self._compute_entry_qty_locked(latest_price),
+                                    )
+                                    if fill is not None:
+                                        await self._append_fill(fill)
+                                        await self._broadcast_trace_event(
+                                            "signal_fill",
+                                            data={
+                                                "signal": signal,
+                                                "processed_bar_ts": int(processed_ts),
+                                                "price": latest_price,
+                                                "trade_id": getattr(fill, "trade_id", None),
+                                                "fill_type": getattr(fill, "type", None),
+                                            },
+                                        )
+
+                            # side-aware marker: signal < 0 and is_flat and bool(cfg.allow_short) and is_derivatives_market(cfg.market_type) opens a fresh short.
+                            elif signal < 0 and is_flat and bool(cfg.allow_short) and is_derivatives_market(cfg.market_type):
+                                entry_gate = self._check_entry_gate_locked(latest_price, now_ts=processed_ts)
+                                if entry_gate["allowed"]:
+                                    self._trade_id += 1
+                                    self._state, fill = self._engine.enter_short(
+                                        ts_iso=str(int(processed_ts)),
+                                        state=self._state,
+                                        close=latest_price,
+                                        market_type=cfg.market_type,
+                                        leverage=cfg.leverage,
+                                        trade_id=self._trade_id,
+                                        qty_override=self._compute_entry_qty_locked(latest_price),
+                                    )
+                                    if fill is not None:
+                                        await self._append_fill(fill)
+                                        await self._broadcast_trace_event(
+                                            "signal_fill",
+                                            data={
+                                                "signal": signal,
+                                                "processed_bar_ts": int(processed_ts),
+                                                "price": latest_price,
+                                                "trade_id": getattr(fill, "trade_id", None),
+                                                "fill_type": getattr(fill, "type", None),
+                                            },
+                                        )
+                                else:
+                                    self._risk_halt_reason = entry_gate["reason"]
+                                    await self._broadcast_trace_event(
+                                        "entry_blocked",
+                                        note=f"Risk blocked short entry: {entry_gate['reason']}",
+                                        data={
+                                            "processed_bar_ts": int(processed_ts),
+                                            "price": latest_price,
+                                            **(entry_gate.get("meta", {}) or {}),
+                                        },
+                                    )
                     self._persist_status()
                     self._persist_snapshot()
                     await self._sleep_or_stop(cfg.poll_seconds)
-                    continue
 
-                if bool(getattr(cfg, "debug_stream", False)):
-                    print(
-                        "[paper-loop]",
-                        f"run_id={self._status.run_id}",
-                        f"symbol={cfg.symbol}",
-                        f"interval={cfg.interval}",
-                        f"bar_ts={latest_bar.get('timestamp')}",
-                        f"close={latest_price}",
-                        f"position_qty={self._state.position_qty if self._state else 0.0}",
-                        f"signal={self._last_signal}",
-                        flush=True,
-                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._reconnect_attempts += 1
+                self._last_fetch_error = str(e)
 
-                stable_bars, processed_ts = self._stable_bars_for_signal(bars)
-
-                if (
-                    processed_ts is not None
-                    and (
-                        self._last_processed_bar_ts is None
-                        or int(processed_ts) > int(self._last_processed_bar_ts)
-                    )
-                ):
-                    signal = int(self._latest_signal_from_bars(stable_bars, cfg))
-                    self._last_signal = signal
-                    self._last_processed_bar_ts = int(processed_ts)
-
-                    if self._state is not None and self._engine is not None:
-                        fill = None
-                        qty_now = float(self._state.position_qty or 0.0)
-                        position_side = str(getattr(self._state, "side", None) or "").lower() or None
-                        is_flat = abs(qty_now) <= 1e-12
-
-                        # side-aware marker: signal > 0 and position_side == 'short' means cover short first.
-                        if cfg.exit_on_signal and signal > 0 and position_side == "short":
-                            self._state, fill = self._engine.exit_short(
-                                ts_iso=str(int(processed_ts)),
-                                state=self._state,
-                                close=latest_price,
-                                market_type=cfg.market_type,
-                                trade_id=self._trade_id,
-                            )
-                            if fill is not None:
-                                await self._append_fill(fill)
-                                await self._broadcast_trace_event(
-                                    "signal_fill",
-                                    data={
-                                        "signal": signal,
-                                        "processed_bar_ts": int(processed_ts),
-                                        "price": latest_price,
-                                        "trade_id": getattr(fill, "trade_id", None),
-                                        "fill_type": getattr(fill, "type", None),
-                                    },
-                                )
-                            qty_now = float(self._state.position_qty or 0.0)
-                            position_side = str(getattr(self._state, "side", None) or "").lower() or None
-                            is_flat = abs(qty_now) <= 1e-12
-
-                        if signal > 0 and is_flat:
-                            entry_gate = self._check_entry_gate_locked(latest_price, now_ts=processed_ts)
-                            if entry_gate["allowed"]:
-                                self._trade_id += 1
-                                self._state, fill = self._engine.enter_long(
-                                    ts_iso=str(int(processed_ts)),
-                                    state=self._state,
-                                    close=latest_price,
-                                    market_type=cfg.market_type,
-                                    leverage=cfg.leverage,
-                                    trade_id=self._trade_id,
-                                    qty_override=self._compute_entry_qty_locked(latest_price),
-                                )
-                                if fill is not None:
-                                    await self._append_fill(fill)
-                                    await self._broadcast_trace_event(
-                                        "signal_fill",
-                                        data={
-                                            "signal": signal,
-                                            "processed_bar_ts": int(processed_ts),
-                                            "price": latest_price,
-                                            "trade_id": getattr(fill, "trade_id", None),
-                                            "fill_type": getattr(fill, "type", None),
-                                        },
-                                    )
-                            else:
-                                self._risk_halt_reason = entry_gate["reason"]
-                                await self._broadcast_trace_event(
-                                    "entry_blocked",
-                                    note=f"Risk blocked entry: {entry_gate['reason']}",
-                                    data={
-                                        "processed_bar_ts": int(processed_ts),
-                                        "price": latest_price,
-                                        **(entry_gate.get("meta", {}) or {}),
-                                    },
-                                )
-
-                        # side-aware marker: signal < 0 and position_side == 'long' means exit long first.
-                        elif cfg.exit_on_signal and signal < 0 and position_side == "long":
-                            self._state, fill = self._engine.exit_long(
-                                ts_iso=str(int(processed_ts)),
-                                state=self._state,
-                                close=latest_price,
-                                market_type=cfg.market_type,
-                                trade_id=self._trade_id,
-                            )
-                            if fill is not None:
-                                await self._append_fill(fill)
-                                await self._broadcast_trace_event(
-                                    "signal_fill",
-                                    data={
-                                        "signal": signal,
-                                        "processed_bar_ts": int(processed_ts),
-                                        "price": latest_price,
-                                        "trade_id": getattr(fill, "trade_id", None),
-                                        "fill_type": getattr(fill, "type", None),
-                                    },
-                                )
-                            qty_now = float(self._state.position_qty or 0.0)
-                            position_side = str(getattr(self._state, "side", None) or "").lower() or None
-                            is_flat = abs(qty_now) <= 1e-12
-
-                            if cfg.allow_short and is_flat and is_derivatives_market(cfg.market_type):
-                                self._trade_id += 1
-                                self._state, fill = self._engine.enter_short(
-                                    ts_iso=str(int(processed_ts)),
-                                    state=self._state,
-                                    close=latest_price,
-                                    market_type=cfg.market_type,
-                                    leverage=cfg.leverage,
-                                    trade_id=self._trade_id,
-                                    qty_override=self._compute_entry_qty_locked(latest_price),
-                                )
-                                if fill is not None:
-                                    await self._append_fill(fill)
-                                    await self._broadcast_trace_event(
-                                        "signal_fill",
-                                        data={
-                                            "signal": signal,
-                                            "processed_bar_ts": int(processed_ts),
-                                            "price": latest_price,
-                                            "trade_id": getattr(fill, "trade_id", None),
-                                            "fill_type": getattr(fill, "type", None),
-                                        },
-                                    )
-
-                        # side-aware marker: signal < 0 and is_flat and bool(cfg.allow_short) and is_derivatives_market(cfg.market_type) opens a fresh short.
-                        elif signal < 0 and is_flat and bool(cfg.allow_short) and is_derivatives_market(cfg.market_type):
-                            entry_gate = self._check_entry_gate_locked(latest_price, now_ts=processed_ts)
-                            if entry_gate["allowed"]:
-                                self._trade_id += 1
-                                self._state, fill = self._engine.enter_short(
-                                    ts_iso=str(int(processed_ts)),
-                                    state=self._state,
-                                    close=latest_price,
-                                    market_type=cfg.market_type,
-                                    leverage=cfg.leverage,
-                                    trade_id=self._trade_id,
-                                    qty_override=self._compute_entry_qty_locked(latest_price),
-                                )
-                                if fill is not None:
-                                    await self._append_fill(fill)
-                                    await self._broadcast_trace_event(
-                                        "signal_fill",
-                                        data={
-                                            "signal": signal,
-                                            "processed_bar_ts": int(processed_ts),
-                                            "price": latest_price,
-                                            "trade_id": getattr(fill, "trade_id", None),
-                                            "fill_type": getattr(fill, "type", None),
-                                        },
-                                    )
-                            else:
-                                self._risk_halt_reason = entry_gate["reason"]
-                                await self._broadcast_trace_event(
-                                    "entry_blocked",
-                                    note=f"Risk blocked short entry: {entry_gate['reason']}",
-                                    data={
-                                        "processed_bar_ts": int(processed_ts),
-                                        "price": latest_price,
-                                        **(entry_gate.get("meta", {}) or {}),
-                                    },
-                                )
-                self._persist_status()
-                self._persist_snapshot()
-                await self._sleep_or_stop(cfg.poll_seconds)
-
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            self._reconnect_attempts += 1
-            self._last_fetch_error = str(e)
-
-            self._persist_status()
-            self._persist_snapshot()
-
-            await self._broadcast_trace_event(
-                "reconnect_wait",
-                note="Paper loop fetch/process error. Retrying.",
-                data={
-                    "attempt": self._reconnect_attempts,
-                    "error": str(e),
-                },
-            )
-
-            max_attempts = max(1, int(self._status.config.max_reconnect_attempts or 8))
-            backoff_base = max(1.0, float(self._status.config.reconnect_backoff_base or 1.5))
-
-            if self._reconnect_attempts >= max_attempts:
-                self._status.state = EngineState.ERROR
-                self._status.last_error = (
-                    f"Paper loop stopped after {self._reconnect_attempts} reconnect attempts: {e}"
-                )
-                self._status.stopped_at = time.time()
                 self._persist_status()
                 self._persist_snapshot()
 
                 await self._broadcast_trace_event(
-                    "paper_error",
-                    note="Reconnect limit reached. Paper loop stopped.",
+                    "reconnect_wait",
+                    note="Paper loop fetch/process error. Retrying.",
                     data={
-                        "attempts": self._reconnect_attempts,
+                        "attempt": self._reconnect_attempts,
                         "error": str(e),
                     },
                 )
-                return
 
-            delay = min(30.0, backoff_base ** max(0, self._reconnect_attempts - 1))
-            await self._sleep_or_stop(delay)
-            if not self._stop_event.is_set():
-                await self._run_loop()
+                max_attempts = max(1, int(self._status.config.max_reconnect_attempts or 8))
+                backoff_base = max(1.0, float(self._status.config.reconnect_backoff_base or 1.5))
+
+                if self._reconnect_attempts >= max_attempts:
+                    self._status.state = EngineState.ERROR
+                    self._status.last_error = (
+                        f"Paper loop stopped after {self._reconnect_attempts} reconnect attempts: {e}"
+                    )
+                    self._status.stopped_at = time.time()
+                    self._persist_status()
+                    self._persist_snapshot()
+
+                    await self._broadcast_trace_event(
+                        "paper_error",
+                        note="Reconnect limit reached. Paper loop stopped.",
+                        data={
+                            "attempts": self._reconnect_attempts,
+                            "error": str(e),
+                        },
+                    )
+                    return
+
+                delay = min(30.0, backoff_base ** max(0, self._reconnect_attempts - 1))
+                await self._sleep_or_stop(delay)
+                if not self._stop_event.is_set():
+                    continue
 
     def _coerce_epoch_seconds(self, value: object) -> float | None:
         return self._risk_engine._coerce_epoch_seconds(value)
@@ -2251,37 +2254,7 @@ class ModeController:
 
     def _latest_atr_value_locked(self) -> float | None:
         period = int(getattr(self._status.config, "atr_period", 14) or 14)
-        if period <= 0 or not self._bars:
-            return None
-
-        df = pd.DataFrame(self._bars).copy()
-        needed = {"high", "low", "close"}
-        if df.empty or not needed.issubset(df.columns):
-            return None
-
-        high = pd.to_numeric(df["high"], errors="coerce")
-        low = pd.to_numeric(df["low"], errors="coerce")
-        close = pd.to_numeric(df["close"], errors="coerce")
-        prev_close = close.shift(1)
-
-        tr = pd.concat(
-            [
-                (high - low).abs(),
-                (high - prev_close).abs(),
-                (low - prev_close).abs(),
-            ],
-            axis=1,
-        ).max(axis=1)
-
-        atr = tr.rolling(window=period, min_periods=period).mean()
-        if atr.empty or pd.isna(atr.iloc[-1]):
-            return None
-
-        try:
-            value = float(atr.iloc[-1])
-            return value if value > 0.0 else None
-        except Exception:
-            return None
+        return latest_atr_value(self._bars, period)
 
     def _check_static_exit_locked(self, market_price: float) -> dict:
         if self._state is None or self._state.position_qty <= 0:
@@ -2303,6 +2276,7 @@ class ModeController:
             atr_take_mult=self._status.config.atr_take_mult,
             atr_reference_mode=self._status.config.atr_reference_mode,
             peak_price_since_entry=self._position_peak_price,
+            fee_rate=getattr(self._engine, "fee_rate", 0.0),
         )
         return {
             "should_exit": result.should_exit,

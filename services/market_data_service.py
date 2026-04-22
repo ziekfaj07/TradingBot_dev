@@ -1,4 +1,5 @@
 import requests
+from core.http_client import request_get
 
 
 class MarketDataService:
@@ -22,7 +23,7 @@ class CoinGeckoService(MarketDataService):
             return {"error": "Unsupported symbol"}
 
         coin_id = self.SYMBOL_MAP[symbol]
-        response = requests.get(
+        response = request_get(
             f"{self.BASE_URL}/simple/price",
             params={"ids": coin_id, "vs_currencies": "usd"},
             timeout=10,
@@ -86,7 +87,7 @@ class GateIOService(MarketDataService):
         except ValueError as e:
             return {"error": str(e)}
 
-        response = requests.get(
+        response = request_get(
             f"{self.BASE_URL}/spot/tickers",
             params={"currency_pair": pair},
             timeout=10,
@@ -108,7 +109,7 @@ class GateIOService(MarketDataService):
         gate_interval = self._normalize_interval(interval)
         safe_limit = max(10, min(int(limit), 1000))
 
-        response = requests.get(
+        response = request_get(
             f"{self.BASE_URL}/spot/candlesticks",
             params={
                 "currency_pair": pair,

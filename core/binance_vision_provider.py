@@ -12,6 +12,10 @@ import pandas as pd
 import requests
 
 from core.data_provider import DataProvider
+from core.http_client import request_session
+from core.synthetic_ohlcv import build_synthetic_ohlcv
+
+session = request_session()
 
 UtcTimestamp: TypeAlias = pd.Timestamp
 OptionalUtcTimestamp: TypeAlias = pd.Timestamp | None
@@ -97,7 +101,7 @@ class BinanceVisionProvider(DataProvider):
         os.makedirs(self.hist_dir, exist_ok=True)
         os.makedirs(self.exp_dir, exist_ok=True)
 
-        self.session = requests.Session()
+        self.session = request_session()
         self.session.headers.update(
             {
                 "User-Agent": "TradingBot/0.1 (+historical-loader)",
@@ -993,6 +997,23 @@ class BinanceVisionProvider(DataProvider):
                 )
             except Exception as e:
                 diagnostics.append(f"{base_interval}: {e}")
+
+        allow_synthetic = str(
+            os.getenv("TRADINGBOT_ALLOW_SYNTHETIC_OHLCV", "false")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        
+        allow_synthetic = str(
+            os.getenv("TRADINGBOT_ALLOW_SYNTHETIC_OHLCV", "false")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+
+        if allow_synthetic:
+            return build_synthetic_ohlcv(
+                symbol=symbol,
+                interval=interval,
+                start=start,
+                end=end,
+                limit=300,
+            )        
 
         raise RuntimeError(
             f"Failed to load historical OHLCV. "

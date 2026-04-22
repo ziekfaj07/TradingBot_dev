@@ -1,0 +1,295 @@
+"""
+fix_bollinger_param_naming.py
+
+Drop-in repo patch for canonical Bollinger Mean Reversion parameter names.
+Run from the repository root:
+
+    python fix_bollinger_param_naming.py
+
+Canonical public/API/UI names after patch:
+    length
+    std_dev
+    min_band_width_pct
+    exit_on_mid
+    allow_short
+
+Backward-compatible accepted aliases:
+    stddev -> std_dev
+    min_bandwidth_pct -> min_band_width_pct
+    min_bandwidth -> min_band_width_pct
+    min_band_width -> min_band_width_pct
+"""
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+ROOT = Path.cwd()
+SKIP_DIRS = {".git", "__pycache__", ".venv", "venv", "env", "node_modules", ".mypy_cache", ".pytest_cache"}
+
+STRATEGY_CLASS = r'''class BollingerMeanReversion(BaseStrategy):
+    name = "bollinger_mean_reversion"
+    display_name = "Bollinger Mean Reversion"
+    description = (
+        "Enter long when price re-enters from below the lower Bollinger band; "
+        "optionally emit short signals when price re-enters from above the upper band."
+    )
+
+    # Canonical names used by the strategy, API schema, saved configs, and UI.
+    # Legacy spellings are accepted by normalize_params(), but new configs should
+    # emit these names only.
+    default_params = {
+        "length": 20,
+        "std_dev": 2.0,
+        "min_band_width_pct": 0.01,
+        "exit_on_mid": True,
+        "allow_short": False,
+    }
+
+    min_bars = 22
+
+    @classmethod
+    def normalize_params(cls, params: dict | None = None) -> dict:
+        """Return canonical Bollinger params while accepting legacy aliases."""
+        raw = dict(params or {})
+        aliases = {
+            "stddev": "std_dev",
+            "std_mult": "std_dev",
+            "min_bandwidth_pct": "min_band_width_pct",
+            "min_bandwidth": "min_band_width_pct",
+            "min_band_width": "min_band_width_pct",
+            "window": "length",
+        }
+
+        normalized = dict(cls.default_params)
+        for key, value in raw.items():
+            normalized[aliases.get(str(key), str(key))] = value
+
+        normalized["length"] = max(2, int(normalized.get("length", cls.default_params["length"])))
+        normalized["std_dev"] = float(normalized.get("std_dev", cls.default_params["std_dev"]))
+        normalized["min_band_width_pct"] = float(
+            normalized.get("min_band_width_pct", cls.default_params["min_band_width_pct"])
+        )
+        normalized["exit_on_mid"] = bool(normalized.get("exit_on_mid", cls.default_params["exit_on_mid"]))
+        normalized["allow_short"] = bool(normalized.get("allow_short", cls.default_params["allow_short"]))
+        return normalized
+
+    @classmethod
+    def generate(cls, df, params: dict | None = None):
+        """Generate Bollinger mean-reversion signals.
+
+        signal:
+            1  = long entry / bullish signal
+           -1  = short entry / bearish signal when allow_short=True
+            0  = no signal
+        """
+        p = cls.normalize_params(params)
+        length = p["length"]
+        std_dev = p["std_dev"]
+        min_band_width_pct = p["min_band_width_pct"]
+        allow_short = p["allow_short"]
+
+        out = df.copy()
+        close = out["close"].astype(float)
+
+        mid = close.rolling(length, min_periods=length).mean()
+        std = close.rolling(length, min_periods=length).std()
+        upper = mid + (std_dev * std)
+        lower = mid - (std_dev * std)
+
+        band_width_pct = ((upper - lower) / mid).replace([float("inf"), float("-inf")], 0.0).fillna(0.0)
+
+        prev_close = close.shift(1)
+        prev_upper = upper.shift(1)
+        prev_lower = lower.shift(1)
+
+        long_signal = (
+            (prev_close < prev_lower)
+            & (close >= lower)
+            & (band_width_pct >= min_band_width_pct)
+        )
+        short_signal = (
+            (prev_close > prev_upper)
+            & (close <= upper)
+            & (band_width_pct >= min_band_width_pct)
+        )
+
+        out["bb_mid"] = mid
+        out["bb_upper"] = upper
+        out["bb_lower"] = lower
+        out["bb_band_width_pct"] = band_width_pct
+        out["signal"] = 0
+        out.loc[long_signal, "signal"] = 1
+        if allow_short:
+            out.loc[short_signal, "signal"] = -1
+
+        return out
+
+    @classmethod
+    def apply(cls, df, params: dict | None = None):
+        return cls.generate(df, params)
+'''
+
+
+def iter_py_files() -> list[Path]:
+    files: list[Path] = []
+    for path in ROOT.rglob("*.py"):
+        if any(part in SKIP_DIRS for part in path.parts):
+            continue
+        if path.name == Path(__file__).name:
+            continue
+        files.append(path)
+    return files
+
+
+def write_if_changed(path: Path, old: str, new: str, touched: list[str]) -> None:
+    if old == new:
+        return
+    backup = path.with_suffix(path.suffix + ".bak_bollinger_params")
+    if not backup.exists():
+        backup.write_text(old, encoding="utf-8")
+    path.write_text(new, encoding="utf-8")
+    touched.append(str(path.relative_to(ROOT)))
+
+
+def patch_strategy_class(touched: list[str]) -> None:
+    matches = [p for p in iter_py_files() if "BollingerMeanReversion" in p.read_text(encoding="utf-8", errors="ignore")]
+    if not matches:
+        raise FileNotFoundError("Could not find the file containing class BollingerMeanReversion.")
+
+    for path in matches:
+        text = path.read_text(encoding="utf-8")
+        if "class BollingerMeanReversion(BaseStrategy):" not in text:
+            continue
+        new = re.sub(
+            r"class BollingerMeanReversion\(BaseStrategy\):[\s\S]*\Z",
+            STRATEGY_CLASS,
+            text,
+            count=1,
+        )
+        write_if_changed(path, text, new, touched)
+        return
+
+    raise FileNotFoundError("Found BollingerMeanReversion text, but not the expected class declaration.")
+
+
+def ensure_model_validator_import(text: str) -> str:
+    pattern = re.compile(r"from pydantic import ([^\n]+)")
+    m = pattern.search(text)
+    if not m:
+        return text
+    names = [x.strip() for x in m.group(1).split(",")]
+    if "model_validator" not in names:
+        names.append("model_validator")
+    # Keep stable order with model_validator last to avoid unnecessary noise.
+    return text[:m.start()] + "from pydantic import " + ", ".join(names) + text[m.end():]
+
+
+def patch_schema_files(touched: list[str]) -> None:
+    for path in iter_py_files():
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        if not any(token in text for token in ("stddev", "min_bandwidth_pct", "Bollinger", "bollinger_mean_reversion")):
+            continue
+
+        old = text
+
+        # Canonicalize common field declarations/references.
+        text = re.sub(r"\bstddev\b", "std_dev", text)
+        text = re.sub(r"\bstd_mult\b", "std_dev", text)
+        text = re.sub(r"\bmin_bandwidth_pct\b", "min_band_width_pct", text)
+        text = re.sub(r"\bmin_bandwidth\b", "min_band_width_pct", text)
+        # Do not replace min_band_width_pct again; it is already canonical.
+
+        # Preserve legacy compatibility by injecting a before-validator into any
+        # Pydantic params model that now has the canonical fields.
+        if (
+            "BaseModel" in text
+            and "std_dev" in text
+            and "min_band_width_pct" in text
+            and "normalize_bollinger_param_aliases" not in text
+        ):
+            text = ensure_model_validator_import(text)
+
+            class_match = re.search(
+                r"class\s+\w*Bollinger\w*\s*\([^)]*BaseModel[^)]*\):\n",
+                text,
+            )
+            if class_match:
+                insert_at = class_match.end()
+                validator = '''    @model_validator(mode="before")
+    @classmethod
+    def normalize_bollinger_param_aliases(cls, values):
+        if not isinstance(values, dict):
+            return values
+        values = dict(values)
+        aliases = {
+            "stddev": "std_dev",
+            "std_mult": "std_dev",
+            "min_bandwidth_pct": "min_band_width_pct",
+            "min_bandwidth": "min_band_width_pct",
+            "min_band_width": "min_band_width_pct",
+            "window": "length",
+        }
+        for old_key, new_key in aliases.items():
+            if old_key in values and new_key not in values:
+                values[new_key] = values.pop(old_key)
+        return values
+
+'''
+                text = text[:insert_at] + validator + text[insert_at:]
+
+        write_if_changed(path, old, text, touched)
+
+
+def patch_strategy_engine_normalization(touched: list[str]) -> None:
+    for path in iter_py_files():
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        if "class StrategyEngine" not in text or "def apply" not in text:
+            continue
+        if "normalize_params" in text and "strategy.normalize_params" in text:
+            continue
+
+        old = text
+        # Insert immediately after the strategy object is resolved where possible.
+        patterns = [
+            r"(strategy\s*=\s*cls\.get\([^\n]+\)\n)",
+            r"(strategy\s*=\s*STRATEGIES\[[^\n]+\]\n)",
+        ]
+        inserted = False
+        for pattern in patterns:
+            m = re.search(pattern, text)
+            if m:
+                block = (
+                    m.group(1)
+                    + "        strategy_params = dict(strategy_params or {})\n"
+                    + "        if hasattr(strategy, \"normalize_params\"):\n"
+                    + "            strategy_params = strategy.normalize_params(strategy_params)\n"
+                )
+                text = text[:m.start()] + block + text[m.end():]
+                inserted = True
+                break
+
+        if inserted:
+            write_if_changed(path, old, text, touched)
+        return
+
+
+def main() -> None:
+    touched: list[str] = []
+    patch_strategy_class(touched)
+    patch_schema_files(touched)
+    patch_strategy_engine_normalization(touched)
+
+    print("Bollinger parameter naming cleanup complete.")
+    if touched:
+        print("Modified files:")
+        for item in touched:
+            print(f"  - {item}")
+    else:
+        print("No files changed.")
+    print("\nCanonical params: length, std_dev, min_band_width_pct, exit_on_mid, allow_short")
+    print("Legacy aliases are still accepted by the strategy normalizer.")
+
+
+if __name__ == "__main__":
+    main()

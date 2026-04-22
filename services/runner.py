@@ -5,7 +5,10 @@ import math
 from typing import Any
 
 import pandas as pd
+from starlette import config
 
+from core.indicators import bars_per_year, build_atr_series
+from core.math_utils import clean_float as _clean_float, clean_money as _clean_money
 from core.execution_models import PortfolioState
 from core.market_types import is_derivatives_market
 from services.execution_engine import ExecutionEngine
@@ -65,29 +68,6 @@ class RunOutput:
     last_margin_snapshot: dict[str, Any] | None = None
 
 
-_NUMERIC_EPSILON = 1e-12
-_MONEY_EPSILON = 1e-9
-
-
-def _clean_float(value: Any, eps: float = _NUMERIC_EPSILON) -> float:
-    try:
-        v = float(value)
-    except (TypeError, ValueError):
-        return 0.0
-
-    if pd.isna(v):
-        return 0.0
-
-    if abs(v) <= eps:
-        return 0.0
-
-    return v
-
-
-def _clean_money(value: Any) -> float:
-    return round(_clean_float(value, eps=_MONEY_EPSILON), 12)
-
-
 def _clean_fill_for_output(fill: Any) -> dict[str, Any]:
     raw = dict(fill.__dict__)
 
@@ -130,42 +110,13 @@ def _day_key_from_ts(value: Any) -> str:
     return ts.strftime("%Y-%m-%d")
 
 
-def _build_atr_series(df: Any, period: int | None) -> pd.Series | None:
-    try:
-        p = max(1, int(period or 14))
-    except (TypeError, ValueError):
-        p = 14
-
-    if not isinstance(df, pd.DataFrame):
-        return None
-
-    needed = {"high", "low", "close"}
-    if not needed.issubset(df.columns):
-        return None
-
-    high = pd.to_numeric(df["high"], errors="coerce")
-    low = pd.to_numeric(df["low"], errors="coerce")
-    close = pd.to_numeric(df["close"], errors="coerce")
-    prev_close = close.shift(1)
-
-    tr = pd.concat(
-        [
-            (high - low).abs(),
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-
-    return tr.rolling(window=p, min_periods=p).mean()
-
-
 def _build_backtest_stats(
     *,
     initial_balance: float,
     final_equity: float,
     trades: list[dict],
     equity_curve: list[dict],
+    interval: str = "1d",
 ) -> BacktestStats:
     initial_balance = _clean_money(initial_balance)
     final_equity = _clean_money(final_equity)
@@ -230,7 +181,7 @@ def _build_backtest_stats(
     if len(eq_np) >= 2:
         rets = eq_np.pct_change().replace([float("inf"), float("-inf")], pd.NA).dropna()
         if not rets.empty and float(rets.std()) > 0.0:
-            sharpe = _clean_money(float(rets.mean() / rets.std()) * math.sqrt(365.0))
+            sharpe = _clean_money(float(rets.mean() / rets.std()) * math.sqrt(bars_per_year(interval)))
         else:
             sharpe = 0.0
     else:
@@ -262,6 +213,7 @@ def run_signal_backed_loop(
     state: PortfolioState,
     market_type: str,
     leverage: float,
+    interval: str = "1d",
     allow_short: bool = False,
     exit_on_signal: bool = True,
     exit_mode: str = "static",
@@ -278,7 +230,7 @@ def run_signal_backed_loop(
     equity_stride: int = 1,
     risk_engine: RiskEngine | None = None,
     
-    position_sizing_mode: str = "all-in",
+    position_sizing_mode: str = "all_in",
     position_size_value: float | None = None,
     enable_volatility_scaling: bool = False,
     volatility_target_pct: float | None = None,
@@ -323,7 +275,7 @@ def run_signal_backed_loop(
         or bool(enable_volatility_scaling)
     )
 
-    atr_series = _build_atr_series(df, atr_period) if needs_atr else None    
+    atr_series = build_atr_series(df, atr_period) if needs_atr else None    
 
     for i in range(len(df)):
         bar_was_liquidated = False
@@ -335,6 +287,10 @@ def run_signal_backed_loop(
         if state.position_qty > 0.0:
             position_peak_price = (
                 close if position_peak_price is None else max(float(position_peak_price), close)
+            )
+        elif state.position_qty < 0.0:
+            position_peak_price = (
+                close if position_peak_price is None else min(float(position_peak_price), close)
             )
         else:
             position_peak_price = None
@@ -493,6 +449,7 @@ def run_signal_backed_loop(
                 atr_take_mult=atr_take_mult,
                 atr_reference_mode=atr_reference_mode,
                 peak_price_since_entry=position_peak_price,
+                fee_rate=engine.fee_rate,
             )
             if exit_signal.should_exit:
                 trade_id += 1
@@ -513,6 +470,42 @@ def run_signal_backed_loop(
                             "event": "risk_event",
                             "reason": exit_signal.reason,
                             "meta": exit_signal.meta or {},
+                        }
+                    )
+
+        if (not bar_was_liquidated) and state.position_qty < 0.0:
+            short_exit_signal = risk_engine.evaluate_short_exit(
+                entry_price=state.entry_price,
+                market_price=close,
+                stop_loss_pct=stop_loss_pct,
+                take_profit_pct=take_profit_pct,
+                exit_mode=exit_mode,
+                atr_value=atr_value,
+                atr_stop_mult=atr_stop_mult,
+                atr_take_mult=atr_take_mult,
+                atr_reference_mode=atr_reference_mode,
+                trough_price_since_entry=position_peak_price,
+                fee_rate=engine.fee_rate,
+            )
+            if short_exit_signal.should_exit:
+                trade_id += 1
+                state, fill = engine.exit_short(ts_iso, state, close, market_type, trade_id)
+                if fill:
+                    realized_pnl = _clean_money(
+                        float(fill.equity_after) - float(open_trade_equity_baseline)
+                    )
+                    fill.pnl = realized_pnl
+                    fill.equity_after = _clean_money(fill.equity_after)
+                    trades.append(_clean_fill_for_output(fill))
+                    open_trade_equity_baseline = _clean_money(fill.equity_after)
+                    last_exit_ts = getattr(fill, "timestamp", None) or ts_iso
+                    position_peak_price = None
+                    risk_events.append(
+                        {
+                            "timestamp": ts_iso,
+                            "event": "risk_event",
+                            "reason": short_exit_signal.reason,
+                            "meta": short_exit_signal.meta or {},
                         }
                     )
 
@@ -647,6 +640,7 @@ def run_signal_backed_loop(
                     fill.equity_after = _clean_money(getattr(fill, "equity_after", 0.0))
                     trades.append(_clean_fill_for_output(fill))
                     open_trade_equity_baseline = _clean_money(engine.mark_equity(state, market_type, close))
+                    position_peak_price = close
                     trades_today += 1
             else:
                 risk_events.append({"timestamp": ts_iso, "event": "entry_blocked", "reason": gate.reason, "meta": gate.meta or {}})
@@ -672,6 +666,7 @@ def run_signal_backed_loop(
         final_equity=final_equity,
         trades=trades,
         equity_curve=equity_curve,
+        interval=interval,
     )
 
     return RunOutput(

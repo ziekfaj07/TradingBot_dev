@@ -38,38 +38,30 @@ class ThreeCandleReversalParams(StrategyParamsBase):
 
 
 class BollingerMeanReversionParams(StrategyParamsBase):
-    # Canonical public/API names. UI should emit these names only.
     length: int = Field(20, ge=2)
-    std_dev: float = Field(2.0, gt=0.0)
+    stddev: float = Field(2.0, gt=0.0)
     exit_on_mid: bool = True
-    min_band_width_pct: float = Field(0.01, ge=0.0)
-    allow_short: bool = False
+    min_bandwidth_pct: float = Field(0.0, ge=0.0)
 
     @model_validator(mode="before")
     @classmethod
     def alias_inputs(cls, data: Any) -> Any:
-        """Accept old saved-config aliases, but return canonical names."""
         if not isinstance(data, dict):
             return data
 
         out = dict(data)
 
-        alias_map = {
-            "window": "length",
-            "period": "length",
-            "lookback": "length",
-            "stddev": "std_dev",
-            "stdev": "std_dev",
-            "std": "std_dev",
-            "std_mult": "std_dev",
-            "min_bandwidth_pct": "min_band_width_pct",
-            "min_bandwidth": "min_band_width_pct",
-            "min_band_width": "min_band_width_pct",
-        }
+        if "length" not in out:
+            for alt in ("window", "period", "lookback"):
+                if alt in out:
+                    out["length"] = out[alt]
+                    break
 
-        for old_key, new_key in alias_map.items():
-            if old_key in out and new_key not in out:
-                out[new_key] = out.pop(old_key)
+        if "stddev" not in out:
+            for alt in ("std", "std_dev", "stdev", "std_mult"):
+                if alt in out:
+                    out["stddev"] = out[alt]
+                    break
 
         return out
 
