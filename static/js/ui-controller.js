@@ -126,6 +126,7 @@ window.uiController = {
     const runtime = data?.runtime || {};
     const paper = runtime.paper_state || {};
     const latestBar = runtime.latest_bar || {};
+    const live = runtime.live || {};    
 
     qs("botState").textContent = data?.state || "unknown";
     qs("lastSignal").textContent = String(runtime.last_signal ?? "WAIT");
@@ -144,10 +145,83 @@ window.uiController = {
     qs("barCount").textContent = fmtNum(runtime.bar_count ?? 0, 0);
     qs("startedAt").textContent = fmtTs(data?.started_at);
 
+    const visualMode = data?.mode || "-";
+    const visualState = data?.state || "unknown";
+    const cfg = data?.config || {};
+    const rawMarketType = cfg.market_type || "-";
+    const marketLabel = rawMarketType === "swap" ? "futures" : rawMarketType;
+
+    const visualModeBadge = qs("visualModeBadge");
+    const visualStateBadge = qs("visualStateBadge");
+
+    if (visualModeBadge) {
+      visualModeBadge.textContent = String(visualMode).toUpperCase();
+      visualModeBadge.className = `mode-badge mode-${String(visualMode).toLowerCase()}`;
+    }
+
+    if (visualStateBadge) {
+      visualStateBadge.textContent = String(visualState).toUpperCase();
+      visualStateBadge.className = `state-badge state-${String(visualState).toLowerCase()}`;
+    }
+
+    if (qs("visualRunLabel")) {
+      qs("visualRunLabel").textContent = data?.run_label || data?.run_id || "-";
+    }
+
+    if (qs("visualSymbol")) {
+      qs("visualSymbol").textContent = cfg.symbol || runtime.chart_symbol || "-";
+    }
+
+    if (qs("visualMarket")) {
+      qs("visualMarket").textContent = String(marketLabel).toUpperCase();
+    }
+
+    if (qs("visualPosition")) {
+      const qty = Number(paper.position_qty || 0);
+      if (!Number.isFinite(qty) || qty === 0) {
+        qs("visualPosition").textContent = "FLAT";
+      } else if (qty > 0) {
+        qs("visualPosition").textContent = `LONG ${fmtNum(qty)}`;
+      } else {
+        qs("visualPosition").textContent = `SHORT ${fmtNum(Math.abs(qty))}`;
+      }
+    }
+
+    if (qs("visualLiveSafety")) {
+      if (visualMode === "live") {
+        if (live.enable_live_trading && !live.live_dry_run) {
+          qs("visualLiveSafety").textContent =
+            "LIVE EXECUTION ENABLED — real orders may be submitted when backend safety guards allow it.";
+          qs("visualLiveSafety").className = "live-safety-note danger";
+        } else {
+          qs("visualLiveSafety").textContent =
+            "Live mode is armed for monitoring / dry-run only. Real order submission is not active.";
+          qs("visualLiveSafety").className = "live-safety-note warn-note";
+        }
+      } else if (visualMode === "demo") {
+        qs("visualLiveSafety").textContent =
+          "Demo mode: exchange rehearsal environment / sandbox-style execution path.";
+        qs("visualLiveSafety").className = "live-safety-note demo-note";
+      } else if (visualMode === "paper") {
+        qs("visualLiveSafety").textContent =
+          "Paper mode: simulated execution and local accounting only.";
+        qs("visualLiveSafety").className = "live-safety-note paper-note";
+      } else {
+        qs("visualLiveSafety").textContent =
+          "Backtest / idle mode: no live order submission.";
+        qs("visualLiveSafety").className = "live-safety-note";
+      }
+    }    
+
     qs("chartSymbolView").textContent =
       runtime.chart_symbol || data?.config?.symbol || "-";
     qs("chartIntervalView").textContent =
       runtime.chart_interval || data?.config?.interval || "-";
+
+    const chartStrategyEl = qs("chartStrategyView");
+    if (chartStrategyEl) {
+      chartStrategyEl.textContent = data?.config?.strategy_name || "ema_crossover";
+    }
 
     if (paper.equity !== null && paper.equity !== undefined) {
       equityModule.push(paper.equity);
@@ -347,6 +421,13 @@ window.uiController = {
 
         if (msg.type === "fills") {
           fillsModule.load().catch(console.error);
+
+          const fills = msg.payload?.fills || [];
+          for (const fill of fills) {
+            chartModule.addLiveMarkerFromFill(fill);
+          }
+
+          return;
         }
       } catch (err) {
         console.error("Bad WS message:", err, event.data);
@@ -374,6 +455,45 @@ window.uiController = {
     qs("showFillsBtn")?.addEventListener("click", () => fillsModule.load());
     qs("resetPaperBtn")?.addEventListener("click", () => this.resetPaper());
     qs("exportCsvBtn")?.addEventListener("click", () => api.exportCsv());
+
+    qs("autoFollowToggle")?.addEventListener("click", () => {
+      state.autoFollow = !state.autoFollow;
+      qs("autoFollowToggle").textContent =
+        "Auto Follow: " + (state.autoFollow ? "ON" : "OFF");
+    });
+
+    qs("goLiveBtn")?.addEventListener("click", () => {
+      state.autoFollow = true;
+
+      chartModule.scrollToLatest();
+
+      // optional: re-enable auto scaling
+      if (state.chartCandles.length) {
+        chartModule.autoScalePriceRange(state.chartCandles);
+      }
+
+      chartModule.updateGoLiveButton();
+
+    document.querySelectorAll(".tf-btn").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const tf = btn.dataset.tf;
+
+        if (tf === state.selectedTimeframe) return;
+
+        state.selectedTimeframe = tf;
+
+        // update active UI
+        document.querySelectorAll(".tf-btn").forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+
+        // reset chart cleanly
+        chartModule.reset();
+
+        // force reload with new timeframe
+        await chartModule.loadBootstrap(true);
+      });
+    });
+    });    
   },
 
   async init() {

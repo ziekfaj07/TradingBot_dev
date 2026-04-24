@@ -7,8 +7,17 @@ window.state = {
   equityHistory: [],
   chart: null,
   candleSeries: null,
+  markerApi: null,
+  chartMarkers: [],
+  chartCandles: [],
+  indicatorSeries: {},
   lastChartKey: null,
   lastCandleTime: null,
+  autoFollow: true,
+  scrollAnimationFrame: null,
+  autoScale: true,
+  tooltipInitialized: false,
+  selectedTimeframe: "1m",
 };
 
 window.fmtNum = function fmtNum(v, digits = 4) {
@@ -84,7 +93,7 @@ window.api = {
   },
 
   async getChart(limit = 300) {
-    return await this.request(`/api/run/paper/chart?limit=${limit}`);
+    return this.get(`/api/run/paper/chart?limit=${limit}&interval=${state.selectedTimeframe}`);
   },
 
   exportCsv() {

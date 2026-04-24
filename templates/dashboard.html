@@ -13,6 +13,40 @@
       <h1 class="page-title">Trading Bot Dashboard</h1>
       <a href="/backtest">Backtest Page</a>
     </div>
+    <section class="card status-hero">
+      <div class="status-hero-main">
+        <div>
+          <div class="muted">Runtime Status</div>
+          <div class="status-hero-title">
+            <span id="visualModeBadge" class="mode-badge mode-unknown">-</span>
+            <span id="visualStateBadge" class="state-badge state-unknown">UNKNOWN</span>
+          </div>
+        </div>
+
+        <div class="status-hero-grid">
+          <div>
+            <div class="stat-label">Run</div>
+            <div id="visualRunLabel" class="stat-value">-</div>
+          </div>
+          <div>
+            <div class="stat-label">Symbol</div>
+            <div id="visualSymbol" class="stat-value">-</div>
+          </div>
+          <div>
+            <div class="stat-label">Market</div>
+            <div id="visualMarket" class="stat-value">-</div>
+          </div>
+          <div>
+            <div class="stat-label">Position</div>
+            <div id="visualPosition" class="stat-value">FLAT</div>
+          </div>
+        </div>
+      </div>
+
+      <div id="visualLiveSafety" class="live-safety-note">
+        Waiting for runtime status.
+      </div>
+    </section>
 
     <section class="card">
       <h2>Bot Control Panel</h2>
@@ -21,10 +55,9 @@
           <label for="mode">Mode</label>
           <select id="mode">
             <option value="backtest">Backtest</option>
+            <option value="paper">Paper</option>
             <option value="demo">Demo</option>            
             <option value="live">Live</option>
-            <option value="paper">Paper</option>
-
           </select>
         </div>
         <div>
@@ -200,17 +233,34 @@
 
     <section class="card mt-16">
       <h2>Live Candlestick Chart</h2>
+      <div class="chart-controls">
+        <button id="goLiveBtn" class="btn small go-live hidden">● Go to Live</button>
+        <button id="autoFollowToggle" class="btn small">Auto Follow: ON</button>
+      </div>
       <div class="chart-meta">
         <div>Symbol: <strong id="chartSymbolView">-</strong></div>
+        <div>Market: <strong id="chartMarketView">-</strong></div>
         <div>Interval: <strong id="chartIntervalView">-</strong></div>
+        <div>Strategy: <strong id="chartStrategyView">-</strong></div>      
         <div>Bars: <strong id="chartBarsView">0</strong></div>
+        <div>Markers: <strong id="chartMarkersView">0</strong></div>        
       </div>
       <div class="muted mb-10">
-        Recent candles for the active paper config. Loads history first, then updates the latest candle live over WebSocket.
+        Recent candles for the active config. Entries, exits, covers, and liquidation fills are drawn directly on the chart.
+      </div>
+      <div id="indicatorLegend" class="indicator-legend"></div>
+      <div class="timeframe-switch">
+        <button class="tf-btn active" data-tf="1m">1m</button>
+        <button class="tf-btn" data-tf="3m">3m</button>
+        <button class="tf-btn" data-tf="5m">5m</button>
+        <button class="tf-btn" data-tf="15m">15m</button>
+        <button class="tf-btn" data-tf="30m">30m</button>
+        <button class="tf-btn" data-tf="1h">1h</button>
       </div>
       <div class="live-chart-wrap">
         <div id="liveCandleChart"></div>
       </div>
+      <div id="chartTooltip" class="chart-tooltip hidden"></div>
     </section>
 
     <section class="card mt-16">
@@ -225,6 +275,7 @@
         <thead>
           <tr>
             <th>Time</th>
+            <th>Action</th>
             <th>Side</th>
             <th>Qty</th>
             <th>Price</th>

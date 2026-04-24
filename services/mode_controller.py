@@ -794,11 +794,255 @@ class ModeController:
         except (KeyError, TypeError, ValueError):
             return None
 
-    def get_chart_snapshot(self, limit: int | None = None) -> dict:
+    def _fill_timestamp_to_unix(self, value: Any) -> int | None:
+        if value is None:
+            return None
+
+        if isinstance(value, (int, float)):
+            if math.isfinite(float(value)):
+                return int(float(value))
+            return None
+
+        text = str(value).strip()
+        if not text:
+            return None
+
+        try:
+            return int(float(text))
+        except (TypeError, ValueError):
+            pass
+
+        try:
+            return int(datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp())
+        except ValueError:
+            return None
+
+    def _load_chart_marker_rows(self) -> list[Mapping[str, Any]]:
+        if self._status.run_id:
+            rows = load_runtime_fills(
+                run_id=self._status.run_id,
+                limit=5000,
+                offset=0,
+            )
+            if rows:
+                return cast(list[Mapping[str, Any]], rows)
+
+        return [
+            cast(Mapping[str, Any], getattr(fill, "__dict__", fill))
+            for fill in self._fills
+        ]
+
+    def _marker_from_fill(self, row: Mapping[str, Any]) -> dict | None:
+        ts = self._fill_timestamp_to_unix(row.get("timestamp"))
+        if ts is None:
+            return None
+
+        fill_type = str(row.get("type", "")).strip().upper()
+        side = str(row.get("side", "")).strip().lower()
+        price = self._safe_float_value(row.get("price"))
+        pnl = self._safe_float_value(row.get("pnl"))
+
+        if fill_type == "ENTRY" and side == "long":
+            position = "belowBar"
+            color = "#22c55e"
+            shape = "arrowUp"
+            label = "LONG"
+        elif fill_type == "ENTRY" and side == "short":
+            position = "aboveBar"
+            color = "#ef4444"
+            shape = "arrowDown"
+            label = "SHORT"
+        elif fill_type == "EXIT" and side == "long":
+            position = "aboveBar"
+            color = "#f59e0b"
+            shape = "arrowDown"
+            label = "EXIT"
+        elif fill_type == "EXIT" and side == "short":
+            position = "belowBar"
+            color = "#f59e0b"
+            shape = "arrowUp"
+            label = "COVER"
+        elif fill_type == "LIQUIDATION":
+            position = "aboveBar"
+            color = "#ff4d6d"
+            shape = "circle"
+            label = "LIQ"
+        else:
+            position = "aboveBar"
+            color = "#94a3b8"
+            shape = "circle"
+            label = fill_type or "FILL"
+
+        if price is not None:
+            text = f"{label} @ {price:.5f}"
+        else:
+            text = label
+
+        if pnl is not None and fill_type in {"EXIT", "LIQUIDATION"}:
+            text += f" PnL {pnl:+.2f}"
+
+        return {
+            "time": ts,
+            "position": position,
+            "color": color,
+            "shape": shape,
+            "text": text,
+        }
+
+    def _chart_marker_time(self, value: Any) -> int | None:
+        if value is None:
+            return None
+
+        if isinstance(value, (int, float)):
+            try:
+                numeric = float(value)
+                if not math.isfinite(numeric):
+                    return None
+                return int(numeric / 1000) if numeric > 10_000_000_000 else int(numeric)
+            except (TypeError, ValueError):
+                return None
+
+        raw = str(value).strip()
+        if not raw:
+            return None
+
+        try:
+            numeric = float(raw)
+            if math.isfinite(numeric):
+                return int(numeric / 1000) if numeric > 10_000_000_000 else int(numeric)
+        except ValueError:
+            pass
+
+        try:
+            normalized = raw.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(normalized)
+            return int(dt.timestamp())
+        except ValueError:
+            return None
+
+    def _serialize_chart_marker(self, fill: Fill | dict) -> dict | None:
+        data = fill.to_dict() if isinstance(fill, Fill) else dict(fill or {})
+
+        marker_time = self._chart_marker_time(data.get("timestamp"))
+        if marker_time is None:
+            return None
+
+        fill_type = str(data.get("type") or data.get("fill_type") or "").upper()
+        side = str(data.get("side") or "").lower()
+        price = data.get("price")
+        qty = data.get("qty")
+        pnl = data.get("pnl")
+
+        is_entry = fill_type == "ENTRY"
+        is_exit = fill_type in {"EXIT", "LIQUIDATION"}
+        if not is_entry and not is_exit:
+            return None
+
+        if fill_type == "LIQUIDATION":
+            color = "#f97316"
+            text = "LIQ"
+            position = "aboveBar"
+            shape = "circle"
+        elif is_entry and side == "short":
+            color = "#f43f5e"
+            text = "SHORT"
+            position = "aboveBar"
+            shape = "arrowDown"
+        elif is_entry:
+            color = "#22c55e"
+            text = "LONG"
+            position = "belowBar"
+            shape = "arrowUp"
+        elif side == "short":
+            color = "#38bdf8"
+            text = "COVER"
+            position = "belowBar"
+            shape = "arrowUp"
+        else:
+            color = "#f59e0b"
+            text = "EXIT"
+            position = "aboveBar"
+            shape = "arrowDown"
+
+        label_bits = [text]
+
+        try:
+            if price is not None:
+                label_bits.append(f"@ {float(price):.4g}")
+        except (TypeError, ValueError):
+            pass
+
+        try:
+            if pnl is not None:
+                label_bits.append(f"PnL {float(pnl):+.4g}")
+        except (TypeError, ValueError):
+            pass
+
+        return {
+            "time": marker_time,
+            "position": position,
+            "color": color,
+            "shape": shape,
+            "text": " ".join(label_bits),
+            "fill_type": fill_type,
+            "side": side,
+            "price": price,
+            "qty": qty,
+            "pnl": pnl,
+        }
+
+    def _chart_markers_from_fills(self, start_time: int | None, end_time: int | None) -> list[dict]:
+        if self._status.run_id:
+            raw_fills = load_runtime_fills_ascending(
+                run_id=self._status.run_id,
+                limit=5_000,
+                offset=0,
+            )
+        else:
+            raw_fills = [getattr(f, "__dict__", f) for f in self._fills]
+
+        markers: list[dict] = []
+        seen: set[tuple[Any, ...]] = set()
+
+        for fill in raw_fills:
+            marker = self._serialize_chart_marker(fill)
+            if not marker:
+                continue
+
+            marker_time = int(marker["time"])
+            if start_time is not None and marker_time < start_time:
+                continue
+            if end_time is not None and marker_time > end_time:
+                continue
+
+            dedupe_key = (
+                marker.get("time"),
+                marker.get("fill_type"),
+                marker.get("side"),
+                marker.get("price"),
+                marker.get("qty"),
+            )
+            if dedupe_key in seen:
+                continue
+
+            seen.add(dedupe_key)
+            markers.append(marker)
+
+        markers.sort(key=lambda item: int(item.get("time", 0)))
+        return markers
+
+    def get_chart_snapshot(self, limit: int | None = None, interval_override: str | None = None) -> dict:
         cfg = self._status.config
         effective_limit = max(10, int(limit or cfg.candle_limit or 300))
 
-        bars = self._bars[-effective_limit:] if self._bars else []
+        interval = interval_override or cfg.interval
+
+        bars = self._fetch_recent_bars(
+            symbol=cfg.symbol,
+            interval=interval,
+            limit=effective_limit,
+        )
+
         if not bars:
             bars = self._fetch_recent_bars(
                 symbol=cfg.symbol,
@@ -812,10 +1056,28 @@ class ModeController:
             if normalized:
                 candles.append(normalized)
 
+        markers: list[dict] = []
+        symbol_upper = str(cfg.symbol or "").upper()
+
+        for row in self._load_chart_marker_rows():
+            row_symbol = str(row.get("symbol") or cfg.symbol or "").upper()
+            if row_symbol and symbol_upper and row_symbol != symbol_upper:
+                continue
+
+            marker = self._marker_from_fill(row)
+            if marker:
+                markers.append(marker)
+
+        markers.sort(key=lambda item: int(item["time"]))
+
         return {
             "symbol": cfg.symbol,
-            "interval": cfg.interval,
+            "interval": interval,
+            "strategy_name": self._resolved_strategy_name_from_config(cfg),
+            "strategy_params": dict(cfg.strategy_params or {}),
             "candles": candles,
+            "markers": markers,
+            "marker_count": len(markers),
         }
 
     def get_paper_fills(self, limit: int = 200, offset: int = 0) -> dict:

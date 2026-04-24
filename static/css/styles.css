@@ -238,14 +238,6 @@ td {
   position: relative;
 }
 
-#liveCandleChart {
-  display: block;
-  width: 100%;
-  height: 420px;
-  min-height: 420px;
-  outline: 1px dashed #5dade2;
-}
-
 .chart-meta {
   display: flex;
   gap: 14px;
@@ -259,9 +251,307 @@ td {
   color: var(--text);
 }
 
-canvas {
+#equityCanvas {
   width: 100%;
   background: #0f1726;
   border: 1px solid var(--border);
   border-radius: 12px;
+}
+
+/* Never style Lightweight Charts internal canvases globally. */
+#liveCandleChart canvas {
+  width: auto;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+}
+
+#liveCandleChart {
+  display: block;
+  width: 100%;
+  height: 420px;
+  min-height: 420px;
+}
+
+.status-hero {
+  margin-bottom: 16px;
+  background:
+    radial-gradient(circle at top left, rgba(93, 173, 226, 0.16), transparent 34%),
+    linear-gradient(135deg, rgba(18, 26, 43, 1), rgba(15, 23, 38, 1));
+}
+
+.status-hero-main {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.8fr) minmax(320px, 1.2fr);
+  gap: 18px;
+  align-items: center;
+}
+
+.status-hero-title {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  align-items: center;
+  margin-top: 8px;
+}
+
+.status-hero-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+}
+
+.mode-badge,
+.state-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 34px;
+  padding: 7px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+}
+
+.mode-paper {
+  color: #22c55e;
+  border-color: rgba(34, 197, 94, 0.45);
+  background: rgba(34, 197, 94, 0.10);
+}
+
+.mode-demo {
+  color: #38bdf8;
+  border-color: rgba(56, 189, 248, 0.45);
+  background: rgba(56, 189, 248, 0.10);
+}
+
+.mode-live {
+  color: #fb7185;
+  border-color: rgba(251, 113, 133, 0.55);
+  background: rgba(251, 113, 133, 0.12);
+}
+
+.mode-backtest {
+  color: #c084fc;
+  border-color: rgba(192, 132, 252, 0.45);
+  background: rgba(192, 132, 252, 0.10);
+}
+
+.mode-unknown {
+  color: var(--muted);
+}
+
+.state-running {
+  color: #22c55e;
+  border-color: rgba(34, 197, 94, 0.45);
+  background: rgba(34, 197, 94, 0.10);
+}
+
+.state-idle {
+  color: var(--muted);
+  background: rgba(148, 163, 184, 0.08);
+}
+
+.state-starting,
+.state-stopping {
+  color: #f59e0b;
+  border-color: rgba(245, 158, 11, 0.45);
+  background: rgba(245, 158, 11, 0.10);
+}
+
+.state-error {
+  color: #ef4444;
+  border-color: rgba(239, 68, 68, 0.50);
+  background: rgba(239, 68, 68, 0.12);
+}
+
+.live-safety-note {
+  margin-top: 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  color: var(--muted);
+  background: rgba(15, 23, 38, 0.72);
+  font-size: 13px;
+}
+
+.live-safety-note.danger {
+  color: #fecdd3;
+  border-color: rgba(244, 63, 94, 0.55);
+  background: rgba(244, 63, 94, 0.13);
+}
+
+.live-safety-note.warn-note {
+  color: #fde68a;
+  border-color: rgba(245, 158, 11, 0.45);
+  background: rgba(245, 158, 11, 0.10);
+}
+
+.live-safety-note.demo-note {
+  color: #bae6fd;
+  border-color: rgba(56, 189, 248, 0.45);
+  background: rgba(56, 189, 248, 0.10);
+}
+
+.live-safety-note.paper-note {
+  color: #bbf7d0;
+  border-color: rgba(34, 197, 94, 0.38);
+  background: rgba(34, 197, 94, 0.09);
+}
+
+.live-chart-wrap {
+  box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.05);
+}
+
+@media (max-width: 760px) {
+  .status-hero-main {
+    grid-template-columns: 1fr;
+  }
+}
+
+.indicator-legend {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.indicator-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: #0f1726;
+}
+
+.fill-badge {
+  display: inline-block;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  border: 1px solid var(--border);
+  background: #0f1726;
+  color: var(--text);
+}
+
+.fill-badge.entry-long {
+  color: #22c55e;
+  border-color: rgba(34, 197, 94, 0.4);
+  background: rgba(34, 197, 94, 0.10);
+}
+
+.fill-badge.entry-short {
+  color: #ef4444;
+  border-color: rgba(239, 68, 68, 0.4);
+  background: rgba(239, 68, 68, 0.10);
+}
+
+.fill-badge.exit-long,
+.fill-badge.exit-short {
+  color: #f59e0b;
+  border-color: rgba(245, 158, 11, 0.4);
+  background: rgba(245, 158, 11, 0.10);
+}
+
+.fill-badge.liquidation {
+  color: #ff4d6d;
+  border-color: rgba(255, 77, 109, 0.45);
+  background: rgba(255, 77, 109, 0.12);
+}
+
+.go-live {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  background: #0f1726;
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  color: #ef4444;
+  font-weight: 600;
+  border-radius: 999px;
+  padding: 6px 12px;
+  cursor: pointer;
+  z-index: 10;
+}
+
+.go-live:hover {
+  background: rgba(239, 68, 68, 0.1);
+}
+
+.hidden {
+  display: none;
+}
+
+.go-live {
+  animation: pulse 1.5s infinite;
+}
+
+@keyframes pulse {
+  0% { box-shadow: 0 0 0 0 rgba(239,68,68,0.5); }
+  70% { box-shadow: 0 0 0 8px rgba(239,68,68,0); }
+  100% { box-shadow: 0 0 0 0 rgba(239,68,68,0); }
+}
+
+.chart-tooltip {
+  position: absolute;
+  pointer-events: none;
+  background: #0f1726;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 12px;
+  color: var(--text);
+  z-index: 20;
+  white-space: nowrap;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+}
+
+.chart-tooltip .row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.chart-tooltip .label {
+  color: var(--muted);
+}
+
+.chart-tooltip .value.pnl-pos {
+  color: #22c55e;
+}
+
+.chart-tooltip .value.pnl-neg {
+  color: #ef4444;
+}
+
+.timeframe-switch {
+  display: inline-flex;
+  gap: 6px;
+  margin-left: 10px;
+}
+
+.tf-btn {
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: #0f1726;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.tf-btn.active {
+  color: #22c55e;
+  border-color: rgba(34, 197, 94, 0.5);
+  background: rgba(34, 197, 94, 0.1);
+}
+
+.tf-btn:hover {
+  color: var(--text);
 }
