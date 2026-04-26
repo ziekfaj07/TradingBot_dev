@@ -3,9 +3,6 @@ from __future__ import annotations
 import os
 from typing import Union
 
-import certifi
-
-
 VerifyArg = Union[bool, str]
 
 
@@ -18,6 +15,15 @@ def _truthy_false(value: str | None) -> bool:
         "disable",
         "disabled",
     }
+
+
+def _safe_certifi_where() -> str | None:
+    try:
+        import certifi
+
+        return certifi.where()
+    except Exception:
+        return None
 
 
 def configure_ssl() -> None:
@@ -43,7 +49,7 @@ def configure_ssl() -> None:
     cert_path = (
         os.getenv("REQUESTS_CA_BUNDLE")
         or os.getenv("SSL_CERT_FILE")
-        or certifi.where()
+        or _safe_certifi_where()
     )
 
     if cert_path and os.path.exists(cert_path):
@@ -58,7 +64,7 @@ def get_ssl_verify() -> VerifyArg:
     cert_path = (
         os.getenv("REQUESTS_CA_BUNDLE")
         or os.getenv("SSL_CERT_FILE")
-        or certifi.where()
+        or _safe_certifi_where()
     )
 
     if cert_path and os.path.exists(cert_path):

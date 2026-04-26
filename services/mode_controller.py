@@ -749,7 +749,7 @@ class ModeController:
             "state": self._status.state.value,
             "runtime": {
                 "fills": [getattr(f, "__dict__", f) for f in reversed(self._fills[-10:])],
-                "paper_metrics": self._build_metrics_payload(),
+                "paper_metrics": self._get_cached_metrics_payload(),
                 "risk": self._build_risk_payload(),
                 "latest_equity": self._equity_points[-1] if self._equity_points else None,
                 "equity_point_count": len(self._equity_points),
@@ -841,6 +841,10 @@ class ModeController:
         side = str(row.get("side", "")).strip().lower()
         price = self._safe_float_value(row.get("price"))
         pnl = self._safe_float_value(row.get("pnl"))
+        qty = self._safe_float_value(row.get("qty"))
+        fee = self._safe_float_value(row.get("fee"))
+        trade_id = row.get("trade_id")
+        symbol = str(row.get("symbol") or self._status.config.symbol or "").upper()
 
         if fill_type == "ENTRY" and side == "long":
             position = "belowBar"
@@ -887,6 +891,15 @@ class ModeController:
             "color": color,
             "shape": shape,
             "text": text,
+            "fill_type": fill_type,
+            "side": side,
+            "price": price,
+            "qty": qty,
+            "fee": fee,
+            "pnl": pnl,
+            "trade_id": trade_id,
+            "symbol": symbol,
+            "timestamp": row.get("timestamp"),
         }
 
     def _chart_marker_time(self, value: Any) -> int | None:

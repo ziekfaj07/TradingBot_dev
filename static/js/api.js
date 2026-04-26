@@ -9,6 +9,7 @@ window.state = {
   candleSeries: null,
   markerApi: null,
   chartMarkers: [],
+  rawChartMarkers: [],
   chartCandles: [],
   indicatorSeries: {},
   lastChartKey: null,
@@ -17,7 +18,27 @@ window.state = {
   scrollAnimationFrame: null,
   autoScale: true,
   tooltipInitialized: false,
+  visibleRangeSubscribed: false,
   selectedTimeframe: "1m",
+  chartPrecision: 6,
+  chartMinMove: 0.000001,
+  exchangePrecisionLoaded: false,
+  indicatorVisibility: {
+    emaShort: true,
+    emaLong: true,
+    bbUpper: true,
+    bbMid: true,
+    bbLower: true,
+    pnlCurve: true,
+  },
+  pnlSeries: null,
+  pnlCurveData: [],
+  replayIndex: -1,
+  replayPlaying: false,
+  replayTimer: null,
+  lastAutoFitAt: 0,
+  selectedMarker: null,
+  markerClusterWindowSec: 45,
 };
 
 window.fmtNum = function fmtNum(v, digits = 4) {
@@ -36,15 +57,73 @@ window.fmtTs = function fmtTs(v) {
 };
 
 window.api = {
+  storageKey: "tradingbot_api_key",
+
+  getStoredApiKey() {
+    try {
+      return String(window.localStorage.getItem(this.storageKey) || "").trim();
+    } catch (_) {
+      return "";
+    }
+  },
+
+  setStoredApiKey(value) {
+    const clean = String(value || "").trim();
+    try {
+      if (clean) {
+        window.localStorage.setItem(this.storageKey, clean);
+      } else {
+        window.localStorage.removeItem(this.storageKey);
+      }
+    } catch (_) {}
+    return clean;
+  },
+
+  buildHeaders(extraHeaders = {}) {
+    const headers = {
+      "Content-Type": "application/json",
+      ...extraHeaders,
+    };
+
+    const apiKey = this.getStoredApiKey();
+    if (apiKey) {
+      headers["X-API-Key"] = apiKey;
+    }
+
+    return headers;
+  },
+
   async request(path, options = {}) {
     const res = await fetch(path, {
-      headers: { "Content-Type": "application/json" },
       ...options,
+      headers: this.buildHeaders(options.headers || {}),
     });
 
     if (!res.ok) {
-      const text = await res.text();
-      throw new Error(text || `HTTP ${res.status}`);
+      let message = "";
+      const ct = res.headers.get("content-type") || "";
+
+      try {
+        if (ct.includes("application/json")) {
+          const data = await res.json();
+          message = data?.detail || JSON.stringify(data);
+        } else {
+          message = await res.text();
+        }
+      } catch (_) {
+        message = "";
+      }
+
+      if (res.status === 401) {
+        if (this.getStoredApiKey()) {
+          throw new Error(message || "API key rejected by backend.");
+        }
+        throw new Error(
+          "API key required. Enter the TradingBot API key in the dashboard, save it, then retry."
+        );
+      }
+
+      throw new Error(message || `HTTP ${res.status}`);
     }
 
     const ct = res.headers.get("content-type") || "";
@@ -93,7 +172,16 @@ window.api = {
   },
 
   async getChart(limit = 300) {
-    return this.get(`/api/run/paper/chart?limit=${limit}&interval=${state.selectedTimeframe}`);
+    return await this.request(
+      `/api/run/paper/chart?limit=${limit}&interval=${encodeURIComponent(state.selectedTimeframe)}`
+    );
+  },
+
+  async validateExchangeConfig(payload) {
+    return await this.request("/api/exchange/validate-live-config", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
   },
 
   exportCsv() {

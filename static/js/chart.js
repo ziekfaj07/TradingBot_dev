@@ -1,4 +1,54 @@
 window.chartModule = {
+  formatPrice(value, fallbackDigits = null) {
+    const digits = Number.isInteger(fallbackDigits)
+      ? fallbackDigits
+      : Math.max(0, Number(state.chartPrecision || 6));
+    const num = Number(value);
+    if (!Number.isFinite(num)) return "-";
+    return num.toFixed(digits);
+  },
+
+  formatQty(value) {
+    const num = Number(value);
+    if (!Number.isFinite(num)) return "-";
+    return num.toFixed(4);
+  },
+
+  setChartPrecision(precision, minMove) {
+    const nextPrecision = Number.isFinite(Number(precision))
+      ? Math.max(0, Math.min(10, Number(precision)))
+      : 6;
+    const nextMinMove = Number.isFinite(Number(minMove)) && Number(minMove) > 0
+      ? Number(minMove)
+      : Number((1 / (10 ** nextPrecision)).toFixed(Math.max(nextPrecision, 1)));
+
+    state.chartPrecision = nextPrecision;
+    state.chartMinMove = nextMinMove;
+
+    const precisionEl = qs("chartPrecisionView");
+    if (precisionEl) {
+      precisionEl.textContent = `${nextPrecision} dp / tick ${nextMinMove}`;
+    }
+
+    if (state.chart) {
+      state.chart.applyOptions({
+        localization: {
+          priceFormatter: (price) => this.formatPrice(price),
+        },
+      });
+    }
+
+    if (state.candleSeries) {
+      state.candleSeries.applyOptions({
+        priceFormat: {
+          type: "price",
+          precision: nextPrecision,
+          minMove: nextMinMove,
+        },
+      });
+    }
+  },
+
   chartKey(symbol, interval) {
     return `${symbol || ""}__${interval || ""}`;
   },
@@ -6,7 +56,7 @@ window.chartModule = {
   currentChartKeyFromStatus(status) {
     const runtime = status?.runtime || {};
     const symbol = runtime.chart_symbol || status?.config?.symbol || "";
-    const interval = runtime.chart_interval || status?.config?.interval || "";
+    const interval = runtime.chart_interval || state.selectedTimeframe || status?.config?.interval || "";
     return this.chartKey(symbol, interval);
   },
 
@@ -34,9 +84,24 @@ window.chartModule = {
     }
 
     if (forceRecreate && state.chart) {
+      if (state.scrollAnimationFrame) {
+        cancelAnimationFrame(state.scrollAnimationFrame);
+        state.scrollAnimationFrame = null;
+      }
+      if (state.replayTimer) {
+        clearInterval(state.replayTimer);
+        state.replayTimer = null;
+      }
+
       try {
         for (const series of Object.values(state.indicatorSeries || {})) {
           state.chart.removeSeries(series);
+        }
+      } catch (_) {}
+
+      try {
+        if (state.pnlSeries) {
+          state.chart.removeSeries(state.pnlSeries);
         }
       } catch (_) {}
 
@@ -51,6 +116,11 @@ window.chartModule = {
       state.chartCandles = [];
       state.indicatorSeries = {};
       state.lastCandleTime = null;
+      state.tooltipInitialized = false;
+      state.visibleRangeSubscribed = false;
+      state.pnlSeries = null;
+      state.pnlCurveData = [];
+      state.selectedMarker = null;
     }
 
     const width = Math.max(600, Math.floor(container.clientWidth || 900));
@@ -81,12 +151,7 @@ window.chartModule = {
           },
         },
         localization: {
-          priceFormatter: (price) => {
-            if (price >= 1000) return price.toFixed(2);
-            if (price >= 1) return price.toFixed(4);
-            if (price >= 0.01) return price.toFixed(6);
-            return price.toFixed(8);
-          },
+          priceFormatter: (price) => this.formatPrice(price),
         },
         timeScale: {
           borderColor: "rgba(148, 163, 184, 0.22)",
@@ -115,32 +180,37 @@ window.chartModule = {
       state.candleSeries.applyOptions({
         priceFormat: {
           type: "price",
-          precision: 8,
-          minMove: 0.00000001,
+          precision: Number(state.chartPrecision || 6),
+          minMove: Number(state.chartMinMove || 0.000001),
         },
       });
 
       if (!state.tooltipInitialized) {
         this.initTooltip();
         state.tooltipInitialized = true;
-      };      
+      }
+    }
+
+    this.ensurePnlSeries();
+
+    if (!state.visibleRangeSubscribed) {
+      state.chart.timeScale().subscribeVisibleTimeRangeChange(() => {
+        const timeScale = state.chart?.timeScale();
+        const range = timeScale?.getVisibleRange();
+
+        if (!range || !state.chartCandles.length) return;
+
+        const lastCandle = state.chartCandles[state.chartCandles.length - 1];
+        const isNearRightEdge = range.to >= lastCandle.time - 5;
+
+        state.autoFollow = isNearRightEdge;
+        this.updateGoLiveButton();
+        this.updateFollowState();
+      });
+      state.visibleRangeSubscribed = true;
     }
 
     return { chart: state.chart, candleSeries: state.candleSeries };
-
-    refs.chart.timeScale().subscribeVisibleTimeRangeChange(() => {
-      const timeScale = refs.chart.timeScale();
-      const range = timeScale.getVisibleRange();
-
-      if (!range || !state.chartCandles.length) return;
-
-      const lastCandle = state.chartCandles[state.chartCandles.length - 1];
-      const isNearRightEdge = range.to >= lastCandle.time - 5;
-
-      state.autoFollow = isNearRightEdge;
-
-      this.updateGoLiveButton();
-    });
   },
 
   sanitizeCandles(candles) {
@@ -181,15 +251,89 @@ window.chartModule = {
         color: marker?.color || "#f59e0b",
         shape: marker?.shape || "circle",
         text: marker?.text || "FILL",
+        fill_type: marker?.fill_type || marker?.type || "",
+        side: marker?.side || "",
+        price: marker?.price,
+        qty: marker?.qty,
+        pnl: marker?.pnl,
+        fee: marker?.fee,
+        trade_id: marker?.trade_id,
+        symbol: marker?.symbol,
+        timestamp: marker?.timestamp,
+        items: Array.isArray(marker?.items) ? marker.items : null,
       }))
       .filter((marker) => Number.isFinite(marker.time))
       .sort((a, b) => a.time - b.time);
   },
 
-  setMeta(symbol,interval, barsCount, markerCount = 0) {
+  clusterMarkers(markers) {
+    if (!Array.isArray(markers) || !markers.length) return [];
+
+    const windowSec = Math.max(1, Number(state.markerClusterWindowSec || 45));
+    const groups = [];
+
+    for (const marker of markers) {
+      const last = groups[groups.length - 1];
+      if (
+        last &&
+        Math.abs(Number(last.time) - Number(marker.time)) <= windowSec &&
+        String(last.position) === String(marker.position)
+      ) {
+        last.items.push(marker);
+        last.time = Math.min(Number(last.time), Number(marker.time));
+      } else {
+        groups.push({
+          time: Number(marker.time),
+          position: marker.position,
+          items: [marker],
+        });
+      }
+    }
+
+    return groups.map((group) => {
+      const items = [...group.items].sort((a, b) => Number(a.time) - Number(b.time));
+      if (items.length === 1) {
+        return {
+          ...items[0],
+          items,
+          cluster_count: 1,
+        };
+      }
+
+      const exits = items.filter((item) => ["EXIT", "LIQUIDATION"].includes(String(item.fill_type).toUpperCase()));
+      const pnl = exits.reduce((acc, item) => acc + (Number(item.pnl) || 0), 0);
+      const tradeIds = [...new Set(items.map((item) => item.trade_id).filter((v) => v !== undefined && v !== null && v !== ""))];
+      const summary = items.some((item) => String(item.fill_type).toUpperCase() === "LIQUIDATION") ? "LIQ" : `${items.length} fills`;
+
+      return {
+        time: Number(items[0].time),
+        position: group.position,
+        color: group.position === "belowBar" ? "#22c55e" : "#f59e0b",
+        shape: "circle",
+        text: summary,
+        fill_type: "CLUSTER",
+        side: items[0].side || "",
+        price: items[items.length - 1].price,
+        qty: items.reduce((acc, item) => acc + (Number(item.qty) || 0), 0),
+        pnl,
+        fee: items.reduce((acc, item) => acc + (Number(item.fee) || 0), 0),
+        trade_id: tradeIds.join(", "),
+        symbol: items[0].symbol || "",
+        timestamp: items[0].timestamp,
+        items,
+        cluster_count: items.length,
+      };
+    });
+  },
+
+  setMeta(symbol, interval, barsCount, markerCount = 0) {
     qs("chartSymbolView").textContent = symbol || "-";
     qs("chartIntervalView").textContent = interval || "-";
     qs("chartBarsView").textContent = String(barsCount ?? 0);
+    const marketEl = qs("chartMarketView");
+    if (marketEl) {
+      marketEl.textContent = state.latestStatus?.config?.market_type || "-";
+    }
 
     const strategyView = qs("chartStrategyView");
     if (strategyView) {
@@ -199,6 +343,11 @@ window.chartModule = {
     const markerEl = qs("chartMarkersView");
     if (markerEl) {
       markerEl.textContent = String(markerCount ?? 0);
+    }
+
+    const precisionEl = qs("chartPrecisionView");
+    if (precisionEl && !precisionEl.textContent.trim()) {
+      precisionEl.textContent = `${state.chartPrecision} dp / tick ${state.chartMinMove}`;
     }
   },
 
@@ -212,8 +361,27 @@ window.chartModule = {
     }
 
     el.innerHTML = items
-      .map((item) => `<span class="indicator-chip">${item}</span>`)
+      .map((item) => {
+        const enabled = state.indicatorVisibility[item.key] !== false;
+        return `
+          <button
+            type="button"
+            class="indicator-chip toggleable ${enabled ? "" : "disabled"}"
+            data-indicator-key="${item.key}"
+          >${item.label}</button>
+        `;
+      })
       .join("");
+
+    el.querySelectorAll("[data-indicator-key]").forEach((node) => {
+      node.addEventListener("click", () => {
+        const key = node.getAttribute("data-indicator-key");
+        if (!key) return;
+        state.indicatorVisibility[key] = state.indicatorVisibility[key] === false;
+        this.syncIndicators(state.chartCandles || []);
+        this.applyMarkers(state.rawChartMarkers || []);
+      });
+    });
   },
 
   clearIndicators() {
@@ -222,7 +390,7 @@ window.chartModule = {
       return;
     }
 
-    for (const [key, series] of Object.entries(state.indicatorSeries || {})) {
+    for (const [, series] of Object.entries(state.indicatorSeries || {})) {
       try {
         state.chart.removeSeries(series);
       } catch (_) {}
@@ -232,10 +400,36 @@ window.chartModule = {
   },
 
   addLineSeries(key, options) {
-    if (!state.chart) return null;
+    if (!state.chart || state.indicatorVisibility[key] === false) return null;
     const series = state.chart.addSeries(LightweightCharts.LineSeries, options);
     state.indicatorSeries[key] = series;
     return series;
+  },
+
+  ensurePnlSeries() {
+    if (!state.chart) return null;
+    if (state.pnlSeries) return state.pnlSeries;
+
+    try {
+      state.chart.priceScale("pnl").applyOptions({
+        visible: true,
+        borderColor: "rgba(148, 163, 184, 0.15)",
+        scaleMargins: {
+          top: 0.70,
+          bottom: 0.02,
+        },
+      });
+    } catch (_) {}
+
+    state.pnlSeries = state.chart.addSeries(LightweightCharts.LineSeries, {
+      color: "#a78bfa",
+      lineWidth: 2,
+      priceLineVisible: false,
+      lastValueVisible: false,
+      crosshairMarkerVisible: false,
+      priceScaleId: "pnl",
+    });
+    return state.pnlSeries;
   },
 
   calculateEmaData(candles, period) {
@@ -292,6 +486,91 @@ window.chartModule = {
     return { mid, upper, lower };
   },
 
+  computePnlCurve(markers) {
+    const baseEquity = Number(state.latestStatus?.config?.initial_balance ?? 0);
+    const exits = (Array.isArray(markers) ? markers : [])
+      .flatMap((marker) => Array.isArray(marker.items) ? marker.items : [marker])
+      .filter((item) => ["EXIT", "LIQUIDATION"].includes(String(item.fill_type).toUpperCase()))
+      .sort((a, b) => Number(a.time) - Number(b.time));
+
+    let running = baseEquity;
+    const points = [];
+
+    for (const item of exits) {
+      const pnl = Number(item.pnl);
+      if (!Number.isFinite(pnl)) continue;
+      running += pnl;
+      points.push({
+        time: Number(item.time),
+        value: Number(running.toFixed(8)),
+      });
+    }
+
+    state.pnlCurveData = points;
+    return points;
+  },
+
+  syncPnlOverlay(markers) {
+    const series = this.ensurePnlSeries();
+    if (!series) return;
+
+    if (state.indicatorVisibility.pnlCurve === false) {
+      series.setData([]);
+      return;
+    }
+
+    series.setData(this.computePnlCurve(markers));
+  },
+
+  buildMarkerDetails(marker) {
+    const items = Array.isArray(marker?.items) ? marker.items : [marker];
+    const feeTotal = items.reduce((acc, item) => acc + (Number(item?.fee) || 0), 0);
+    const qtyTotal = items.reduce((acc, item) => acc + (Number(item?.qty) || 0), 0);
+    const pnlTotal = items.reduce((acc, item) => acc + (Number(item?.pnl) || 0), 0);
+    const tradeIds = [...new Set(items.map((item) => item?.trade_id).filter((v) => v !== undefined && v !== null && String(v) !== ""))];
+
+    return {
+      tradeIds: tradeIds.length ? tradeIds.join(", ") : "-",
+      fillCount: items.length,
+      side: marker?.side || items[0]?.side || "-",
+      type: marker?.fill_type || items[0]?.fill_type || "-",
+      price: marker?.price ?? items[items.length - 1]?.price,
+      qty: qtyTotal,
+      fee: feeTotal,
+      pnl: pnlTotal,
+      time: marker?.time || items[0]?.time,
+      symbol: marker?.symbol || items[0]?.symbol || state.latestStatus?.config?.symbol || "-",
+      items,
+    };
+  },
+
+  renderTradeDetails(marker) {
+    const panel = qs("tradeDetailsPanel");
+    if (!panel) return;
+
+    if (!marker) {
+      panel.innerHTML = `<div class="muted">Click a marker or step replay to inspect a trade.</div>`;
+      return;
+    }
+
+    const details = this.buildMarkerDetails(marker);
+    const pnlClass = Number(details.pnl) > 0 ? "good" : Number(details.pnl) < 0 ? "bad" : "";
+
+    panel.innerHTML = `
+      <div class="trade-detail-grid">
+        <div class="trade-detail-card"><div class="label">Trade ID</div><div class="value">${details.tradeIds}</div></div>
+        <div class="trade-detail-card"><div class="label">Action</div><div class="value">${details.type}</div></div>
+        <div class="trade-detail-card"><div class="label">Side</div><div class="value">${String(details.side).toUpperCase()}</div></div>
+        <div class="trade-detail-card"><div class="label">Time</div><div class="value">${fmtTs(details.time)}</div></div>
+        <div class="trade-detail-card"><div class="label">Price</div><div class="value">${this.formatPrice(details.price)}</div></div>
+        <div class="trade-detail-card"><div class="label">Qty</div><div class="value">${this.formatQty(details.qty)}</div></div>
+        <div class="trade-detail-card"><div class="label">Fee</div><div class="value">${this.formatPrice(details.fee, 6)}</div></div>
+        <div class="trade-detail-card"><div class="label">PnL</div><div class="value ${pnlClass}">${this.formatPrice(details.pnl, 4)}</div></div>
+        <div class="trade-detail-card"><div class="label">Fills</div><div class="value">${details.fillCount}</div></div>
+      </div>
+    `;
+  },
+
   syncIndicators(candles) {
     const { name, params } = this.resolveStrategyConfig();
     const strategyView = qs("chartStrategyView");
@@ -306,7 +585,7 @@ window.chartModule = {
       return;
     }
 
-    const legend = [];
+    const legend = [{ key: "pnlCurve", label: "PnL Curve" }];
 
     if (name === "ema_crossover") {
       const shortPeriod = Math.max(1, Number(params.short ?? 9));
@@ -329,8 +608,8 @@ window.chartModule = {
       shortSeries?.setData(this.calculateEmaData(candles, shortPeriod));
       longSeries?.setData(this.calculateEmaData(candles, longPeriod));
 
-      legend.push(`EMA ${shortPeriod}`);
-      legend.push(`EMA ${longPeriod}`);
+      legend.push({ key: "emaShort", label: `EMA ${shortPeriod}` });
+      legend.push({ key: "emaLong", label: `EMA ${longPeriod}` });
     } else if (name === "bollinger_mean_reversion") {
       const length = Math.max(2, Number(params.length ?? 20));
       const stdDev = Math.max(0.000001, Number(params.std_dev ?? 2.0));
@@ -361,21 +640,26 @@ window.chartModule = {
       midSeries?.setData(bands.mid);
       lowerSeries?.setData(bands.lower);
 
-      legend.push(`BB Upper (${length}, ${stdDev})`);
-      legend.push(`BB Mid (${length})`);
-      legend.push(`BB Lower (${length}, ${stdDev})`);
+      legend.push({ key: "bbUpper", label: `BB Upper (${length}, ${stdDev})` });
+      legend.push({ key: "bbMid", label: `BB Mid (${length})` });
+      legend.push({ key: "bbLower", label: `BB Lower (${length}, ${stdDev})` });
     }
 
     this.renderIndicatorLegend(legend);
   },
 
-  applyMarkers(markers) {
+  applyMarkers(markers, options = {}) {
     const refs = this.ensureChart(false);
     const cleanMarkers = this.sanitizeMarkers(markers);
-    state.chartMarkers = cleanMarkers;
+    if (!options.preserveRaw) {
+      state.rawChartMarkers = cleanMarkers;
+    }
+    const clusteredMarkers = this.clusterMarkers(cleanMarkers);
+    state.chartMarkers = clusteredMarkers;
+    this.syncPnlOverlay(clusteredMarkers);
 
     if (typeof refs.candleSeries.setMarkers === "function") {
-      refs.candleSeries.setMarkers(cleanMarkers);
+      refs.candleSeries.setMarkers(clusteredMarkers);
       return;
     }
 
@@ -383,14 +667,14 @@ window.chartModule = {
       if (!state.markerApi) {
         state.markerApi = LightweightCharts.createSeriesMarkers(
           refs.candleSeries,
-          cleanMarkers
+          clusteredMarkers
         );
       } else if (typeof state.markerApi.setMarkers === "function") {
-        state.markerApi.setMarkers(cleanMarkers);
+        state.markerApi.setMarkers(clusteredMarkers);
       } else {
         state.markerApi = LightweightCharts.createSeriesMarkers(
           refs.candleSeries,
-          cleanMarkers
+          clusteredMarkers
         );
       }
     }
@@ -403,6 +687,9 @@ window.chartModule = {
 
     state.chartCandles = [];
     state.chartMarkers = [];
+    state.rawChartMarkers = [];
+    state.replayIndex = -1;
+    state.selectedMarker = null;
     this.clearIndicators();
     this.applyMarkers([]);
 
@@ -413,6 +700,8 @@ window.chartModule = {
     state.lastCandleTime = null;
     state.lastChartKey = null;
     this.renderIndicatorLegend([]);
+    this.renderTradeDetails(null);
+    this.updateFollowState();
   },
 
   async refreshSnapshot() {
@@ -425,18 +714,17 @@ window.chartModule = {
 
     refs.candleSeries.setData(candles);
     state.chartCandles = candles;
-    this.scrollToLatest();
-    state.chartCandles = candles;
 
     this.applyMarkers(markers);
     this.syncIndicators(candles);
-    this.autoScalePriceRange(candles);
+    this.autoScalePriceRange(candles, { force: true });
 
     state.lastCandleTime = candles.length ? candles[candles.length - 1].time : null;
     state.lastChartKey = this.chartKey(data?.symbol, data?.interval);
 
-    this.setMeta(data?.symbol, data?.interval, candles.length, markers.length);
+    this.setMeta(data?.symbol, data?.interval, candles.length, state.chartMarkers.length);
     this.updateGoLiveButton();
+    this.updateFollowState();
 
     return { data, candles, markers };
   },
@@ -456,6 +744,7 @@ window.chartModule = {
       state.chart.timeScale().fitContent();
       state.autoFollow = true;
       this.scrollToLatest();
+      this.updateFollowState();
     }
 
     const candleCount = result?.candles?.length ?? 0;
@@ -503,6 +792,7 @@ window.chartModule = {
     this.scrollToLatest();
     this.autoScalePriceRange(candles);
     this.updateGoLiveButton();
+    this.updateFollowState();
   },
 
   resize() {
@@ -534,7 +824,9 @@ window.chartModule = {
     } else if (type === "EXIT" && side === "long") {
       marker = { position: "aboveBar", color: "#f59e0b", shape: "arrowDown", text: "EXIT" };
     } else if (type === "EXIT" && side === "short") {
-      marker = { position: "belowBar", color: "#f59e0b", shape: "arrowUp", text: "COVER" };
+      marker = { position: "belowBar", color: "#38bdf8", shape: "arrowUp", text: "COVER" };
+    } else if (type === "LIQUIDATION") {
+      marker = { position: "aboveBar", color: "#f97316", shape: "circle", text: "LIQ" };
     } else {
       marker = { position: "aboveBar", color: "#94a3b8", shape: "circle", text: type };
     }
@@ -543,18 +835,21 @@ window.chartModule = {
       ...marker,
       time,
       text: `${marker.text}`,
-      meta: {
-        type: fill.type,
-        side: fill.side,
-        price: fill.price,
-        pnl: fill.pnl,
-        qty: fill.qty,
-        fee: fill.fee,
-      }
+      fill_type: fill.type,
+      side: fill.side,
+      price: fill.price,
+      pnl: fill.pnl,
+      qty: fill.qty,
+      fee: fill.fee,
+      trade_id: fill.trade_id,
+      symbol: fill.symbol || state.latestStatus?.config?.symbol || "",
+      timestamp: fill.timestamp,
     };
 
-    state.chartMarkers.push(fullMarker);
-    this.applyMarkers(state.chartMarkers);
+    state.rawChartMarkers.push(fullMarker);
+    this.applyMarkers(state.rawChartMarkers, { preserveRaw: true });
+    this.renderTradeDetails(fullMarker);
+    this.autoScalePriceRange(state.chartCandles, { force: true, fromFill: true });
 
     const markerEl = qs("chartMarkersView");
     if (markerEl) markerEl.textContent = state.chartMarkers.length;
@@ -565,7 +860,6 @@ window.chartModule = {
 
     const timeScale = state.chart.timeScale();
 
-    // cancel previous animation if running
     if (state.scrollAnimationFrame) {
       cancelAnimationFrame(state.scrollAnimationFrame);
       state.scrollAnimationFrame = null;
@@ -576,14 +870,12 @@ window.chartModule = {
 
       const currentOffset = timeScale.getRightOffset();
 
-      // when close enough, snap and stop
       if (Math.abs(currentOffset) < 0.5) {
         timeScale.scrollToRealTime();
         state.scrollAnimationFrame = null;
         return;
       }
 
-      // easing (smooth decay)
       const nextOffset = currentOffset * 0.85;
 
       timeScale.scrollToPosition(nextOffset, false);
@@ -594,9 +886,14 @@ window.chartModule = {
     state.scrollAnimationFrame = requestAnimationFrame(step);
   },
 
-  autoScalePriceRange(candles) {
-    if (!state.chart || !state.autoFollow || !state.autoScale) return;
+  autoScalePriceRange(candles, options = {}) {
+    if (!state.chart || !state.autoScale) return;
+    const force = Boolean(options.force);
+    if (!force && !state.autoFollow) return;
     if (!Array.isArray(candles) || candles.length < 20) return;
+
+    const now = Date.now();
+    if (!force && now - Number(state.lastAutoFitAt || 0) < 750) return;
 
     const lookback = Math.min(50, candles.length);
     const recent = candles.slice(-lookback);
@@ -612,8 +909,6 @@ window.chartModule = {
     if (!isFinite(min) || !isFinite(max) || min === max) return;
 
     const range = max - min;
-
-    // add breathing room
     const padding = range * 0.15;
 
     const finalMin = min - padding;
@@ -623,6 +918,7 @@ window.chartModule = {
       from: finalMin,
       to: finalMax,
     });
+    state.lastAutoFitAt = now;
   },
 
   isAtLiveEdge() {
@@ -648,9 +944,138 @@ window.chartModule = {
     }
   },
 
+  updateFollowState() {
+    const btn = qs("autoFollowToggle");
+    const badge = qs("autoFollowStatus");
+    if (btn) {
+      btn.textContent = `Auto Follow: ${state.autoFollow ? "LIVE" : "PAUSED"}`;
+    }
+    if (badge) {
+      badge.textContent = state.autoFollow ? "LIVE" : "PAUSED";
+      badge.className = `follow-badge ${state.autoFollow ? "follow-live" : "follow-paused"}`;
+    }
+  },
+
+  findMarkerNearTime(time) {
+    const target = Number(time);
+    if (!Number.isFinite(target) || !Array.isArray(state.chartMarkers)) return null;
+
+    let closest = null;
+    let minDiff = Infinity;
+
+    for (const marker of state.chartMarkers) {
+      const diff = Math.abs(Number(marker.time) - target);
+      if (diff < minDiff && diff <= Math.max(60, Number(state.markerClusterWindowSec || 45))) {
+        minDiff = diff;
+        closest = marker;
+      }
+    }
+    return closest;
+  },
+
+  focusMarker(marker) {
+    if (!marker || !state.chart) return;
+    state.selectedMarker = marker;
+    this.renderTradeDetails(marker);
+
+    const timeScale = state.chart.timeScale();
+    const time = Number(marker.time);
+    timeScale.setVisibleRange({
+      from: Math.max(0, time - 20 * 60),
+      to: time + 10 * 60,
+    });
+  },
+
+  replayMarkers() {
+    return Array.isArray(state.rawChartMarkers)
+      ? this.clusterMarkers(this.sanitizeMarkers(state.rawChartMarkers))
+        .filter((marker) => marker && Number.isFinite(Number(marker.time)))
+      : [];
+  },
+
+  renderReplaySlice() {
+    if (!state.chart || state.replayIndex < 0) return;
+    const markers = this.replayMarkers();
+    const current = markers[state.replayIndex];
+    if (!current) return;
+
+    const replayTime = Number(current.time);
+    const candles = state.chartCandles.filter((candle) => Number(candle.time) <= replayTime);
+    const markerSlice = (state.rawChartMarkers || []).filter((marker) => Number(marker.time) <= replayTime);
+
+    state.candleSeries?.setData(candles);
+    this.applyMarkers(markerSlice, { preserveRaw: true });
+    this.focusMarker(current);
+  },
+
+  replayStep(delta) {
+    const markers = this.replayMarkers();
+    if (!markers.length) return;
+
+    state.autoFollow = false;
+    this.updateFollowState();
+    state.replayIndex = Math.max(0, Math.min(markers.length - 1, Number(state.replayIndex) + Number(delta)));
+    this.renderReplaySlice();
+    qs("replayExitBtn")?.classList.remove("hidden");
+  },
+
+  toggleReplayPlay() {
+    const btn = qs("replayPlayBtn");
+    if (state.replayPlaying) {
+      state.replayPlaying = false;
+      if (state.replayTimer) {
+        clearInterval(state.replayTimer);
+        state.replayTimer = null;
+      }
+      if (btn) btn.textContent = "Play";
+      return;
+    }
+
+    const markers = this.replayMarkers();
+    if (!markers.length) return;
+    if (state.replayIndex < 0) {
+      state.replayIndex = 0;
+      this.renderReplaySlice();
+    }
+
+    state.replayPlaying = true;
+    if (btn) btn.textContent = "Pause";
+    state.replayTimer = setInterval(() => {
+      const list = this.replayMarkers();
+      if (state.replayIndex >= list.length - 1) {
+        this.toggleReplayPlay();
+        return;
+      }
+      this.replayStep(1);
+    }, 1200);
+  },
+
+  exitReplay() {
+    state.replayIndex = -1;
+    if (state.replayPlaying) {
+      this.toggleReplayPlay();
+    }
+    qs("replayExitBtn")?.classList.add("hidden");
+    state.candleSeries?.setData(state.chartCandles);
+    this.applyMarkers(state.rawChartMarkers, { preserveRaw: true });
+    this.renderTradeDetails(state.selectedMarker);
+    if (state.autoFollow) {
+      this.scrollToLatest();
+      this.autoScalePriceRange(state.chartCandles, { force: true });
+    }
+  },
+
   initTooltip() {
     const tooltip = qs("chartTooltip");
     if (!tooltip || !state.chart) return;
+
+    state.chart.subscribeClick((param) => {
+      if (!param || !param.time) return;
+      const marker = this.findMarkerNearTime(param.time);
+      if (marker) {
+        this.focusMarker(marker);
+      }
+    });
 
     state.chart.subscribeCrosshairMove((param) => {
       if (!param || !param.time || !param.point) {
@@ -658,41 +1083,29 @@ window.chartModule = {
         return;
       }
 
-      const time = param.time;
-
-      // find closest marker
-      let closest = null;
-      let minDiff = Infinity;
-
-      for (const m of state.chartMarkers) {
-        const diff = Math.abs(m.time - time);
-        if (diff < minDiff && diff < 60) { // within 1 candle
-          minDiff = diff;
-          closest = m;
-        }
-      }
-
-      if (!closest || !closest.meta) {
+      const closest = this.findMarkerNearTime(param.time);
+      if (!closest) {
         tooltip.classList.add("hidden");
         return;
       }
 
-      const m = closest.meta;
-
+      const details = this.buildMarkerDetails(closest);
       const pnlClass =
-        m.pnl > 0 ? "pnl-pos" :
-        m.pnl < 0 ? "pnl-neg" : "";
+        details.pnl > 0 ? "pnl-pos" :
+        details.pnl < 0 ? "pnl-neg" : "";
 
       tooltip.innerHTML = `
-        <div class="row"><span class="label">Action</span><span>${m.type} ${m.side}</span></div>
-        <div class="row"><span class="label">Price</span><span>${Number(m.price).toFixed(6)}</span></div>
-        <div class="row"><span class="label">Qty</span><span>${Number(m.qty).toFixed(4)}</span></div>
-        <div class="row"><span class="label">Fee</span><span>${Number(m.fee).toFixed(6)}</span></div>
-        <div class="row"><span class="label">PnL</span><span class="value ${pnlClass}">${Number(m.pnl || 0).toFixed(4)}</span></div>
+        <div class="row"><span class="label">Trade</span><span>${details.tradeIds}</span></div>
+        <div class="row"><span class="label">Action</span><span>${details.type} ${details.side}</span></div>
+        <div class="row"><span class="label">Price</span><span>${this.formatPrice(details.price)}</span></div>
+        <div class="row"><span class="label">Qty</span><span>${this.formatQty(details.qty)}</span></div>
+        <div class="row"><span class="label">Fee</span><span>${this.formatPrice(details.fee, 6)}</span></div>
+        <div class="row"><span class="label">PnL</span><span class="value ${pnlClass}">${this.formatPrice(details.pnl, 4)}</span></div>
+        <div class="row"><span class="label">Fills</span><span>${details.fillCount}</span></div>
       `;
 
-      tooltip.style.left = param.point.x + 20 + "px";
-      tooltip.style.top = param.point.y + 20 + "px";
+      tooltip.style.left = `${Math.max(12, Math.min(param.point.x + 16, window.innerWidth - 300))}px`;
+      tooltip.style.top = `${Math.max(12, param.point.y + 16)}px`;
 
       tooltip.classList.remove("hidden");
     });

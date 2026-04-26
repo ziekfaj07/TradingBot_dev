@@ -5,6 +5,61 @@ window.uiController = {
     el.className = `action-message ${klass}`.trim();
   },
 
+  hydrateApiKeyField() {
+    const input = qs("apiKey");
+    if (!input) return;
+    input.value = api.getStoredApiKey();
+  },
+
+  saveApiKey() {
+    const input = qs("apiKey");
+    if (!input) return;
+
+    const clean = api.setStoredApiKey(input.value);
+    input.value = clean;
+
+    if (clean) {
+      this.setActionMessage("API key saved locally in this browser.", "good");
+    } else {
+      this.setActionMessage("API key cleared from this browser.", "warn");
+    }
+  },
+
+  clearApiKey() {
+    const input = qs("apiKey");
+    api.setStoredApiKey("");
+    if (input) input.value = "";
+    this.setActionMessage("API key cleared from this browser.", "warn");
+  },
+
+  async syncExchangePrecision() {
+    if (!state.latestStatus?.config) return;
+
+    const cfg = state.latestStatus.config;
+    try {
+      const payload = {
+        exchange_name: cfg.exchange_name || "gateio",
+        market_type: cfg.market_type || "spot",
+        symbol: cfg.symbol || "BTCUSDT",
+        enable_live_trading: Boolean(cfg.enable_live_trading),
+        dry_run_live: cfg.live_dry_run !== false,
+        api_key_env: cfg.exchange_api_key_env || "GATEIO_API_KEY",
+        api_secret_env: cfg.exchange_api_secret_env || "GATEIO_API_SECRET",
+        api_passphrase_env: cfg.exchange_api_passphrase_env || "GATEIO_API_PASSPHRASE",
+      };
+      const result = await api.validateExchangeConfig(payload);
+      const precision = result?.symbol_validation?.precision?.price;
+      if (precision !== undefined && precision !== null) {
+        const digits = Number(precision);
+        const minMove = Number((1 / (10 ** digits)).toFixed(Math.max(0, digits)));
+        chartModule.setChartPrecision(digits, minMove);
+        state.exchangePrecisionLoaded = true;
+      }
+    } catch (err) {
+      console.warn("Precision sync skipped:", err);
+    }
+  },
+
   applyConfigToForm(cfg = {}) {
     const fields = [
       "symbol",
@@ -40,45 +95,19 @@ window.uiController = {
       } else {
         el.value = String(cfg[key]);
       }
-
     }
 
     this.syncModeDerivedFields();
   },
 
   readConfigForm() {
-    return {
+    const selectedMode = qs("mode").value;
+    const payload = {
       symbol: qs("symbol").value,
       interval: qs("interval").value,
       market_type: qs("market_type").value,
       start: qs("start").value || null,
       end: qs("end").value || null,
-      initial_balance: Number(qs("initial_balance").value),
-      fee_rate: Number(qs("fee_rate").value),
-      slippage_bps: Number(qs("slippage_bps").value),
-      allow_short: qs("allow_short").value === "true",
-      leverage: Number(qs("leverage").value),
-      maintenance_margin: Number(qs("maintenance_margin").value),
-      max_leverage: Number(qs("max_leverage").value),
-      max_qty: Number(qs("max_qty").value),
-      include_equity: qs("include_equity").value === "true",
-      equity_stride: Number(qs("equity_stride").value),
-      poll_seconds: Number(qs("poll_seconds").value),
-      ema_short: Number(qs("ema_short").value),
-      ema_long: Number(qs("ema_long").value),
-      candle_limit: Number(qs("candle_limit").value),
-      exchange_name: qs("exchange_name").value,
-      exchange_settle_currency: qs("exchange_settle_currency").value,
-      enable_live_trading: qs("enable_live_trading").value === "true",
-      live_dry_run: qs("live_dry_run").value === "true",
-    };
-
-    const selectedMode = qs("mode").value;
-
-    const payload = {
-      symbol: qs("symbol").value,
-      interval: qs("interval").value,
-      market_type: qs("market_type").value,
 
       initial_balance: Number(qs("initial_balance").value),
       fee_rate: Number(qs("fee_rate").value),
@@ -117,7 +146,7 @@ window.uiController = {
       payload.client_order_id_prefix = "tb-backtest";
     }
 
-    return payload;    
+    return payload;
   },
 
   renderStatus(data) {
@@ -126,7 +155,7 @@ window.uiController = {
     const runtime = data?.runtime || {};
     const paper = runtime.paper_state || {};
     const latestBar = runtime.latest_bar || {};
-    const live = runtime.live || {};    
+    const live = runtime.live || {};
 
     qs("botState").textContent = data?.state || "unknown";
     qs("lastSignal").textContent = String(runtime.last_signal ?? "WAIT");
@@ -191,7 +220,7 @@ window.uiController = {
       if (visualMode === "live") {
         if (live.enable_live_trading && !live.live_dry_run) {
           qs("visualLiveSafety").textContent =
-            "LIVE EXECUTION ENABLED — real orders may be submitted when backend safety guards allow it.";
+            "LIVE EXECUTION ENABLED - real orders may be submitted when backend safety guards allow it.";
           qs("visualLiveSafety").className = "live-safety-note danger";
         } else {
           qs("visualLiveSafety").textContent =
@@ -211,7 +240,34 @@ window.uiController = {
           "Backtest / idle mode: no live order submission.";
         qs("visualLiveSafety").className = "live-safety-note";
       }
-    }    
+    }
+
+    const flowBadge = qs("visualFlowBadge");
+    const summary = qs("visualHeaderSummary");
+    if (flowBadge) {
+      const flow = visualMode === "live"
+        ? "LIVE"
+        : visualMode === "demo"
+          ? "DEMO"
+          : visualMode === "paper"
+            ? "PAPER"
+            : "IDLE";
+      const flowClass = visualMode === "live"
+        ? "flow-live"
+        : visualMode === "demo"
+          ? "flow-demo"
+          : visualMode === "paper"
+            ? "flow-paper"
+            : "flow-idle";
+      flowBadge.textContent = flow;
+      flowBadge.className = `flow-badge ${flowClass}`;
+    }
+    if (summary) {
+      const equity = paper.equity !== undefined && paper.equity !== null ? fmtNum(paper.equity) : "-";
+      const lastPrice = latestBar.close !== undefined && latestBar.close !== null ? fmtNum(latestBar.close) : "-";
+      const autoState = state.autoFollow ? "LIVE" : "PAUSED";
+      summary.textContent = `${String(visualMode).toUpperCase()} | ${String(visualState).toUpperCase()} | Equity ${equity} | Last ${lastPrice} | Follow ${autoState}`;
+    }
 
     qs("chartSymbolView").textContent =
       runtime.chart_symbol || data?.config?.symbol || "-";
@@ -234,6 +290,8 @@ window.uiController = {
         this.setActionMessage(`Chart bootstrap failed: ${err.message}`, "bad");
       });
     }
+
+    chartModule.updateFollowState();
   },
 
   async configureBot() {
@@ -242,6 +300,7 @@ window.uiController = {
       await api.configure(payload);
       const data = await api.getStatus();
       this.renderStatus(data);
+      await this.syncExchangePrecision();
       await chartModule.loadBootstrap(true);
       this.setActionMessage("Configuration updated.", "good");
     } catch (err) {
@@ -297,6 +356,7 @@ window.uiController = {
 
       const data = await api.start();
       this.renderStatus(data);
+      await this.syncExchangePrecision();
       await chartModule.loadBootstrap(true);
 
       this.setActionMessage(`${selectedMode.toUpperCase()} bot started.`, "good");
@@ -330,6 +390,7 @@ window.uiController = {
       equityModule.clear();
       chartModule.reset();
       await fillsModule.load();
+      await this.syncExchangePrecision();
       await chartModule.loadBootstrap(true);
       this.setActionMessage("Paper account reset.", "warn");
     } catch (err) {
@@ -344,6 +405,15 @@ window.uiController = {
       this.renderStatus(data);
       this.applyConfigToForm(data.config || {});
 
+      if (data?.config?.interval) {
+        state.selectedTimeframe = data.config.interval;
+        document.querySelectorAll(".tf-btn").forEach((btn) => {
+          btn.classList.toggle("active", btn.dataset.tf === state.selectedTimeframe);
+        });
+      }
+
+      await this.syncExchangePrecision();
+
       try {
         const metrics = await api.getMetrics();
         if (metrics?.runtime) {
@@ -355,7 +425,7 @@ window.uiController = {
       }
 
       await fillsModule.load();
-      await chartModule.loadBootstrap(true);      
+      await chartModule.loadBootstrap(true);
     } catch (err) {
       console.error(err);
       this.setActionMessage(`Status load failed: ${err.message}`, "bad");
@@ -441,14 +511,25 @@ window.uiController = {
   },
 
   bindEvents() {
+    this.hydrateApiKeyField();
+
     qs("configureBtn")?.addEventListener("click", () => this.configureBot());
     qs("startBtn")?.addEventListener("click", () => this.startBot());
+    qs("saveApiKeyBtn")?.addEventListener("click", () => this.saveApiKey());
+    qs("clearApiKeyBtn")?.addEventListener("click", () => this.clearApiKey());
+    qs("apiKey")?.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        this.saveApiKey();
+      }
+    });
+
     const modeEl = qs("mode");
     if (modeEl) {
       modeEl.addEventListener("change", () => this.syncModeDerivedFields());
     }
 
-    this.syncModeDerivedFields();    
+    this.syncModeDerivedFields();
 
     qs("stopBtn")?.addEventListener("click", () => this.stopBot());
     qs("refreshStatusBtn")?.addEventListener("click", () => this.loadStatus());
@@ -458,8 +539,11 @@ window.uiController = {
 
     qs("autoFollowToggle")?.addEventListener("click", () => {
       state.autoFollow = !state.autoFollow;
-      qs("autoFollowToggle").textContent =
-        "Auto Follow: " + (state.autoFollow ? "ON" : "OFF");
+      chartModule.updateFollowState();
+      if (state.autoFollow) {
+        chartModule.scrollToLatest();
+        chartModule.autoScalePriceRange(state.chartCandles, { force: true });
+      }
     });
 
     qs("goLiveBtn")?.addEventListener("click", () => {
@@ -467,12 +551,18 @@ window.uiController = {
 
       chartModule.scrollToLatest();
 
-      // optional: re-enable auto scaling
       if (state.chartCandles.length) {
-        chartModule.autoScalePriceRange(state.chartCandles);
+        chartModule.autoScalePriceRange(state.chartCandles, { force: true });
       }
 
       chartModule.updateGoLiveButton();
+      chartModule.updateFollowState();
+    });
+
+    qs("replayPrevBtn")?.addEventListener("click", () => chartModule.replayStep(-1));
+    qs("replayPlayBtn")?.addEventListener("click", () => chartModule.toggleReplayPlay());
+    qs("replayNextBtn")?.addEventListener("click", () => chartModule.replayStep(1));
+    qs("replayExitBtn")?.addEventListener("click", () => chartModule.exitReplay());
 
     document.querySelectorAll(".tf-btn").forEach((btn) => {
       btn.addEventListener("click", async () => {
@@ -481,19 +571,15 @@ window.uiController = {
         if (tf === state.selectedTimeframe) return;
 
         state.selectedTimeframe = tf;
+        chartModule.exitReplay();
 
-        // update active UI
-        document.querySelectorAll(".tf-btn").forEach(b => b.classList.remove("active"));
+        document.querySelectorAll(".tf-btn").forEach((b) => b.classList.remove("active"));
         btn.classList.add("active");
 
-        // reset chart cleanly
         chartModule.reset();
-
-        // force reload with new timeframe
         await chartModule.loadBootstrap(true);
       });
     });
-    });    
   },
 
   async init() {

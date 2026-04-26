@@ -24,9 +24,10 @@ async def get_paper_fills(
 @router.get("/chart")
 async def get_paper_chart(
     limit: int = Query(default=300, ge=10, le=5000),
+    interval: str | None = None,
 ):
     try:
-        return mode_controller.get_chart_snapshot(limit=limit)
+        return mode_controller.get_chart_snapshot(limit=limit, interval_override=interval)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 

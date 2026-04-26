@@ -38,3 +38,7 @@ data/
 *.csv
 .db
 *.db
+
+# codex
+.codex/
+AGENTS.md

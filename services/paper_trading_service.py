@@ -3,19 +3,9 @@ from __future__ import annotations
 import time
 
 from core.execution_models import PortfolioState
+from core.market_types import is_derivatives_market, normalize_market_type
 from services.execution_engine import ExecutionEngine
 from services.margin_engine import evaluate_position_margin
-
-
-def _normalize_market_type(value: str | None) -> str:
-    mt = str(value or "spot").strip().lower()
-    if mt in {"future", "futures", "swap", "perp", "perpetual"}:
-        return "futures"
-    return "spot"
-
-
-def _is_derivatives_market(value: str | None) -> bool:
-    return _normalize_market_type(value) == "futures"
 
 
 class PaperTradingService:
@@ -30,7 +20,7 @@ class PaperTradingService:
         margin_mode: str = "cross",
         maintenance_margin_override: float | None = None,
     ):
-        self.market_type = _normalize_market_type(market_type)
+        self.market_type = normalize_market_type(market_type)
         self.leverage = float(leverage or 1.0)
         self.allow_short = bool(allow_short)
         self.margin_mode = str(margin_mode or "cross").strip().lower()
@@ -61,7 +51,7 @@ class PaperTradingService:
         # Futures liquidation parity:
         # Paper mode now uses the same margin engine path as backtest/live.
         if (
-            _is_derivatives_market(self.market_type)
+            is_derivatives_market(self.market_type)
             and float(self.state.position_qty or 0.0) != 0.0
         ):
             margin_snapshot = evaluate_position_margin(
@@ -125,7 +115,7 @@ class PaperTradingService:
                 elif (
                     qty == 0.0
                     and self.allow_short
-                    and _is_derivatives_market(self.market_type)
+                    and is_derivatives_market(self.market_type)
                 ):
                     self.trade_id += 1
                     self.state, fill = self.engine.enter_short(

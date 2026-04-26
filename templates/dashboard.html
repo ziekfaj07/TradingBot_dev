@@ -20,6 +20,7 @@
           <div class="status-hero-title">
             <span id="visualModeBadge" class="mode-badge mode-unknown">-</span>
             <span id="visualStateBadge" class="state-badge state-unknown">UNKNOWN</span>
+            <span id="visualFlowBadge" class="flow-badge flow-idle">IDLE</span>
           </div>
         </div>
 
@@ -45,6 +46,9 @@
 
       <div id="visualLiveSafety" class="live-safety-note">
         Waiting for runtime status.
+      </div>
+      <div class="status-hero-subline">
+        <span id="visualHeaderSummary" class="muted">No active runtime.</span>
       </div>
     </section>
 
@@ -206,6 +210,23 @@
         <button id="exportCsvBtn" type="button">Export Fills CSV</button>
       </div>
 
+      <div class="panel-subsection">
+        <h3>Local Dashboard API Key</h3>
+        <div class="form-grid">
+          <div>
+            <label for="apiKey">API Key</label>
+            <input id="apiKey" type="password" autocomplete="off" placeholder="Enter TRADINGBOT_API_KEY" />
+          </div>
+        </div>
+        <div class="actions">
+          <button id="saveApiKeyBtn" type="button">Save API Key</button>
+          <button id="clearApiKeyBtn" type="button">Clear API Key</button>
+        </div>
+        <div class="muted">
+          Stored only in this browser and sent as <code>X-API-Key</code> on API requests.
+        </div>
+      </div>
+
       <div id="actionMessage" class="action-message">Ready.</div>
     </section>
 
@@ -234,8 +255,13 @@
     <section class="card mt-16">
       <h2>Live Candlestick Chart</h2>
       <div class="chart-controls">
-        <button id="goLiveBtn" class="btn small go-live hidden">● Go to Live</button>
-        <button id="autoFollowToggle" class="btn small">Auto Follow: ON</button>
+        <button id="goLiveBtn" class="btn small go-live hidden">Go to Live</button>
+        <button id="autoFollowToggle" class="btn small">Auto Follow: LIVE</button>
+        <span id="autoFollowStatus" class="follow-badge follow-live">LIVE</span>
+        <button id="replayPrevBtn" class="btn small" type="button">Prev Replay</button>
+        <button id="replayPlayBtn" class="btn small" type="button">Play</button>
+        <button id="replayNextBtn" class="btn small" type="button">Next Replay</button>
+        <button id="replayExitBtn" class="btn small hidden" type="button">Exit Replay</button>
       </div>
       <div class="chart-meta">
         <div>Symbol: <strong id="chartSymbolView">-</strong></div>
@@ -243,7 +269,8 @@
         <div>Interval: <strong id="chartIntervalView">-</strong></div>
         <div>Strategy: <strong id="chartStrategyView">-</strong></div>      
         <div>Bars: <strong id="chartBarsView">0</strong></div>
-        <div>Markers: <strong id="chartMarkersView">0</strong></div>        
+        <div>Markers: <strong id="chartMarkersView">0</strong></div>
+        <div>Precision: <strong id="chartPrecisionView">-</strong></div>
       </div>
       <div class="muted mb-10">
         Recent candles for the active config. Entries, exits, covers, and liquidation fills are drawn directly on the chart.
@@ -261,6 +288,12 @@
         <div id="liveCandleChart"></div>
       </div>
       <div id="chartTooltip" class="chart-tooltip hidden"></div>
+      <div class="chart-panels">
+        <div class="chart-side-panel">
+          <h3>Trade Details</h3>
+          <div id="tradeDetailsPanel" class="muted">Click a marker or step replay to inspect a trade.</div>
+        </div>
+      </div>
     </section>
 
     <section class="card mt-16">
