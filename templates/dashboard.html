@@ -136,6 +136,20 @@
           <input id="max_qty" type="number" step="0.0001" value="10" />
         </div>
         <div>
+          <label for="position_sizing_mode">Position Sizing</label>
+          <select id="position_sizing_mode">
+            <option value="all_in">All In</option>
+            <option value="fixed_usdt">Fixed USDT</option>
+            <option value="fixed_pct">Fixed % of Cash</option>
+            <option value="equity_pct">Fixed % of Equity</option>
+            <option value="risk_pct">Risk %</option>
+          </select>
+        </div>
+        <div>
+          <label for="position_size_value">Sizing Value</label>
+          <input id="position_size_value" type="number" step="0.0001" placeholder="Required for non all-in" />
+        </div>
+        <div>
           <label for="maintenance_margin">Maintenance Margin</label>
           <input id="maintenance_margin" type="number" step="0.0001" value="0.005" />
         </div>

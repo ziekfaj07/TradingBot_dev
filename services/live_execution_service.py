@@ -91,6 +91,24 @@ class LiveExecutionService:
 
         self.last_risk_preflight: dict[str, Any] | None = None        
 
+    def _should_retry_live_public(self, exc: Exception) -> bool:
+        return (
+            self.exchange_name == "gateio"
+            and bool(self.testnet)
+            and "INTERNAL" in str(exc).upper()
+        )
+
+    def _fetch_live_public_ticker(self, symbol: str) -> dict[str, Any]:
+        public_adapter = build_exchange_adapter(
+            exchange_name=self.exchange_name,
+            market_type=self.market_type,
+            testnet=False,
+            api_key_env="__unused__",
+            api_secret_env="__unused__",
+            api_passphrase_env=None,
+        )
+        return public_adapter.fetch_ticker(symbol)
+
     @property
     def can_submit_live_orders(self) -> bool:
         return self.armed and not self.dry_run
@@ -104,9 +122,30 @@ class LiveExecutionService:
             trades_limit: int = 100,
     ) -> dict[str, Any]:
         normalized_symbol = self.adapter.normalize_symbol(symbol)
-        ticker = self.adapter.fetch_ticker(normalized_symbol)
+        warnings: list[str] = []
+
+        try:
+            ticker = self.adapter.fetch_ticker(normalized_symbol)
+        except Exception as exc:
+            if not self._should_retry_live_public(exc):
+                raise
+            ticker = self._fetch_live_public_ticker(normalized_symbol)
+            warnings.append(
+                "Gate.io demo public ticker returned an internal error; "
+                "ticker was retried against the live public endpoint."
+            )
+
         balance = self.adapter.fetch_balance()
-        open_orders = self.adapter.fetch_open_orders(normalized_symbol)
+        try:
+            open_orders = self.adapter.fetch_open_orders(normalized_symbol)
+        except Exception as exc:
+            if not self._should_retry_live_public(exc):
+                raise
+            open_orders = []
+            warnings.append(
+                "Gate.io demo open-orders lookup returned an internal error; "
+                "continuing with an empty open-order snapshot."
+            )
         positions: list[dict[str, Any]] = []
 
         recent_trades: list[dict[str, Any]] = []
@@ -121,7 +160,16 @@ class LiveExecutionService:
                 recent_trades = []
 
         if self.market_type == "swap":
-            positions = self.adapter.fetch_positions(normalized_symbol)
+            try:
+                positions = self.adapter.fetch_positions(normalized_symbol)
+            except Exception as exc:
+                if not self._should_retry_live_public(exc):
+                    raise
+                positions = []
+                warnings.append(
+                    "Gate.io demo positions lookup returned an internal error; "
+                    "continuing with an empty position snapshot."
+                )
         return {
             "exchange": self.exchange_name,
             "market_type": self.market_type,
@@ -140,6 +188,7 @@ class LiveExecutionService:
             "armed": self.armed,
             "dry_run": self.dry_run,
             "recent_trades": recent_trades,            
+            "warnings": warnings,
         }
 
     def fetch_recent_trades(

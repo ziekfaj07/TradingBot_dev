@@ -234,3 +234,82 @@ class CCXTExchangeAdapter:
             raise ExchangeAuthError(str(exc)) from exc
         except Exception as exc:
             raise ExchangeConnectionError(str(exc)) from exc
+
+    def set_margin_mode(
+        self,
+        *,
+        margin_mode: str,
+        symbol: str,
+        leverage: float | None = None,
+    ) -> dict[str, Any]:
+        self._require_credentials()
+        normalized_symbol = self.normalize_symbol(symbol, self.public_market_type)
+        params: dict[str, Any] = {}
+        if leverage is not None:
+            params["leverage"] = float(leverage)
+        try:
+            result = self.client.set_margin_mode(str(margin_mode).lower(), normalized_symbol, params)
+        except ccxt.AuthenticationError as exc:
+            raise ExchangeAuthError(str(exc)) from exc
+        except Exception as exc:
+            raise ExchangeConnectionError(str(exc)) from exc
+        payload = dict(result or {})
+        payload.setdefault("symbol", normalized_symbol)
+        payload.setdefault("margin_mode", str(margin_mode).lower())
+        payload.setdefault("source", "set_margin_mode")
+        return payload
+
+    def set_leverage(
+        self,
+        *,
+        leverage: float,
+        symbol: str,
+        margin_mode: str | None = None,
+    ) -> dict[str, Any]:
+        self._require_credentials()
+        normalized_symbol = self.normalize_symbol(symbol, self.public_market_type)
+        params: dict[str, Any] = {}
+        if margin_mode:
+            params["marginMode"] = str(margin_mode).lower()
+            params["margin_mode"] = str(margin_mode).lower()
+        try:
+            result = self.client.set_leverage(float(leverage), normalized_symbol, params)
+        except ccxt.AuthenticationError as exc:
+            raise ExchangeAuthError(str(exc)) from exc
+        except Exception as exc:
+            raise ExchangeConnectionError(str(exc)) from exc
+        payload = dict(result or {})
+        payload.setdefault("symbol", normalized_symbol)
+        payload.setdefault("leverage", float(leverage))
+        payload.setdefault("margin_mode", str(margin_mode).lower() if margin_mode else None)
+        payload.setdefault("source", "set_leverage")
+        return payload
+
+    def fetch_effective_leverage(
+        self,
+        *,
+        symbol: str,
+        margin_mode: str | None = None,
+    ) -> dict[str, Any]:
+        self._require_credentials()
+        normalized_symbol = self.normalize_symbol(symbol, self.public_market_type)
+        try:
+            positions = self.client.fetch_positions([normalized_symbol])
+            rows = list(positions or [])
+            if rows:
+                payload = dict(rows[0] or {})
+                payload.setdefault("source", "fetch_positions")
+                return payload
+        except ccxt.AuthenticationError as exc:
+            raise ExchangeAuthError(str(exc)) from exc
+        except Exception as exc:
+            raise ExchangeConnectionError(str(exc)) from exc
+
+        try:
+            payload = dict(self.client.fetch_position(normalized_symbol) or {})
+            payload.setdefault("source", "fetch_position")
+            return payload
+        except ccxt.AuthenticationError as exc:
+            raise ExchangeAuthError(str(exc)) from exc
+        except Exception as exc:
+            raise ExchangeConnectionError(str(exc)) from exc

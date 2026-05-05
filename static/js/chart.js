@@ -731,6 +731,10 @@ window.chartModule = {
 
   async loadBootstrap(force = false) {
     if (!state.latestStatus) return;
+    if (state.latestStatus?.mode === "backtest") {
+      this.reset();
+      return;
+    }
 
     const nextKey = this.currentChartKeyFromStatus(state.latestStatus);
     if (!force && state.lastChartKey === nextKey && state.chartCandles.length) {

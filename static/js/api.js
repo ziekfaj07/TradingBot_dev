@@ -155,6 +155,13 @@ window.api = {
     });
   },
 
+  async runBacktest(payload) {
+    return await this.request("/api/run/backtest", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+
   async start() {
     return await this.request("/api/run/start", { method: "POST" });
   },

@@ -21,6 +21,8 @@ class LiveConfigCheckBody(BaseModel):
     symbol: str = "BTCUSDT"
     enable_live_trading: bool = False
     dry_run_live: bool = True
+    testnet: bool = False
+    base_url: str | None = None
     api_key_env: str = "GATEIO_API_KEY"
     api_secret_env: str = "GATEIO_API_SECRET"
     api_passphrase_env: str | None = "GATEIO_API_PASSPHRASE"

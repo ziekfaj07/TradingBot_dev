@@ -55,10 +55,16 @@ class GateIOAdapter:
             }
         )
 
-        if self.base_url:
-            self._apply_base_url(self.base_url)
+        if self.testnet and hasattr(self.client, "set_sandbox_mode"):
+            try:
+                self.client.set_sandbox_mode(True)
+            except Exception:
+                self._apply_testnet_urls()
         elif self.testnet:
             self._apply_testnet_urls()
+
+        if self.base_url:
+            self._apply_base_url(self.base_url)
 
     def _normalize_market_type(self, market_type: str) -> str:
         public_type = normalize_market_type(market_type)
@@ -69,19 +75,24 @@ class GateIOAdapter:
         if not base:
             return
         urls = dict(getattr(self.client, "urls", {}) or {})
-        api_urls = dict(urls.get("api", {}) or {})
-        api_urls["public"] = base
-        api_urls["private"] = base
-        urls["api"] = api_urls
+        urls["api"] = self._rewrite_api_url_tree(urls.get("api"), base)
         self.client.urls = urls
 
     def _apply_testnet_urls(self) -> None:
         urls = dict(getattr(self.client, "urls", {}) or {})
-        api_urls = dict(urls.get("api", {}) or {})
-        api_urls["public"] = "https://api-testnet.gateapi.io/api/v4"
-        api_urls["private"] = "https://api-testnet.gateapi.io/api/v4"
-        urls["api"] = api_urls
+        urls["api"] = self._rewrite_api_url_tree(
+            urls.get("api"),
+            "https://api-testnet.gateapi.io/api/v4",
+        )
         self.client.urls = urls
+
+    def _rewrite_api_url_tree(self, node: Any, base_url: str) -> Any:
+        if isinstance(node, dict):
+            return {
+                key: self._rewrite_api_url_tree(value, base_url)
+                for key, value in node.items()
+            }
+        return str(base_url or "").strip().rstrip("/")
 
     @staticmethod
     def normalize_symbol(symbol: str) -> str:
@@ -226,6 +237,85 @@ class GateIOAdapter:
         except Exception as exc:
             raise ExchangeConnectionError(str(exc)) from exc
         return list(positions or [])
+
+    def set_margin_mode(
+        self,
+        *,
+        margin_mode: str,
+        symbol: str,
+        leverage: float | None = None,
+    ) -> dict[str, Any]:
+        self._require_credentials()
+        normalized_symbol = self.normalize_symbol(symbol)
+        params: dict[str, Any] = {}
+        if leverage is not None:
+            params["leverage"] = float(leverage)
+        try:
+            result = self.client.set_margin_mode(str(margin_mode).lower(), normalized_symbol, params)
+        except ccxt.AuthenticationError as exc:
+            raise ExchangeAuthError(str(exc)) from exc
+        except Exception as exc:
+            raise ExchangeConnectionError(str(exc)) from exc
+        payload = dict(result or {})
+        payload.setdefault("symbol", normalized_symbol)
+        payload.setdefault("margin_mode", str(margin_mode).lower())
+        payload.setdefault("source", "set_margin_mode")
+        return payload
+
+    def set_leverage(
+        self,
+        *,
+        leverage: float,
+        symbol: str,
+        margin_mode: str | None = None,
+    ) -> dict[str, Any]:
+        self._require_credentials()
+        normalized_symbol = self.normalize_symbol(symbol)
+        params: dict[str, Any] = {}
+        if margin_mode:
+            params["marginMode"] = str(margin_mode).lower()
+            params["margin_mode"] = str(margin_mode).lower()
+        try:
+            result = self.client.set_leverage(float(leverage), normalized_symbol, params)
+        except ccxt.AuthenticationError as exc:
+            raise ExchangeAuthError(str(exc)) from exc
+        except Exception as exc:
+            raise ExchangeConnectionError(str(exc)) from exc
+        payload = dict(result or {})
+        payload.setdefault("symbol", normalized_symbol)
+        payload.setdefault("leverage", float(leverage))
+        payload.setdefault("margin_mode", str(margin_mode).lower() if margin_mode else None)
+        payload.setdefault("source", "set_leverage")
+        return payload
+
+    def fetch_effective_leverage(
+        self,
+        *,
+        symbol: str,
+        margin_mode: str | None = None,
+    ) -> dict[str, Any]:
+        self._require_credentials()
+        normalized_symbol = self.normalize_symbol(symbol)
+        try:
+            positions = self.client.fetch_positions([normalized_symbol])
+            rows = list(positions or [])
+            if rows:
+                payload = dict(rows[0] or {})
+                payload.setdefault("source", "fetch_positions")
+                return payload
+        except ccxt.AuthenticationError as exc:
+            raise ExchangeAuthError(str(exc)) from exc
+        except Exception as exc:
+            raise ExchangeConnectionError(str(exc)) from exc
+
+        try:
+            payload = dict(self.client.fetch_position(normalized_symbol) or {})
+            payload.setdefault("source", "fetch_position")
+            return payload
+        except ccxt.AuthenticationError as exc:
+            raise ExchangeAuthError(str(exc)) from exc
+        except Exception as exc:
+            raise ExchangeConnectionError(str(exc)) from exc
 
     def create_order(
         self,

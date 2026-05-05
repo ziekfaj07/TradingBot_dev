@@ -43,6 +43,8 @@ window.uiController = {
         symbol: cfg.symbol || "BTCUSDT",
         enable_live_trading: Boolean(cfg.enable_live_trading),
         dry_run_live: cfg.live_dry_run !== false,
+        testnet: Boolean(cfg.exchange_testnet),
+        base_url: cfg.exchange_base_url || null,
         api_key_env: cfg.exchange_api_key_env || "GATEIO_API_KEY",
         api_secret_env: cfg.exchange_api_secret_env || "GATEIO_API_SECRET",
         api_passphrase_env: cfg.exchange_api_passphrase_env || "GATEIO_API_PASSPHRASE",
@@ -75,6 +77,8 @@ window.uiController = {
       "maintenance_margin",
       "max_leverage",
       "max_qty",
+      "position_sizing_mode",
+      "position_size_value",
       "include_equity",
       "equity_stride",
       "poll_seconds",
@@ -117,6 +121,10 @@ window.uiController = {
       maintenance_margin: Number(qs("maintenance_margin").value),
       max_leverage: Number(qs("max_leverage").value),
       max_qty: Number(qs("max_qty").value),
+      position_sizing_mode: qs("position_sizing_mode")?.value || "all_in",
+      position_size_value: qs("position_size_value")?.value
+        ? Number(qs("position_size_value").value)
+        : null,
 
       include_equity: qs("include_equity").value === "true",
       equity_stride: Number(qs("equity_stride").value),
@@ -283,6 +291,13 @@ window.uiController = {
       equityModule.push(paper.equity);
     }
 
+    if (data?.mode === "backtest") {
+      chartModule.reset();
+      qs("fillsTableBody").innerHTML = "";
+      chartModule.updateFollowState();
+      return;
+    }
+
     const nextChartKey = chartModule.currentChartKeyFromStatus(data);
     if (nextChartKey && nextChartKey !== state.lastChartKey) {
       chartModule.loadBootstrap(true).catch((err) => {
@@ -296,12 +311,19 @@ window.uiController = {
 
   async configureBot() {
     try {
+      const selectedMode = qs("mode").value;
       const payload = this.readConfigForm();
+      await api.setMode(selectedMode);
       await api.configure(payload);
       const data = await api.getStatus();
       this.renderStatus(data);
-      await this.syncExchangePrecision();
-      await chartModule.loadBootstrap(true);
+      if (selectedMode === "backtest") {
+        chartModule.reset();
+        qs("fillsTableBody").innerHTML = "";
+      } else {
+        await this.syncExchangePrecision();
+        await chartModule.loadBootstrap(true);
+      }
       this.setActionMessage("Configuration updated.", "good");
     } catch (err) {
       console.error(err);
@@ -313,6 +335,21 @@ window.uiController = {
     try {
       const selectedMode = qs("mode").value;
       const payload = this.readConfigForm();
+
+      if (selectedMode === "backtest") {
+        await api.setMode("backtest");
+        const response = await api.runBacktest(payload);
+        if (response?.status) {
+          this.renderStatus(response.status);
+        }
+        chartModule.reset();
+        qs("fillsTableBody").innerHTML = "";
+        this.setActionMessage(
+          `BACKTEST completed. Final equity: ${fmtNum(response?.result?.final_equity)}.`,
+          "good"
+        );
+        return;
+      }
 
       if (selectedMode === "demo") {
         payload.exchange_testnet = true;
@@ -410,6 +447,12 @@ window.uiController = {
         document.querySelectorAll(".tf-btn").forEach((btn) => {
           btn.classList.toggle("active", btn.dataset.tf === state.selectedTimeframe);
         });
+      }
+
+      if (data?.mode === "backtest") {
+        chartModule.reset();
+        qs("fillsTableBody").innerHTML = "";
+        return;
       }
 
       await this.syncExchangePrecision();

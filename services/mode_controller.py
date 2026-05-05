@@ -35,7 +35,8 @@ from core.execution_models import Fill, PortfolioState
 from core.market_types import is_derivatives_market, normalize_market_type
 from core.run_naming import make_run_id
 from services.execution_engine import ExecutionEngine
-from services.exchange_service import validate_live_config
+from services.exchange_service import resolve_exchange_env_names, validate_live_config
+from services.live_execution_service import LiveExecutionService
 from services.margin_engine import evaluate_position_margin
 from services.market_data_service import CoinGeckoService, GateIOService
 from services.risk_engine import RiskEngine
@@ -169,6 +170,7 @@ class ModeController:
         self._task: Optional[asyncio.Task] = None
 
         self._engine: Optional[ExecutionEngine] = None
+        self._live_service: Optional[LiveExecutionService] = None
         self._state: Optional[PortfolioState] = None
         self._trade_id: int = 0
 
@@ -674,12 +676,33 @@ class ModeController:
         return raw in ("1", "true", "yes", "y", "on")
 
     def _apply_mode_derived_execution_config(self, config_dict: dict) -> dict:
+        exchange_name = str(config_dict.get("exchange_name") or self._status.config.exchange_name or "gateio").strip().lower()
+        if exchange_name in {"gate", "gateio", "gate.io"} and self._status.mode in (Mode.DEMO, Mode.LIVE):
+            profile = "DEMO" if self._status.mode == Mode.DEMO else "LIVE"
+            resolved_envs = {
+                "api_key_env": f"GATEIO_{profile}_API_KEY",
+                "api_secret_env": f"GATEIO_{profile}_API_SECRET",
+                "api_passphrase_env": f"GATEIO_{profile}_API_PASSPHRASE",
+            }
+        else:
+            resolved_envs = resolve_exchange_env_names(
+                testnet=bool(self._status.mode == Mode.DEMO),
+                api_key_env=str(config_dict.get("exchange_api_key_env") or self._status.config.exchange_api_key_env or "GATEIO_API_KEY"),
+                api_secret_env=str(config_dict.get("exchange_api_secret_env") or self._status.config.exchange_api_secret_env or "GATEIO_API_SECRET"),
+                api_passphrase_env=config_dict.get("exchange_api_passphrase_env") or self._status.config.exchange_api_passphrase_env,
+            )
+
         config_dict["exchange_testnet"] = self._mode_exchange_testnet()
         config_dict["client_order_id_prefix"] = self._mode_client_order_prefix()
+        config_dict["exchange_api_key_env"] = resolved_envs["api_key_env"]
+        config_dict["exchange_api_secret_env"] = resolved_envs["api_secret_env"]
+        config_dict["exchange_api_passphrase_env"] = resolved_envs["api_passphrase_env"]
 
         if self._status.mode in (Mode.BACKTEST, Mode.PAPER):
             config_dict["enable_live_trading"] = False
             config_dict["live_dry_run"] = True
+        elif self._status.mode == Mode.DEMO:
+            config_dict["live_dry_run"] = False
 
         return config_dict
 
@@ -733,6 +756,9 @@ class ModeController:
             "live": {
                 "exchange_name": cfg.get("exchange_name"),
                 "exchange_testnet": cfg.get("exchange_testnet"),
+                "exchange_api_key_env": cfg.get("exchange_api_key_env"),
+                "exchange_api_secret_env": cfg.get("exchange_api_secret_env"),
+                "exchange_api_passphrase_env": cfg.get("exchange_api_passphrase_env"),
                 "enable_live_trading": cfg.get("enable_live_trading"),
                 "live_dry_run": cfg.get("live_dry_run"),
                 "sync_positions_on_start": cfg.get("sync_positions_on_start"),
@@ -1975,6 +2001,7 @@ class ModeController:
 
     def _reset_runtime_memory(self) -> None:
         self._engine = None
+        self._live_service = None
         self._state = None
         self._trade_id = 0
         self._latest_bar = None
@@ -2018,6 +2045,8 @@ class ModeController:
             margin_mode=cfg.margin_mode,
         )
 
+        self._build_live_service_locked()
+
     def _build_runtime_objects_from_existing_or_new(self) -> None:
         cfg = self._status.config
         
@@ -2046,10 +2075,190 @@ class ModeController:
                 margin_mode=cfg.margin_mode,
             )
 
+        self._build_live_service_locked()
+
         if self._status.started_at is None:
             self._status.started_at = time.time()
         self._status.stopped_at = None
         self._status.last_error = None
+
+    def _uses_exchange_execution_locked(self) -> bool:
+        return self._status.mode in (Mode.DEMO, Mode.LIVE)
+
+    def _build_live_service_locked(self) -> None:
+        if not self._uses_exchange_execution_locked():
+            self._live_service = None
+            return
+
+        cfg = self._status.config
+        dry_run = bool(cfg.live_dry_run) if self._status.mode == Mode.LIVE else False
+        self._live_service = LiveExecutionService(
+            exchange_name=cfg.exchange_name,
+            market_type=cfg.market_type,
+            testnet=bool(self._status.mode == Mode.DEMO or cfg.exchange_testnet),
+            settle_currency=cfg.exchange_settle_currency,
+            api_key_env=cfg.exchange_api_key_env,
+            api_secret_env=cfg.exchange_api_secret_env,
+            api_passphrase_env=cfg.exchange_api_passphrase_env,
+            client_order_id_prefix=cfg.client_order_id_prefix,
+            armed=bool(cfg.enable_live_trading),
+            dry_run=dry_run,
+        )
+
+    def _symbol_assets_locked(self) -> tuple[str | None, str | None]:
+        raw_symbol = str(self._status.config.symbol or "").strip().upper()
+        if "/" in raw_symbol:
+            parts = raw_symbol.split("/", 1)
+            return parts[0] or None, parts[1] or None
+        if raw_symbol.endswith("USDT"):
+            return raw_symbol[:-4] or None, "USDT"
+        if raw_symbol.endswith("USD"):
+            return raw_symbol[:-3] or None, "USD"
+        return None, str(self._status.config.exchange_settle_currency or "").strip().upper() or None
+
+    async def _sync_exchange_account_locked(self, market_price: float | None = None) -> dict[str, Any] | None:
+        if self._live_service is None:
+            return None
+
+        snapshot = await asyncio.to_thread(
+            self._live_service.sync_account,
+            symbol=self._status.config.symbol,
+            include_recent_trades=False,
+        )
+
+        if self._state is None:
+            self._state = PortfolioState(cash=0.0, equity=0.0)
+
+        balance = dict(snapshot.get("balance") or {})
+        free_bal = dict(balance.get("free") or {})
+        total_bal = dict(balance.get("total") or {})
+        settle = str(self._status.config.exchange_settle_currency or "USDT").strip().upper() or "USDT"
+        free_settle = self._safe_float_value(free_bal.get(settle), 0.0)
+        total_settle = self._safe_float_value(total_bal.get(settle), free_settle)
+
+        prev_qty = float(getattr(self._state, "position_qty", 0.0) or 0.0)
+        prev_entry = getattr(self._state, "entry_price", None)
+        prev_side = getattr(self._state, "side", None)
+        prev_trade_id = getattr(self._state, "active_trade_id", None)
+        entry_price = prev_entry
+        liquidation_price = None
+        position_qty = 0.0
+        side = None
+        margin_mode = self._status.config.margin_mode
+
+        if is_derivatives_market(self._status.config.market_type):
+            normalized_symbol = self._live_service.adapter.normalize_symbol(self._status.config.symbol)
+            for row in list(snapshot.get("positions") or []):
+                if str(row.get("symbol") or "") != normalized_symbol:
+                    continue
+                base_qty = self._safe_float_value(row.get("base_qty"), 0.0)
+                row_side = str(row.get("side") or "").strip().lower()
+                if base_qty <= 0.0 or row_side not in {"long", "short"}:
+                    continue
+                position_qty = -base_qty if row_side == "short" else base_qty
+                side = row_side
+                entry_price = row.get("entry_price") if row.get("entry_price") is not None else prev_entry
+                liquidation_price = row.get("liquidation_price")
+                margin_mode = str(row.get("margin_mode") or margin_mode or "cross")
+                break
+        else:
+            base_asset, quote_asset = self._symbol_assets_locked()
+            if quote_asset:
+                free_settle = self._safe_float_value(free_bal.get(quote_asset), free_settle)
+                total_settle = self._safe_float_value(total_bal.get(quote_asset), total_settle)
+            if base_asset:
+                base_total = self._safe_float_value(total_bal.get(base_asset), self._safe_float_value(free_bal.get(base_asset), 0.0))
+                if base_total > 1e-12:
+                    position_qty = base_total
+                    side = "long"
+                    if entry_price is None:
+                        entry_price = market_price
+
+        if abs(position_qty) <= 1e-12:
+            entry_price = None
+            side = None
+            liquidation_price = None
+            active_trade_id = None
+        else:
+            active_trade_id = prev_trade_id
+            if active_trade_id is None:
+                active_trade_id = self._trade_id or None
+            if side == prev_side and prev_entry is not None and entry_price is None:
+                entry_price = prev_entry
+
+        if market_price is None:
+            try:
+                market_price = float((snapshot.get("ticker") or {}).get("last"))
+            except Exception:
+                market_price = None
+
+        if is_derivatives_market(self._status.config.market_type):
+            equity = total_settle if total_settle > 0.0 else free_settle
+        else:
+            base_asset, quote_asset = self._symbol_assets_locked()
+            base_total = self._safe_float_value(total_bal.get(base_asset or ""), max(0.0, position_qty))
+            quote_total = self._safe_float_value(total_bal.get(quote_asset or ""), total_settle)
+            equity = quote_total
+            if market_price is not None and base_total > 0.0:
+                equity += base_total * float(market_price)
+
+        self._state.cash = float(free_settle)
+        self._state.position_qty = float(position_qty)
+        self._state.entry_price = entry_price
+        self._state.side = side
+        self._state.equity = float(equity)
+        self._state.liquidation_price = liquidation_price
+        self._state.active_trade_id = active_trade_id
+        self._state.margin_mode = str(margin_mode or "cross")
+        if market_price is not None:
+            self._update_peak_equity_locked(float(market_price))
+        return snapshot
+
+    def _next_client_order_id_locked(self, trade_id: int, action: str) -> str:
+        prefix = str(self._status.config.client_order_id_prefix or "tb").strip() or "tb"
+        run_part = str(self._status.run_id or "run").replace(":", "-")
+        return f"{prefix}-{action}-{trade_id}-{run_part}"[:48]
+
+    async def _submit_exchange_order_locked(
+        self,
+        *,
+        side: str,
+        qty: float,
+        fill_type: str,
+        market_price: float,
+        trade_id: int,
+        reduce_only: bool = False,
+    ) -> Fill | None:
+        if self._live_service is None:
+            raise RuntimeError("Exchange execution service is not initialized.")
+        if not math.isfinite(float(qty)) or float(qty) <= 0.0:
+            return None
+
+        order = await asyncio.to_thread(
+            self._live_service.submit_order,
+            symbol=self._status.config.symbol,
+            side=side,
+            qty=float(abs(qty)),
+            order_type="market",
+            price=None,
+            reduce_only=reduce_only,
+            client_order_id=self._next_client_order_id_locked(trade_id, fill_type.lower()),
+            leverage=self._status.config.leverage,
+            margin_mode=self._status.config.margin_mode,
+        )
+        fill = self._live_service.fill_from_order(
+            order=order.order,
+            fill_type=fill_type,
+            market_price=float(market_price),
+            trade_id=trade_id,
+            expected_price=float(market_price),
+            expected_qty=float(abs(qty)),
+        )
+        await self._append_fill(fill)
+        await self._sync_exchange_account_locked(float(market_price))
+        self._persist_status()
+        self._persist_snapshot()
+        return fill
 
     async def _broadcast_runtime_update(self) -> None:
         latest_price = None
@@ -2151,7 +2360,20 @@ class ModeController:
 
         return float(qty)
 
+    def _resolve_entry_qty_locked(self, price: float) -> float:
+        sized_qty = self._compute_entry_qty_locked(price)
+        if sized_qty is None:
+            sized_qty = self._calculate_order_qty(price)
+        sized_qty = float(sized_qty or 0.0)
+        if not math.isfinite(sized_qty) or sized_qty <= 0.0:
+            return 0.0
+        return sized_qty
+
     async def _mark_to_market(self, price: float) -> None:
+        if self._uses_exchange_execution_locked() and self._live_service is not None:
+            await self._sync_exchange_account_locked(price)
+            return
+
         if self._engine is None or self._state is None:
             return
 
@@ -2277,15 +2499,26 @@ class ModeController:
 
                             # side-aware marker: signal > 0 and position_side == 'short' means cover short first.
                             if cfg.exit_on_signal and signal > 0 and position_side == "short":
-                                self._state, fill = self._engine.exit_short(
-                                    ts_iso=str(int(processed_ts)),
-                                    state=self._state,
-                                    close=latest_price,
-                                    market_type=cfg.market_type,
-                                    trade_id=self._trade_id,
-                                )
+                                if self._uses_exchange_execution_locked():
+                                    fill = await self._submit_exchange_order_locked(
+                                        side="buy",
+                                        qty=abs(qty_now),
+                                        fill_type="EXIT",
+                                        market_price=latest_price,
+                                        trade_id=int(getattr(self._state, "active_trade_id", None) or self._trade_id or 0),
+                                        reduce_only=True,
+                                    )
+                                else:
+                                    self._state, fill = self._engine.exit_short(
+                                        ts_iso=str(int(processed_ts)),
+                                        state=self._state,
+                                        close=latest_price,
+                                        market_type=cfg.market_type,
+                                        trade_id=self._trade_id,
+                                    )
                                 if fill is not None:
-                                    await self._append_fill(fill)
+                                    if not self._uses_exchange_execution_locked():
+                                        await self._append_fill(fill)
                                     await self._broadcast_trace_event(
                                         "signal_fill",
                                         data={
@@ -2304,17 +2537,29 @@ class ModeController:
                                 entry_gate = self._check_entry_gate_locked(latest_price, now_ts=processed_ts)
                                 if entry_gate["allowed"]:
                                     self._trade_id += 1
-                                    self._state, fill = self._engine.enter_long(
-                                        ts_iso=str(int(processed_ts)),
-                                        state=self._state,
-                                        close=latest_price,
-                                        market_type=cfg.market_type,
-                                        leverage=cfg.leverage,
-                                        trade_id=self._trade_id,
-                                        qty_override=self._compute_entry_qty_locked(latest_price),
-                                    )
+                                    qty_override = self._resolve_entry_qty_locked(latest_price)
+                                    if self._uses_exchange_execution_locked():
+                                        fill = await self._submit_exchange_order_locked(
+                                            side="buy",
+                                            qty=float(qty_override or 0.0),
+                                            fill_type="ENTRY",
+                                            market_price=latest_price,
+                                            trade_id=self._trade_id,
+                                            reduce_only=False,
+                                        )
+                                    else:
+                                        self._state, fill = self._engine.enter_long(
+                                            ts_iso=str(int(processed_ts)),
+                                            state=self._state,
+                                            close=latest_price,
+                                            market_type=cfg.market_type,
+                                            leverage=cfg.leverage,
+                                            trade_id=self._trade_id,
+                                            qty_override=qty_override,
+                                        )
                                     if fill is not None:
-                                        await self._append_fill(fill)
+                                        if not self._uses_exchange_execution_locked():
+                                            await self._append_fill(fill)
                                         await self._broadcast_trace_event(
                                             "signal_fill",
                                             data={
@@ -2339,15 +2584,26 @@ class ModeController:
 
                             # side-aware marker: signal < 0 and position_side == 'long' means exit long first.
                             elif cfg.exit_on_signal and signal < 0 and position_side == "long":
-                                self._state, fill = self._engine.exit_long(
-                                    ts_iso=str(int(processed_ts)),
-                                    state=self._state,
-                                    close=latest_price,
-                                    market_type=cfg.market_type,
-                                    trade_id=self._trade_id,
-                                )
+                                if self._uses_exchange_execution_locked():
+                                    fill = await self._submit_exchange_order_locked(
+                                        side="sell",
+                                        qty=abs(qty_now),
+                                        fill_type="EXIT",
+                                        market_price=latest_price,
+                                        trade_id=int(getattr(self._state, "active_trade_id", None) or self._trade_id or 0),
+                                        reduce_only=is_derivatives_market(cfg.market_type),
+                                    )
+                                else:
+                                    self._state, fill = self._engine.exit_long(
+                                        ts_iso=str(int(processed_ts)),
+                                        state=self._state,
+                                        close=latest_price,
+                                        market_type=cfg.market_type,
+                                        trade_id=self._trade_id,
+                                    )
                                 if fill is not None:
-                                    await self._append_fill(fill)
+                                    if not self._uses_exchange_execution_locked():
+                                        await self._append_fill(fill)
                                     await self._broadcast_trace_event(
                                         "signal_fill",
                                         data={
@@ -2364,17 +2620,29 @@ class ModeController:
 
                                 if cfg.allow_short and is_flat and is_derivatives_market(cfg.market_type):
                                     self._trade_id += 1
-                                    self._state, fill = self._engine.enter_short(
-                                        ts_iso=str(int(processed_ts)),
-                                        state=self._state,
-                                        close=latest_price,
-                                        market_type=cfg.market_type,
-                                        leverage=cfg.leverage,
-                                        trade_id=self._trade_id,
-                                        qty_override=self._compute_entry_qty_locked(latest_price),
-                                    )
+                                    qty_override = self._resolve_entry_qty_locked(latest_price)
+                                    if self._uses_exchange_execution_locked():
+                                        fill = await self._submit_exchange_order_locked(
+                                            side="sell",
+                                            qty=float(qty_override or 0.0),
+                                            fill_type="ENTRY",
+                                            market_price=latest_price,
+                                            trade_id=self._trade_id,
+                                            reduce_only=False,
+                                        )
+                                    else:
+                                        self._state, fill = self._engine.enter_short(
+                                            ts_iso=str(int(processed_ts)),
+                                            state=self._state,
+                                            close=latest_price,
+                                            market_type=cfg.market_type,
+                                            leverage=cfg.leverage,
+                                            trade_id=self._trade_id,
+                                            qty_override=qty_override,
+                                        )
                                     if fill is not None:
-                                        await self._append_fill(fill)
+                                        if not self._uses_exchange_execution_locked():
+                                            await self._append_fill(fill)
                                         await self._broadcast_trace_event(
                                             "signal_fill",
                                             data={
@@ -2391,17 +2659,29 @@ class ModeController:
                                 entry_gate = self._check_entry_gate_locked(latest_price, now_ts=processed_ts)
                                 if entry_gate["allowed"]:
                                     self._trade_id += 1
-                                    self._state, fill = self._engine.enter_short(
-                                        ts_iso=str(int(processed_ts)),
-                                        state=self._state,
-                                        close=latest_price,
-                                        market_type=cfg.market_type,
-                                        leverage=cfg.leverage,
-                                        trade_id=self._trade_id,
-                                        qty_override=self._compute_entry_qty_locked(latest_price),
-                                    )
+                                    qty_override = self._resolve_entry_qty_locked(latest_price)
+                                    if self._uses_exchange_execution_locked():
+                                        fill = await self._submit_exchange_order_locked(
+                                            side="sell",
+                                            qty=float(qty_override or 0.0),
+                                            fill_type="ENTRY",
+                                            market_price=latest_price,
+                                            trade_id=self._trade_id,
+                                            reduce_only=False,
+                                        )
+                                    else:
+                                        self._state, fill = self._engine.enter_short(
+                                            ts_iso=str(int(processed_ts)),
+                                            state=self._state,
+                                            close=latest_price,
+                                            market_type=cfg.market_type,
+                                            leverage=cfg.leverage,
+                                            trade_id=self._trade_id,
+                                            qty_override=qty_override,
+                                        )
                                     if fill is not None:
-                                        await self._append_fill(fill)
+                                        if not self._uses_exchange_execution_locked():
+                                            await self._append_fill(fill)
                                         await self._broadcast_trace_event(
                                             "signal_fill",
                                             data={
@@ -2689,21 +2969,34 @@ class ModeController:
             else str(int(time.time()))
         )
 
-        self._state, fill = self._engine.exit_long(
-            ts_iso=ts_iso,
-            state=self._state,
-            close=float(market_price),
-            market_type=self._status.config.market_type,
-            trade_id=self._trade_id,
-        )
+        if self._uses_exchange_execution_locked():
+            exit_side = "sell"
+            reduce_only = is_derivatives_market(self._status.config.market_type)
+            fill = await self._submit_exchange_order_locked(
+                side=exit_side,
+                qty=float(abs(self._state.position_qty or 0.0)),
+                fill_type="EXIT",
+                market_price=float(market_price),
+                trade_id=int(getattr(self._state, "active_trade_id", None) or self._trade_id or 0),
+                reduce_only=reduce_only,
+            )
+        else:
+            self._state, fill = self._engine.exit_long(
+                ts_iso=ts_iso,
+                state=self._state,
+                close=float(market_price),
+                market_type=self._status.config.market_type,
+                trade_id=self._trade_id,
+            )
 
         if not fill:
             return False
 
-        await self._append_fill(fill)
-        await self._mark_to_market(float(market_price))
-        self._persist_status()
-        self._persist_snapshot()
+        if not self._uses_exchange_execution_locked():
+            await self._append_fill(fill)
+            await self._mark_to_market(float(market_price))
+            self._persist_status()
+            self._persist_snapshot()
 
         await self._broadcast_trace_event(
             "paper_risk_exit",

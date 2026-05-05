@@ -12,7 +12,7 @@ AAAAAAA-BCD-yymmdd-hhmm-EEEEE
 
   AAAAAAA - trading pair (ticker)
   B - for market type (S - spot, F - futures)
-  C - for mode (L - live, P - paper, B - Backtest)
+  C - for mode (L - live, P - paper, B - Backtest, D - demo)
   D - if SHORT whether true or false (F - short=false, T - short=true)
   yyyymmdd - year month day
   hhmm - hour minute
@@ -44,7 +44,9 @@ def mode_code(mode: str) -> str:
         return "L"
     if value == "paper":
         return "P"
-    return "B"
+    if value == "backtest":
+        return "B"
+    return "D"
 
 
 def short_code(allow_short: bool) -> str:
