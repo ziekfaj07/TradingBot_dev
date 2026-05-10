@@ -16,6 +16,13 @@ class PortfolioState:
     borrowed: float = 0.0
     isolated_margin: float = 0.0
     margin_mode: str = "cross"
+    mark_price: Optional[float] = None
+    maintenance_margin: float = 0.0
+    maintenance_margin_rate: float = 0.0
+    maintenance_amount: float = 0.0
+    margin_balance: float = 0.0
+    margin_ratio: Optional[float] = None
+    bankruptcy_price: Optional[float] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -37,6 +44,13 @@ class PortfolioState:
             borrowed=float(data.get("borrowed", 0.0)),
             isolated_margin=float(data.get("isolated_margin", 0.0)),
             margin_mode=str(data.get("margin_mode", "cross") or "cross"),
+            mark_price=data.get("mark_price"),
+            maintenance_margin=float(data.get("maintenance_margin", 0.0)),
+            maintenance_margin_rate=float(data.get("maintenance_margin_rate", 0.0)),
+            maintenance_amount=float(data.get("maintenance_amount", 0.0)),
+            margin_balance=float(data.get("margin_balance", 0.0)),
+            margin_ratio=data.get("margin_ratio"),
+            bankruptcy_price=data.get("bankruptcy_price"),
         )
 
 

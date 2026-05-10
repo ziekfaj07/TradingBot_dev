@@ -2187,10 +2187,9 @@ class ModeController:
                 entry_price = prev_entry
 
         if market_price is None:
-            try:
-                market_price = float((snapshot.get("ticker") or {}).get("last"))
-            except Exception:
-                market_price = None
+            ticker = snapshot.get("ticker")
+            ticker_last = ticker.get("last") if isinstance(ticker, Mapping) else None
+            market_price = self._safe_float_value(ticker_last, 0.0) or None
 
         if is_derivatives_market(self._status.config.market_type):
             equity = total_settle if total_settle > 0.0 else free_settle
