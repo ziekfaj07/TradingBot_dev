@@ -53,13 +53,19 @@
       font-size: 12px;
     }
 
-    input, select, button {
+    input, select, button, textarea {
       border-radius: 10px;
       border: 1px solid var(--border);
       background: var(--panel-2);
       color: var(--text);
       padding: 10px 12px;
       font-size: 14px;
+    }
+
+    textarea {
+      min-height: 120px;
+      resize: vertical;
+      font-family: Consolas, Monaco, monospace;
     }
 
     button {
@@ -89,6 +95,10 @@
 
     .muted {
       color: var(--muted);
+    }
+
+    .wide {
+      grid-column: 1 / -1;
     }
 
     a {
@@ -194,13 +204,13 @@
         </div>
 
         <div class="field">
-          <label>EMA Short</label>
-          <input id="ema_short" type="number" step="1" value="9" />
-        </div>
-
-        <div class="field">
-          <label>EMA Long</label>
-          <input id="ema_long" type="number" step="1" value="21" />
+          <label>Strategy</label>
+          <select id="strategy_name">
+            <option value="ema_crossover" selected>EMA Crossover</option>
+            <option value="donchian_breakout">Donchian Breakout</option>
+            <option value="three_candle_reversal">Three Candle Reversal</option>
+            <option value="bollinger_mean_reversion">Bollinger Mean Reversion</option>
+          </select>
         </div>
 
         <div class="field">
@@ -216,6 +226,12 @@
         <div class="field">
           <label>End</label>
           <input id="end" placeholder="Optional" />
+        </div>
+
+        <div class="field wide">
+          <label>Strategy Parameters</label>
+          <textarea id="strategy_params_json" placeholder='Defaults populate from the selected strategy. Example: {"short":9,"long":21}'></textarea>
+          <div class="muted">Select a strategy to load its default parameters. Edit this JSON only when you want to override the selected strategy defaults.</div>
         </div>
       </div>
 
@@ -246,6 +262,25 @@
     const resultsEl = document.getElementById("results");
     const tradesEl = document.getElementById("trades");
 
+    const FALLBACK_STRATEGY_DEFAULT_PARAMS = Object.freeze({
+      ema_crossover: { short: 9, long: 21 },
+      donchian_breakout: { lookback: 20 },
+      three_candle_reversal: {
+        min_body_ratio: 0.55,
+        require_full_range_engulf: true,
+        confirm_break_prev_extreme: true,
+      },
+      bollinger_mean_reversion: {
+        length: 20,
+        std_dev: 2.0,
+        min_band_width_pct: 0.01,
+        exit_on_mid: true,
+        allow_short: false,
+      },
+    });
+
+    let strategyDefaultParams = cloneJson(FALLBACK_STRATEGY_DEFAULT_PARAMS);
+
     function buildHeaders() {
       const headers = { "Content-Type": "application/json" };
       const apiKey = String(window.localStorage.getItem("tradingbot_api_key") || "").trim();
@@ -255,7 +290,63 @@
       return headers;
     }
 
+    function cloneJson(value) {
+      return JSON.parse(JSON.stringify(value || {}));
+    }
+
+    function strategyDefaults(strategyName) {
+      const key = String(strategyName || "ema_crossover").trim().toLowerCase();
+      return cloneJson(strategyDefaultParams[key] || FALLBACK_STRATEGY_DEFAULT_PARAMS[key] || {});
+    }
+
+    function syncStrategyParamsForSelection(force = false) {
+      const strategyEl = document.getElementById("strategy_name");
+      const paramsEl = document.getElementById("strategy_params_json");
+      if (!strategyEl || !paramsEl) return;
+
+      if (!force && String(paramsEl.value || "").trim()) return;
+
+      paramsEl.value = JSON.stringify(strategyDefaults(strategyEl.value), null, 2);
+    }
+
+    async function loadStrategyCatalog() {
+      strategyDefaultParams = cloneJson(FALLBACK_STRATEGY_DEFAULT_PARAMS);
+
+      try {
+        const res = await fetch("/api/strategies", { headers: buildHeaders() });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const catalog = await res.json();
+        const defaults = cloneJson(FALLBACK_STRATEGY_DEFAULT_PARAMS);
+
+        for (const item of catalog?.strategies || []) {
+          const name = String(item?.name || "").trim().toLowerCase();
+          if (!name) continue;
+          defaults[name] = cloneJson(item?.default_params || {});
+        }
+
+        strategyDefaultParams = defaults;
+      } catch (e) {
+        console.warn("Strategy catalog load skipped; using fallback defaults:", e);
+      }
+
+      syncStrategyParamsForSelection(false);
+    }
+
+    function readStrategyParams() {
+      const strategyName = document.getElementById("strategy_name").value;
+      const raw = String(document.getElementById("strategy_params_json").value || "").trim();
+      let params = raw ? JSON.parse(raw) : strategyDefaults(strategyName);
+
+      if (!params || typeof params !== "object" || Array.isArray(params)) {
+        throw new Error("Strategy Parameters must be a JSON object.");
+      }
+
+      return params;
+    }
+
     function getParams() {
+      const strategyName = document.getElementById("strategy_name").value;
+      const strategyParams = readStrategyParams();
       return {
         symbol: document.getElementById("symbol").value.trim().toUpperCase(),
         interval: document.getElementById("interval").value,
@@ -270,8 +361,14 @@
         position_size_value: document.getElementById("position_size_value").value
           ? Number(document.getElementById("position_size_value").value)
           : null,
-        ema_short: Number(document.getElementById("ema_short").value),
-        ema_long: Number(document.getElementById("ema_long").value),
+        strategy_name: strategyName,
+        strategy_params: strategyParams,
+        ...(strategyName === "ema_crossover"
+          ? {
+              ema_short: Number(strategyParams.short),
+              ema_long: Number(strategyParams.long),
+            }
+          : {}),
         candle_limit: Number(document.getElementById("candle_limit").value),
         start: document.getElementById("start").value.trim() || null,
         end: document.getElementById("end").value.trim() || null
@@ -279,12 +376,12 @@
     }
 
     document.getElementById("runBtn").addEventListener("click", async () => {
-      const p = getParams();
       statusEl.textContent = "Running backtest...";
       resultsEl.textContent = "";
       tradesEl.textContent = "";
 
       try {
+        const p = getParams();
         const res = await fetch("/api/run/backtest", {
           method: "POST",
           headers: buildHeaders(),
@@ -308,7 +405,11 @@
     });
 
     document.getElementById("exportBtn").addEventListener("click", async () => {
-      const p = getParams();
+      const p = {
+        symbol: document.getElementById("symbol").value.trim().toUpperCase(),
+        interval: document.getElementById("interval").value,
+        market_type: document.getElementById("market_type").value,
+      };
       statusEl.textContent = "Exporting CSV...";
 
       const url =
@@ -324,6 +425,12 @@
         statusEl.textContent = "Export request failed";
       }
     });
+
+    document.getElementById("strategy_name").addEventListener("change", () => {
+      syncStrategyParamsForSelection(true);
+    });
+
+    loadStrategyCatalog();
   </script>
 </body>
 </html>

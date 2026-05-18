@@ -237,6 +237,10 @@ class LiveExecutionService:
             normalized = self._normalize_margin_mode(candidate)
             if normalized:
                 return normalized
+        for candidate in (raw.get("cross_leverage_limit"), info.get("cross_leverage_limit")):
+            cross_limit = self._float_or_none(candidate)
+            if cross_limit is not None and cross_limit > 0.0:
+                return "cross"
         return None
 
     def _extract_leverage(self, payload: dict[str, Any] | None) -> float | None:
@@ -247,10 +251,12 @@ class LiveExecutionService:
             raw.get("lever"),
             raw.get("longLeverage"),
             raw.get("shortLeverage"),
+            raw.get("cross_leverage_limit"),
             info.get("lever"),
             info.get("leverage"),
             info.get("long_leverage"),
             info.get("short_leverage"),
+            info.get("cross_leverage_limit"),
         ):
             lev = self._float_or_none(candidate)
             if lev is not None and lev > 0.0:
@@ -295,12 +301,20 @@ class LiveExecutionService:
             margin_mode=configured_margin_mode,
         )
 
-        verified = self.adapter.fetch_effective_leverage(
-            symbol=normalized_symbol,
-            margin_mode=configured_margin_mode,
-        )
+        try:
+            verified = self.adapter.fetch_effective_leverage(
+                symbol=normalized_symbol,
+                margin_mode=configured_margin_mode,
+            )
+        except ExchangeAdapterError:
+            verified = dict(leverage_result or {})
+            verified.setdefault("source", "set_leverage")
         exchange_margin_mode = self._extract_margin_mode(verified) or self._normalize_margin_mode(verified.get("margin_mode"))
         exchange_leverage = self._extract_leverage(verified) or self._float_or_none(verified.get("leverage"))
+        if exchange_margin_mode is None:
+            exchange_margin_mode = self._extract_margin_mode(margin_result)
+        if exchange_leverage is None:
+            exchange_leverage = self._extract_leverage(leverage_result)
         margin_mode_match = exchange_margin_mode == configured_margin_mode if exchange_margin_mode is not None else None
         leverage_match = (
             exchange_leverage is not None and abs(float(exchange_leverage) - float(configured_leverage)) <= 1e-9
@@ -447,7 +461,10 @@ class LiveExecutionService:
             return qty, contract_size
         if contract_size is None or contract_size <= 0:
             return qty, contract_size
-        contracts = max(1.0, round(qty / contract_size))
+        # Futures orders are submitted in whole contracts on Gate.io.
+        # Do not round up above the risk engine's requested base quantity;
+        # use the largest whole-contract amount that does not exceed it.
+        contracts = max(1.0, float(int(qty / contract_size)))
         return float(contracts), float(contract_size)
 
     def _resolve_contract_size(

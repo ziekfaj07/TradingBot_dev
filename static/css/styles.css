@@ -147,6 +147,22 @@ textarea {
   resize: vertical;
 }
 
+.wide-field {
+  grid-column: 1 / -1;
+}
+
+.pre-panel {
+  white-space: pre-wrap;
+  overflow: auto;
+  max-height: 320px;
+  background: #0f1726;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .actions {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -448,6 +464,18 @@ td {
   font-size: 12px;
 }
 
+.chart-overlay-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.chart-overlay-row .indicator-legend {
+  margin-bottom: 0;
+}
+
 .indicator-chip {
   display: inline-flex;
   align-items: center;
@@ -572,18 +600,20 @@ td {
 .timeframe-switch {
   display: inline-flex;
   gap: 6px;
-  margin-left: 10px;
+  margin-left: 0;
   flex-wrap: wrap;
 }
 
 .tf-btn {
+  width: 48px;
   padding: 4px 10px;
-  border-radius: 6px;
+  border-radius: 999px;
   border: 1px solid var(--border);
   background: #0f1726;
   color: var(--muted);
   cursor: pointer;
   font-size: 12px;
+  line-height: 1.2;
 }
 
 .tf-btn.active {

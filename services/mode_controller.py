@@ -2215,8 +2215,28 @@ class ModeController:
 
     def _next_client_order_id_locked(self, trade_id: int, action: str) -> str:
         prefix = str(self._status.config.client_order_id_prefix or "tb").strip() or "tb"
-        run_part = str(self._status.run_id or "run").replace(":", "-")
-        return f"{prefix}-{action}-{trade_id}-{run_part}"[:48]
+        allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-.")
+
+        def clean_token(value: object, fallback: str, max_len: int) -> str:
+            token = "".join(
+                ch if ch in allowed else "-"
+                for ch in str(value or "").strip()
+            ).strip("-_.")
+            return (token or fallback)[:max_len].strip("-_.") or fallback
+
+        prefix_part = clean_token(prefix, "tb", 12)
+        if prefix_part.lower().startswith("t-"):
+            prefix_part = prefix_part[2:] or "tb"
+        action_part = clean_token(str(action or "order").lower(), "o", 1)
+        run_part = clean_token(str(self._status.run_id or "run").split("-")[-1], "run", 8)
+        trade_part = clean_token(int(trade_id or 0), "0", 6)
+
+        # Gate.io/CCXT rejects text/clientOrderId values over 28 chars.
+        # It also requires user-supplied IDs to start with the literal "t-".
+        # Keep all exchange client IDs compact so demo/live submissions do
+        # not fail before reaching the exchange.
+        client_order_id = f"t-{prefix_part}-{action_part}{trade_part}-{run_part}"
+        return client_order_id[:28].strip("-_.") or "t-tb-o0"
 
     async def _submit_exchange_order_locked(
         self,
@@ -2361,8 +2381,13 @@ class ModeController:
 
     def _resolve_entry_qty_locked(self, price: float) -> float:
         sized_qty = self._compute_entry_qty_locked(price)
-        if sized_qty is None:
+        sizing_mode = self._risk_engine._normalize_mode(
+            self._status.config.position_sizing_mode
+        )
+        if sized_qty is None and sizing_mode == "all_in":
             sized_qty = self._calculate_order_qty(price)
+        elif sized_qty is None:
+            return 0.0
         sized_qty = float(sized_qty or 0.0)
         if not math.isfinite(sized_qty) or sized_qty <= 0.0:
             return 0.0
@@ -2880,6 +2905,15 @@ class ModeController:
             max_qty=self._status.config.max_qty,
             sizing_mode=self._status.config.position_sizing_mode,
             sizing_value=self._status.config.position_size_value,
+            current_equity=self._current_equity_locked(entry_price),
+            stop_loss_pct=self._status.config.stop_loss_pct,
+            exit_mode=self._status.config.exit_mode,
+            atr_value=self._latest_atr_value_locked(),
+            atr_stop_mult=self._status.config.atr_stop_mult,
+            enable_volatility_scaling=self._status.config.enable_volatility_scaling,
+            volatility_target_pct=self._status.config.volatility_target_pct,
+            min_volatility_scale=self._status.config.min_volatility_scale,
+            max_volatility_scale=self._status.config.max_volatility_scale,
         )
 
     def _check_entry_gate_locked(self, market_price: float | None = None, now_ts: object | None = None) -> dict:

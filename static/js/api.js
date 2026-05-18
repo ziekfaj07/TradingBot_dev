@@ -39,6 +39,7 @@ window.state = {
   lastAutoFitAt: 0,
   selectedMarker: null,
   markerClusterWindowSec: 45,
+  strategyDefaultParams: null,
 };
 
 window.fmtNum = function fmtNum(v, digits = 4) {
@@ -141,6 +142,10 @@ window.api = {
     return await this.request("/api/run/metrics");
   },  
 
+  async getStrategies() {
+    return await this.request("/api/strategies");
+  },
+
   async setMode(mode) {
     return await this.request("/api/run/mode", {
       method: "POST",
@@ -176,6 +181,10 @@ window.api = {
 
   async getFills(limit = 25, offset = 0) {
     return await this.request(`/api/run/paper/fills?limit=${limit}&offset=${offset}`);
+  },
+
+  async getTrace(limit = 50, offset = 0) {
+    return await this.request(`/api/run/paper/dev/trace?limit=${limit}&offset=${offset}`);
   },
 
   async getChart(limit = 300) {

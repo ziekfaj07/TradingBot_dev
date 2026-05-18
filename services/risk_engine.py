@@ -443,7 +443,11 @@ class RiskEngine:
         budget *= vol_scale
         telemetry["budget_after_vol_scale"] = budget
 
-        budget_cap = cash if mt == "spot" else equity
+        # For explicit sizing modes, the configured budget is intended to be
+        # target trade notional, not leveraged margin budget. Leverage should
+        # cap affordability on derivatives, but must not multiply a fixed
+        # position size into a larger order.
+        budget_cap = cash if mt == "spot" else cash * lev
         if budget > budget_cap:
             telemetry["clamps"].append("budget_cap")
         budget = max(0.0, min(budget, budget_cap))
@@ -457,7 +461,7 @@ class RiskEngine:
             notional_after_fee = max(0.0, budget * (1.0 - fee_rate_safe))
             qty = notional_after_fee / px
         else:
-            notional = budget * lev
+            notional = budget
             fee = notional * fee_rate_safe
             if fee >= cash:
                 telemetry["computed_qty_before_clamps"] = 0.0
@@ -889,4 +893,3 @@ class RiskEngine:
                 )
 
         return ExitSignal(should_exit=False)
-

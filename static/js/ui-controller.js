@@ -1,3 +1,20 @@
+const FALLBACK_STRATEGY_DEFAULT_PARAMS = Object.freeze({
+  ema_crossover: { short: 9, long: 21 },
+  donchian_breakout: { lookback: 20 },
+  three_candle_reversal: {
+    min_body_ratio: 0.55,
+    require_full_range_engulf: true,
+    confirm_break_prev_extreme: true,
+  },
+  bollinger_mean_reversion: {
+    length: 20,
+    std_dev: 2.0,
+    min_band_width_pct: 0.01,
+    exit_on_mid: true,
+    allow_short: false,
+  },
+});
+
 window.uiController = {
   setActionMessage(text, klass = "") {
     const el = qs("actionMessage");
@@ -30,6 +47,47 @@ window.uiController = {
     api.setStoredApiKey("");
     if (input) input.value = "";
     this.setActionMessage("API key cleared from this browser.", "warn");
+  },
+
+  cloneJson(value) {
+    return JSON.parse(JSON.stringify(value || {}));
+  },
+
+  strategyDefaults(strategyName) {
+    const key = String(strategyName || "ema_crossover").trim().toLowerCase();
+    const defaults = state.strategyDefaultParams || FALLBACK_STRATEGY_DEFAULT_PARAMS;
+    return this.cloneJson(defaults[key] || FALLBACK_STRATEGY_DEFAULT_PARAMS[key] || {});
+  },
+
+  syncStrategyParamsForSelection(force = false) {
+    const strategyEl = qs("strategy_name");
+    const paramsEl = qs("strategy_params_json");
+    if (!strategyEl || !paramsEl) return;
+
+    if (!force && String(paramsEl.value || "").trim()) return;
+
+    paramsEl.value = JSON.stringify(this.strategyDefaults(strategyEl.value), null, 2);
+  },
+
+  async loadStrategyCatalog() {
+    state.strategyDefaultParams = this.cloneJson(FALLBACK_STRATEGY_DEFAULT_PARAMS);
+
+    try {
+      const catalog = await api.getStrategies();
+      const defaults = this.cloneJson(FALLBACK_STRATEGY_DEFAULT_PARAMS);
+
+      for (const item of catalog?.strategies || []) {
+        const name = String(item?.name || "").trim().toLowerCase();
+        if (!name) continue;
+        defaults[name] = this.cloneJson(item?.default_params || {});
+      }
+
+      state.strategyDefaultParams = defaults;
+    } catch (err) {
+      console.warn("Strategy catalog load skipped; using fallback defaults:", err);
+    }
+
+    this.syncStrategyParamsForSelection(false);
   },
 
   async syncExchangePrecision() {
@@ -82,13 +140,33 @@ window.uiController = {
       "include_equity",
       "equity_stride",
       "poll_seconds",
-      "ema_short",
-      "ema_long",
+      "strategy_name",
       "candle_limit",
       "exchange_name",
       "exchange_settle_currency",
       "enable_live_trading",
       "live_dry_run",
+      "sync_positions_on_start",
+      "cancel_open_orders_on_stop",
+      "live_poll_seconds",
+      "max_drawdown_pct",
+      "max_trades_per_day",
+      "cooldown_seconds",
+      "stop_loss_pct",
+      "take_profit_pct",
+      "exit_on_signal",
+      "exit_mode",
+      "atr_period",
+      "atr_stop_mult",
+      "atr_take_mult",
+      "atr_reference_mode",
+      "enable_volatility_scaling",
+      "volatility_target_pct",
+      "min_volatility_scale",
+      "max_volatility_scale",
+      "margin_mode",
+      "enable_liquidation",
+      "maintenance_margin_override",
     ];
 
     for (const key of fields) {
@@ -101,11 +179,62 @@ window.uiController = {
       }
     }
 
+    if (qs("strategy_params_json")) {
+      const configuredParams = cfg.strategy_params || {};
+      const hasConfiguredParams =
+        typeof configuredParams === "object" &&
+        !Array.isArray(configuredParams) &&
+        Object.keys(configuredParams).length > 0;
+      qs("strategy_params_json").value = JSON.stringify(
+        hasConfiguredParams
+          ? configuredParams
+          : this.strategyDefaults(cfg.strategy_name || qs("strategy_name")?.value),
+        null,
+        2
+      );
+    }
+
     this.syncModeDerivedFields();
   },
 
   readConfigForm() {
     const selectedMode = qs("mode").value;
+    const numOrNull = (id) => {
+      const el = qs(id);
+      if (!el || el.value === "") return null;
+      const n = Number(el.value);
+      return Number.isFinite(n) ? n : null;
+    };
+    const intOrNull = (id) => {
+      const n = numOrNull(id);
+      return n === null ? null : Math.trunc(n);
+    };
+    const boolValue = (id, fallback = false) => {
+      const el = qs(id);
+      if (!el) return fallback;
+      return el.value === "true";
+    };
+    const strategyName = qs("strategy_name")?.value || "ema_crossover";
+    let strategyParams = null;
+    const rawStrategyParams = String(qs("strategy_params_json")?.value || "").trim();
+    if (rawStrategyParams) {
+      try {
+        strategyParams = JSON.parse(rawStrategyParams);
+      } catch (err) {
+        throw new Error(`Strategy Params JSON is invalid: ${err.message}`);
+      }
+    } else {
+      strategyParams = this.strategyDefaults(strategyName);
+    }
+
+    if (
+      !strategyParams ||
+      typeof strategyParams !== "object" ||
+      Array.isArray(strategyParams)
+    ) {
+      throw new Error("Strategy Params JSON must be an object.");
+    }
+
     const payload = {
       symbol: qs("symbol").value,
       interval: qs("interval").value,
@@ -130,15 +259,44 @@ window.uiController = {
       equity_stride: Number(qs("equity_stride").value),
       poll_seconds: Number(qs("poll_seconds").value),
 
-      ema_short: Number(qs("ema_short").value),
-      ema_long: Number(qs("ema_long").value),
+      strategy_name: strategyName,
+      strategy_params: strategyParams,
       candle_limit: Number(qs("candle_limit").value),
+
+      enable_volatility_scaling: boolValue("enable_volatility_scaling"),
+      volatility_target_pct: numOrNull("volatility_target_pct"),
+      min_volatility_scale: numOrNull("min_volatility_scale"),
+      max_volatility_scale: numOrNull("max_volatility_scale"),
+      max_drawdown_pct: numOrNull("max_drawdown_pct"),
+      max_trades_per_day: intOrNull("max_trades_per_day"),
+      cooldown_seconds: intOrNull("cooldown_seconds") ?? 0,
+      stop_loss_pct: numOrNull("stop_loss_pct"),
+      take_profit_pct: numOrNull("take_profit_pct"),
+      exit_on_signal: boolValue("exit_on_signal", true),
+      exit_mode: qs("exit_mode")?.value || "static",
+      atr_period: intOrNull("atr_period") ?? 14,
+      atr_stop_mult: numOrNull("atr_stop_mult"),
+      atr_take_mult: numOrNull("atr_take_mult"),
+      atr_reference_mode: qs("atr_reference_mode")?.value || "entry",
+      margin_mode: qs("margin_mode")?.value || "cross",
+      enable_liquidation: boolValue("enable_liquidation", true),
+      maintenance_margin_override: numOrNull("maintenance_margin_override"),
 
       exchange_name: qs("exchange_name").value,
       exchange_settle_currency: qs("exchange_settle_currency").value,
       enable_live_trading: qs("enable_live_trading").value === "true",
       live_dry_run: qs("live_dry_run").value === "true",
+      sync_positions_on_start: boolValue("sync_positions_on_start", true),
+      cancel_open_orders_on_stop: boolValue("cancel_open_orders_on_stop", false),
+      live_poll_seconds: numOrNull("live_poll_seconds") ?? 3,
     };
+
+    if (strategyName === "ema_crossover") {
+      const emaShort = Number(strategyParams.short);
+      const emaLong = Number(strategyParams.long);
+      if (Number.isFinite(emaShort)) payload.ema_short = emaShort;
+      if (Number.isFinite(emaLong)) payload.ema_long = emaLong;
+    }
 
     if (selectedMode === "demo") {
       payload.exchange_testnet = true;
@@ -436,6 +594,69 @@ window.uiController = {
     }
   },
 
+  renderBacktestResult(result) {
+    const el = qs("backtestResult");
+    if (!el) return;
+
+    if (!result) {
+      el.textContent = "No backtest result yet.";
+      return;
+    }
+
+    const metrics = result?.result?.metrics || {};
+    const summary = {
+      final_equity: result?.result?.final_equity,
+      liquidated: result?.result?.liquidated,
+      trades: Array.isArray(result?.result?.trades) ? result.result.trades.length : 0,
+      equity_points: Array.isArray(result?.result?.equity_curve) ? result.result.equity_curve.length : 0,
+      metrics,
+    };
+    el.textContent = JSON.stringify(summary, null, 2);
+  },
+
+  async validateExchangeSettings() {
+    try {
+      const selectedMode = qs("mode").value;
+      const payload = this.readConfigForm();
+      const check = {
+        exchange_name: payload.exchange_name || "gateio",
+        market_type: payload.market_type || "spot",
+        symbol: payload.symbol || "BTCUSDT",
+        enable_live_trading: Boolean(payload.enable_live_trading),
+        dry_run_live: selectedMode === "demo" ? false : payload.live_dry_run !== false,
+        testnet: selectedMode === "demo" || Boolean(payload.exchange_testnet),
+        base_url: payload.exchange_base_url || null,
+        api_key_env: payload.exchange_api_key_env || "GATEIO_API_KEY",
+        api_secret_env: payload.exchange_api_secret_env || "GATEIO_API_SECRET",
+        api_passphrase_env: payload.exchange_api_passphrase_env || "GATEIO_API_PASSPHRASE",
+      };
+      const result = await api.validateExchangeConfig(check);
+      const ok = Boolean(result?.ok);
+      this.setActionMessage(
+        ok
+          ? `Exchange config valid (${result.credential_profile || "profile"} / ${result.mode_hint || selectedMode}).`
+          : `Exchange config invalid: ${(result.errors || []).join("; ")}`,
+        ok ? "good" : "bad"
+      );
+      await this.loadTrace();
+    } catch (err) {
+      console.error(err);
+      this.setActionMessage(`Exchange validation failed: ${err.message}`, "bad");
+    }
+  },
+
+  async loadTrace() {
+    const el = qs("traceOutput");
+    if (!el) return;
+    try {
+      const trace = await api.getTrace(50, 0);
+      el.textContent = JSON.stringify(trace, null, 2);
+    } catch (err) {
+      console.error(err);
+      el.textContent = `Trace load failed: ${err.message}`;
+    }
+  },
+
   async loadStatus() {
     try {
       const data = await api.getStatus();
@@ -468,6 +689,7 @@ window.uiController = {
       }
 
       await fillsModule.load();
+      await this.loadTrace();
       await chartModule.loadBootstrap(true);
     } catch (err) {
       console.error(err);
@@ -572,6 +794,10 @@ window.uiController = {
       modeEl.addEventListener("change", () => this.syncModeDerivedFields());
     }
 
+    qs("strategy_name")?.addEventListener("change", () => {
+      this.syncStrategyParamsForSelection(true);
+    });
+
     this.syncModeDerivedFields();
 
     qs("stopBtn")?.addEventListener("click", () => this.stopBot());
@@ -628,6 +854,7 @@ window.uiController = {
   async init() {
     this.bindEvents();
     window.addEventListener("resize", () => this.handleResize());
+    await this.loadStrategyCatalog();
     await this.loadStatus();
     this.connectWebSocket();
   },

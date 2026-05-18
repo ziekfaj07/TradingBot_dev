@@ -39,6 +39,12 @@ data/
 .db
 *.db
 
-# # codex
-# .codex/
-# AGENTS.md
+# codex
+.codex/
+AGENTS.md
+
+# certificates
+.tmp/
+.certifi/
+*.pem
+*.crt

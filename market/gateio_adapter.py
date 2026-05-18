@@ -6,7 +6,7 @@ from typing import Any
 import ccxt
 
 from core.interfaces import ExchangeCredentials
-from core.market_types import normalize_market_type, to_exchange_market_type
+from core.market_types import is_derivatives_market, normalize_market_type, to_exchange_market_type
 from market.exceptions import (
     ExchangeAuthError,
     ExchangeConfigurationError,
@@ -94,20 +94,32 @@ class GateIOAdapter:
             }
         return str(base_url or "").strip().rstrip("/")
 
-    @staticmethod
-    def normalize_symbol(symbol: str) -> str:
-        raw = str(symbol or "").strip().upper().replace("/", "").replace("-", "")
+    def normalize_symbol(self, symbol: str) -> str:
+        raw_input = str(symbol or "").strip().upper()
+        if "/" in raw_input and ":" in raw_input:
+            return raw_input
+
+        raw = raw_input.replace("/", "").replace("-", "").replace("_", "")
         if not raw:
             raise ExchangeConfigurationError("Symbol is required.")
         if raw.endswith("USDT"):
-            return f"{raw[:-4]}/USDT"
-        if raw.endswith("USD"):
-            return f"{raw[:-3]}/USD"
-        if "/" in str(symbol):
-            return str(symbol).strip().upper()
-        raise ExchangeConfigurationError(
-            f"Unsupported Gate.io symbol format: {symbol!r}. Expected like BTCUSDT or BTC/USDT."
-        )
+            base = raw[:-4]
+            quote = "USDT"
+        elif raw.endswith("USD"):
+            base = raw[:-3]
+            quote = "USD"
+        elif "/" in raw_input:
+            base, quote = raw_input.split("/", 1)
+            quote = quote.split(":", 1)[0]
+        else:
+            raise ExchangeConfigurationError(
+                f"Unsupported Gate.io symbol format: {symbol!r}. Expected like BTCUSDT or BTC/USDT."
+            )
+
+        pair = f"{base}/{quote}"
+        if is_derivatives_market(self.public_market_type) and quote in {"USDT", "USD", "USDC"}:
+            return f"{pair}:{quote}"
+        return pair
 
     def _require_credentials(self) -> None:
         if not self.credentials.api_key or not self.credentials.api_secret:
@@ -247,18 +259,36 @@ class GateIOAdapter:
     ) -> dict[str, Any]:
         self._require_credentials()
         normalized_symbol = self.normalize_symbol(symbol)
+        normalized_margin_mode = str(margin_mode or "").strip().lower()
+        if not normalized_margin_mode:
+            normalized_margin_mode = "cross"
+
+        if getattr(self.client, "has", {}).get("setMarginMode") is False:
+            if normalized_margin_mode in {"cross", "cross_margin"}:
+                return {
+                    "symbol": normalized_symbol,
+                    "margin_mode": "cross",
+                    "source": "set_margin_mode_skipped",
+                    "skipped": True,
+                    "reason": "gateio_ccxt_set_margin_mode_unsupported",
+                }
+            raise ExchangeConfigurationError(
+                "Gate.io setMarginMode() is not supported by the current CCXT adapter. "
+                "Use margin_mode='cross' or configure isolated margin directly on the exchange before starting."
+            )
+
         params: dict[str, Any] = {}
         if leverage is not None:
             params["leverage"] = float(leverage)
         try:
-            result = self.client.set_margin_mode(str(margin_mode).lower(), normalized_symbol, params)
+            result = self.client.set_margin_mode(normalized_margin_mode, normalized_symbol, params)
         except ccxt.AuthenticationError as exc:
             raise ExchangeAuthError(str(exc)) from exc
         except Exception as exc:
             raise ExchangeConnectionError(str(exc)) from exc
         payload = dict(result or {})
         payload.setdefault("symbol", normalized_symbol)
-        payload.setdefault("margin_mode", str(margin_mode).lower())
+        payload.setdefault("margin_mode", normalized_margin_mode)
         payload.setdefault("source", "set_margin_mode")
         return payload
 
@@ -316,6 +346,48 @@ class GateIOAdapter:
             raise ExchangeAuthError(str(exc)) from exc
         except Exception as exc:
             raise ExchangeConnectionError(str(exc)) from exc
+
+    def fetch_order(
+        self,
+        *,
+        order_id: str,
+        symbol: str,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self._require_credentials()
+        normalized_symbol = self.normalize_symbol(symbol)
+        try:
+            return self.client.fetch_order(str(order_id), normalized_symbol, params or {})
+        except ccxt.AuthenticationError as exc:
+            raise ExchangeAuthError(str(exc)) from exc
+        except Exception as exc:
+            raise ExchangeConnectionError(str(exc)) from exc
+
+    def contract_size_for_symbol(self, symbol: str) -> float | None:
+        normalized_symbol = self.normalize_symbol(symbol)
+        try:
+            markets = self.client.load_markets()
+            market = markets.get(normalized_symbol)
+            if not market:
+                return None
+            for candidate in (
+                market.get("contractSize"),
+                market.get("contract_size"),
+                (market.get("info") or {}).get("quanto_multiplier")
+                if isinstance(market.get("info"), dict)
+                else None,
+                (market.get("info") or {}).get("contract_size")
+                if isinstance(market.get("info"), dict)
+                else None,
+            ):
+                if candidate is None or candidate == "":
+                    continue
+                value = float(candidate)
+                if value > 0.0:
+                    return value
+        except Exception:
+            return None
+        return None
 
     def create_order(
         self,
