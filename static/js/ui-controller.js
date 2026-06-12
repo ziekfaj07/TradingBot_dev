@@ -500,6 +500,8 @@ window.uiController = {
         if (response?.status) {
           this.renderStatus(response.status);
         }
+        this.renderBacktestResult(response);
+        this.renderPerformanceMetrics(response?.result?.metrics || null, "backtest", response?.result || {});
         chartModule.reset();
         qs("fillsTableBody").innerHTML = "";
         this.setActionMessage(
@@ -584,6 +586,7 @@ window.uiController = {
       this.renderStatus(data);
       equityModule.clear();
       chartModule.reset();
+      this.resetPerformanceMetricsView();
       await fillsModule.load();
       await this.syncExchangePrecision();
       await chartModule.loadBootstrap(true);
@@ -612,6 +615,164 @@ window.uiController = {
       metrics,
     };
     el.textContent = JSON.stringify(summary, null, 2);
+  },
+
+  performanceMetricBindings() {
+    return [
+      ["metricInitialBalance", "initial_balance", 2],
+      ["metricLatestEquity", "latest_equity", 2],
+      ["metricNetPnl", "net_pnl", 2],
+      ["metricReturnPct", "return_pct", 2, "%"],
+      ["metricMaxDrawdownPct", "max_drawdown_pct", 2, "%"],
+      ["metricClosedTrades", "closed_trades", 0],
+      ["metricWinRatePct", "win_rate_pct", 2, "%"],
+      ["metricProfitFactor", "profit_factor", 3],
+      ["metricGrossProfit", "gross_profit", 2],
+      ["metricGrossLoss", "gross_loss", 2],
+      ["metricAvgTradePnl", "avg_trade_pnl", 2],
+      ["metricEquityPoints", "equity_points", 0],
+    ];
+  },
+
+  firstMetricValue(metrics, keys) {
+    for (const key of keys) {
+      const value = metrics?.[key];
+      if (value !== undefined && value !== null && value !== "") return value;
+    }
+    return null;
+  },
+
+  normalizePerformanceMetrics(metrics, context = {}) {
+    const raw = metrics && typeof metrics === "object" ? metrics : {};
+    const trades = raw.trades && typeof raw.trades === "object" ? raw.trades : {};
+    const equity = raw.equity && typeof raw.equity === "object" ? raw.equity : {};
+    const cfg = state.latestStatus?.config || {};
+
+    const initialBalance = this.firstMetricValue(
+      { ...raw, ...equity, ...context, cfg_initial_balance: cfg.initial_balance },
+      ["initial_balance", "starting_balance", "start_equity", "first_equity", "cfg_initial_balance"]
+    );
+    const latestEquity = this.firstMetricValue(
+      { ...raw, ...equity, ...context },
+      ["latest_equity", "final_equity", "final_balance", "last_equity"]
+    );
+    const closedTrades = this.firstMetricValue(
+      { ...raw, ...trades },
+      ["closed_trades", "total_trades", "closed_trade_count"]
+    );
+    const netPnl = this.firstMetricValue(
+      { ...raw, ...trades },
+      ["net_pnl", "net_profit", "net_closed_pnl", "gross_pnl", "pnl"]
+    );
+    const returnPct = this.firstMetricValue(
+      { ...raw, ...equity },
+      ["return_pct", "total_return_percent", "return_percent"]
+    );
+    const maxDrawdownPct = this.firstMetricValue(
+      { ...raw, ...equity },
+      ["max_drawdown_pct", "max_drawdown_percent"]
+    );
+    const grossProfit = this.firstMetricValue(
+      { ...raw, ...trades },
+      ["gross_profit", "gross_wins", "winning_pnl"]
+    );
+    const grossLoss = this.firstMetricValue(
+      { ...raw, ...trades },
+      ["gross_loss", "gross_losses_abs", "losing_pnl"]
+    );
+
+    const initialNumber = Number(initialBalance);
+    const latestNumber = Number(latestEquity);
+    const netNumber = Number(netPnl);
+    const closedNumber = Number(closedTrades);
+
+    return {
+      initial_balance: initialBalance,
+      latest_equity: latestEquity,
+      net_pnl: netPnl ?? (
+        Number.isFinite(initialNumber) && Number.isFinite(latestNumber)
+          ? latestNumber - initialNumber
+          : null
+      ),
+      return_pct: returnPct ?? (
+        Number.isFinite(initialNumber) && initialNumber > 0 && Number.isFinite(latestNumber)
+          ? ((latestNumber - initialNumber) / initialNumber) * 100
+          : null
+      ),
+      max_drawdown_pct: maxDrawdownPct,
+      closed_trades: closedTrades,
+      wins: this.firstMetricValue({ ...raw, ...trades }, ["wins", "winning_trades", "winning_trade_count"]),
+      losses: this.firstMetricValue({ ...raw, ...trades }, ["losses", "losing_trades", "losing_trade_count"]),
+      breakeven: this.firstMetricValue({ ...raw, ...trades }, ["breakeven", "breakeven_trade_count"]),
+      win_rate_pct: this.firstMetricValue({ ...raw, ...trades }, ["win_rate_pct", "win_rate_percent", "win_rate"]),
+      gross_profit: grossProfit,
+      gross_loss: grossLoss,
+      profit_factor: this.firstMetricValue({ ...raw, ...trades }, ["profit_factor"]),
+      avg_trade_pnl: this.firstMetricValue({ ...raw, ...trades }, ["avg_trade_pnl", "avg_closed_pnl"]) ?? (
+        Number.isFinite(netNumber) && Number.isFinite(closedNumber) && closedNumber > 0
+          ? netNumber / closedNumber
+          : null
+      ),
+      equity_points: this.firstMetricValue(
+        { ...raw, ...equity, context_equity_points: Array.isArray(context.equity_curve) ? context.equity_curve.length : null },
+        ["equity_points", "point_count", "context_equity_points"]
+      ),
+    };
+  },
+
+  metricValue(metrics, key, digits = 2, suffix = "") {
+    if (!metrics || metrics[key] === undefined || metrics[key] === null) return "-";
+    return `${fmtNum(metrics[key], digits)}${suffix}`;
+  },
+
+  renderPerformanceMetrics(metrics, source = "runtime", context = {}) {
+    const statusEl = qs("performanceMetricsStatus");
+    const clean = metrics && typeof metrics === "object"
+      ? this.normalizePerformanceMetrics(metrics, context)
+      : null;
+
+    for (const [id, key, digits, suffix] of this.performanceMetricBindings()) {
+      const el = qs(id);
+      if (!el) continue;
+
+      el.textContent = this.metricValue(clean, key, digits, suffix || "");
+      el.classList.remove("good", "bad", "warn");
+
+      if (key === "net_pnl" || key === "return_pct") {
+        const value = Number(clean?.[key]);
+        if (Number.isFinite(value) && value > 0) el.classList.add("good");
+        if (Number.isFinite(value) && value < 0) el.classList.add("bad");
+      }
+    }
+
+    if (statusEl) {
+      statusEl.textContent = clean
+        ? `Loaded ${source} performance metrics.`
+        : "No performance metrics loaded.";
+    }
+  },
+
+  resetPerformanceMetricsView() {
+    this.renderPerformanceMetrics(null);
+    const statusEl = qs("performanceMetricsStatus");
+    if (statusEl) {
+      statusEl.textContent = "Performance metrics view reset locally.";
+    }
+  },
+
+  async loadPerformanceMetrics() {
+    try {
+      const metrics = await api.getMetrics();
+      this.renderPerformanceMetrics(metrics?.runtime?.paper_metrics || null, metrics?.mode || "runtime");
+      return metrics;
+    } catch (err) {
+      console.error(err);
+      const statusEl = qs("performanceMetricsStatus");
+      if (statusEl) {
+        statusEl.textContent = `Metrics load failed: ${err.message}`;
+      }
+      return null;
+    }
   },
 
   async validateExchangeSettings() {
@@ -680,6 +841,7 @@ window.uiController = {
 
       try {
         const metrics = await api.getMetrics();
+        this.renderPerformanceMetrics(metrics?.runtime?.paper_metrics || null, metrics?.mode || "runtime");
         if (metrics?.runtime) {
           data.runtime = { ...(data.runtime || {}), ...metrics.runtime };
           this.renderStatus(data);
@@ -805,6 +967,8 @@ window.uiController = {
     qs("showFillsBtn")?.addEventListener("click", () => fillsModule.load());
     qs("resetPaperBtn")?.addEventListener("click", () => this.resetPaper());
     qs("exportCsvBtn")?.addEventListener("click", () => api.exportCsv());
+    qs("refreshMetricsBtn")?.addEventListener("click", () => this.loadPerformanceMetrics());
+    qs("resetMetricsViewBtn")?.addEventListener("click", () => this.resetPerformanceMetricsView());
 
     qs("autoFollowToggle")?.addEventListener("click", () => {
       state.autoFollow = !state.autoFollow;

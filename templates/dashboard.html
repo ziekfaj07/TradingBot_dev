@@ -397,6 +397,34 @@
     </section>
 
     <section class="card mt-16">
+      <div class="row-inline row-between">
+        <h2>Performance Metrics</h2>
+        <div class="row-inline">
+          <button id="refreshMetricsBtn" class="btn small" type="button">Refresh Metrics</button>
+          <button id="resetMetricsViewBtn" class="btn small" type="button">Reset Metrics View</button>
+        </div>
+      </div>
+      <div id="performanceMetricsStatus" class="muted mb-10">No performance metrics loaded.</div>
+      <div class="status-grid">
+        <div class="stat"><div class="stat-label">Initial Balance</div><div id="metricInitialBalance" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Latest Equity</div><div id="metricLatestEquity" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Net PnL</div><div id="metricNetPnl" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Return %</div><div id="metricReturnPct" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Max Drawdown %</div><div id="metricMaxDrawdownPct" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Closed Trades</div><div id="metricClosedTrades" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Win Rate %</div><div id="metricWinRatePct" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Profit Factor</div><div id="metricProfitFactor" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Gross Profit</div><div id="metricGrossProfit" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Gross Loss</div><div id="metricGrossLoss" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Avg Trade PnL</div><div id="metricAvgTradePnl" class="stat-value">-</div></div>
+        <div class="stat"><div class="stat-label">Equity Points</div><div id="metricEquityPoints" class="stat-value">-</div></div>
+      </div>
+      <div class="muted mt-10">
+        Reset Metrics View clears only this local dashboard panel; it does not delete fills, equity history, or live runtime state.
+      </div>
+    </section>
+
+    <section class="card mt-16">
       <h2>Backtest Result</h2>
       <pre id="backtestResult" class="pre-panel">No backtest result yet.</pre>
     </section>

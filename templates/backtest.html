@@ -86,6 +86,54 @@
       max-height: 360px;
     }
 
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
+      font-size: 13px;
+    }
+
+    th,
+    td {
+      text-align: left;
+      padding: 8px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+
+    .metrics-grid {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    }
+
+    .metric-card {
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+    }
+
+    .metric-label {
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 6px;
+    }
+
+    .metric-value {
+      font-size: 16px;
+      font-weight: 700;
+      word-break: break-word;
+    }
+
+    .good {
+      color: #2ecc71;
+    }
+
+    .bad {
+      color: #ff6b6b;
+    }
+
     .row {
       display: flex;
       gap: 12px;
@@ -247,12 +295,58 @@
     </div>
 
     <div class="card">
+      <div class="row" style="justify-content: space-between;">
+        <h3>Performance Metrics</h3>
+        <button id="resetMetricsBtn" type="button">Reset Metrics View</button>
+      </div>
+      <div id="metricsStatus" class="muted" style="margin-bottom: 10px;">No performance metrics loaded.</div>
+      <div class="metrics-grid">
+        <div class="metric-card"><div class="metric-label">Initial Balance</div><div id="metricInitialBalance" class="metric-value">-</div></div>
+        <div class="metric-card"><div class="metric-label">Latest Equity</div><div id="metricLatestEquity" class="metric-value">-</div></div>
+        <div class="metric-card"><div class="metric-label">Net PnL</div><div id="metricNetPnl" class="metric-value">-</div></div>
+        <div class="metric-card"><div class="metric-label">Return %</div><div id="metricReturnPct" class="metric-value">-</div></div>
+        <div class="metric-card"><div class="metric-label">Max Drawdown %</div><div id="metricMaxDrawdownPct" class="metric-value">-</div></div>
+        <div class="metric-card"><div class="metric-label">Closed Trades</div><div id="metricClosedTrades" class="metric-value">-</div></div>
+        <div class="metric-card"><div class="metric-label">Win Rate %</div><div id="metricWinRatePct" class="metric-value">-</div></div>
+        <div class="metric-card"><div class="metric-label">Profit Factor</div><div id="metricProfitFactor" class="metric-value">-</div></div>
+        <div class="metric-card"><div class="metric-label">Gross Profit</div><div id="metricGrossProfit" class="metric-value">-</div></div>
+        <div class="metric-card"><div class="metric-label">Gross Loss</div><div id="metricGrossLoss" class="metric-value">-</div></div>
+        <div class="metric-card"><div class="metric-label">Avg Trade PnL</div><div id="metricAvgTradePnl" class="metric-value">-</div></div>
+        <div class="metric-card"><div class="metric-label">Equity Points</div><div id="metricEquityPoints" class="metric-value">-</div></div>
+      </div>
+      <div class="muted" style="margin-top: 10px;">Reset Metrics View clears only this local result panel.</div>
+    </div>
+
+    <div class="card">
       <h3>Results</h3>
       <pre id="results"></pre>
     </div>
 
     <div class="card">
-      <h3>Trades</h3>
+      <h3>Fills Table</h3>
+      <div class="muted">Backtest simulated fills, newest first.</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Type</th>
+            <th>Side</th>
+            <th>Qty</th>
+            <th>Price</th>
+            <th>Fee</th>
+            <th>PnL</th>
+            <th>Equity After</th>
+            <th>Trade ID</th>
+          </tr>
+        </thead>
+        <tbody id="tradesTableBody">
+          <tr><td colspan="9" class="muted">No simulated fills yet.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h3>Raw Trades JSON</h3>
       <pre id="trades"></pre>
     </div>
   </div>
@@ -261,6 +355,8 @@
     const statusEl = document.getElementById("status");
     const resultsEl = document.getElementById("results");
     const tradesEl = document.getElementById("trades");
+    const tradesTableBody = document.getElementById("tradesTableBody");
+    const metricsStatusEl = document.getElementById("metricsStatus");
 
     const FALLBACK_STRATEGY_DEFAULT_PARAMS = Object.freeze({
       ema_crossover: { short: 9, long: 21 },
@@ -344,6 +440,185 @@
       return params;
     }
 
+    function fmtNum(value, digits = 4) {
+      if (value === null || value === undefined || value === "") return "-";
+      const n = Number(value);
+      if (!Number.isFinite(n)) return String(value);
+      return n.toLocaleString(undefined, { maximumFractionDigits: digits });
+    }
+
+    function fmtTs(value) {
+      if (value === null || value === undefined || value === "") return "-";
+      const n = Number(value);
+      if (Number.isFinite(n)) {
+        const seconds = n > 100000000000 ? Math.floor(n / 1000) : n;
+        return new Date(seconds * 1000).toLocaleString();
+      }
+      return String(value);
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    function metricBindings() {
+      return [
+        ["metricInitialBalance", "initial_balance", 2],
+        ["metricLatestEquity", "latest_equity", 2],
+        ["metricNetPnl", "net_pnl", 2],
+        ["metricReturnPct", "return_pct", 2, "%"],
+        ["metricMaxDrawdownPct", "max_drawdown_pct", 2, "%"],
+        ["metricClosedTrades", "closed_trades", 0],
+        ["metricWinRatePct", "win_rate_pct", 2, "%"],
+        ["metricProfitFactor", "profit_factor", 3],
+        ["metricGrossProfit", "gross_profit", 2],
+        ["metricGrossLoss", "gross_loss", 2],
+        ["metricAvgTradePnl", "avg_trade_pnl", 2],
+        ["metricEquityPoints", "equity_points", 0],
+      ];
+    }
+
+    function firstMetricValue(metrics, keys) {
+      for (const key of keys) {
+        const value = metrics?.[key];
+        if (value !== undefined && value !== null && value !== "") return value;
+      }
+      return null;
+    }
+
+    function normalizeMetrics(metrics, context = {}) {
+      const raw = metrics && typeof metrics === "object" ? metrics : {};
+      const trades = raw.trades && typeof raw.trades === "object" ? raw.trades : {};
+      const equity = raw.equity && typeof raw.equity === "object" ? raw.equity : {};
+      const initialBalance = firstMetricValue(
+        { ...raw, ...equity, ...context, form_initial_balance: Number(document.getElementById("initial_balance").value) },
+        ["initial_balance", "starting_balance", "start_equity", "first_equity", "form_initial_balance"]
+      );
+      const latestEquity = firstMetricValue(
+        { ...raw, ...equity, ...context },
+        ["latest_equity", "final_equity", "final_balance", "last_equity"]
+      );
+      const closedTrades = firstMetricValue(
+        { ...raw, ...trades },
+        ["closed_trades", "total_trades", "closed_trade_count"]
+      );
+      const netPnl = firstMetricValue(
+        { ...raw, ...trades },
+        ["net_pnl", "net_profit", "net_closed_pnl", "gross_pnl", "pnl"]
+      );
+      const initialNumber = Number(initialBalance);
+      const latestNumber = Number(latestEquity);
+      const netNumber = Number(netPnl);
+      const closedNumber = Number(closedTrades);
+
+      return {
+        initial_balance: initialBalance,
+        latest_equity: latestEquity,
+        net_pnl: netPnl ?? (
+          Number.isFinite(initialNumber) && Number.isFinite(latestNumber)
+            ? latestNumber - initialNumber
+            : null
+        ),
+        return_pct: firstMetricValue({ ...raw, ...equity }, ["return_pct", "total_return_percent", "return_percent"]) ?? (
+          Number.isFinite(initialNumber) && initialNumber > 0 && Number.isFinite(latestNumber)
+            ? ((latestNumber - initialNumber) / initialNumber) * 100
+            : null
+        ),
+        max_drawdown_pct: firstMetricValue({ ...raw, ...equity }, ["max_drawdown_pct", "max_drawdown_percent"]),
+        closed_trades: closedTrades,
+        win_rate_pct: firstMetricValue({ ...raw, ...trades }, ["win_rate_pct", "win_rate_percent", "win_rate"]),
+        profit_factor: firstMetricValue({ ...raw, ...trades }, ["profit_factor"]),
+        gross_profit: firstMetricValue({ ...raw, ...trades }, ["gross_profit", "gross_wins", "winning_pnl"]),
+        gross_loss: firstMetricValue({ ...raw, ...trades }, ["gross_loss", "gross_losses_abs", "losing_pnl"]),
+        avg_trade_pnl: firstMetricValue({ ...raw, ...trades }, ["avg_trade_pnl", "avg_closed_pnl"]) ?? (
+          Number.isFinite(netNumber) && Number.isFinite(closedNumber) && closedNumber > 0
+            ? netNumber / closedNumber
+            : null
+        ),
+        equity_points: firstMetricValue(
+          { ...raw, ...equity, context_equity_points: Array.isArray(context.equity_curve) ? context.equity_curve.length : null },
+          ["equity_points", "point_count", "context_equity_points"]
+        ),
+      };
+    }
+
+    function renderMetrics(metrics, context = {}) {
+      const clean = metrics && typeof metrics === "object" ? normalizeMetrics(metrics, context) : null;
+      for (const [id, key, digits, suffix] of metricBindings()) {
+        const el = document.getElementById(id);
+        if (!el) continue;
+        el.textContent = clean && clean[key] !== undefined && clean[key] !== null
+          ? `${fmtNum(clean[key], digits)}${suffix || ""}`
+          : "-";
+        el.classList.remove("good", "bad");
+        if (key === "net_pnl" || key === "return_pct") {
+          const value = Number(clean?.[key]);
+          if (Number.isFinite(value) && value > 0) el.classList.add("good");
+          if (Number.isFinite(value) && value < 0) el.classList.add("bad");
+        }
+      }
+      metricsStatusEl.textContent = clean
+        ? "Loaded backtest performance metrics."
+        : "No performance metrics loaded.";
+    }
+
+    function tradePnlValue(trade) {
+      const candidates = [
+        trade?.pnl,
+        trade?.realized_pnl,
+        trade?.realizedPnl,
+        trade?.realizedPnL,
+        trade?.net_pnl,
+        trade?.netPnl,
+        trade?.profit,
+      ];
+
+      for (const value of candidates) {
+        if (value === undefined || value === null || value === "") continue;
+        const n = Number(value);
+        return Number.isFinite(n) ? n : value;
+      }
+
+      return null;
+    }
+
+    function resetMetricsView() {
+      renderMetrics(null);
+      metricsStatusEl.textContent = "Performance metrics view reset locally.";
+    }
+
+    function renderTradesTable(trades) {
+      const rows = Array.isArray(trades) ? [...trades].reverse() : [];
+      if (!rows.length) {
+        tradesTableBody.innerHTML = `<tr><td colspan="9" class="muted">No simulated fills yet.</td></tr>`;
+        return;
+      }
+
+      tradesTableBody.innerHTML = rows.map((trade) => {
+        const pnlValue = tradePnlValue(trade);
+        const pnl = Number(pnlValue);
+        const pnlClass = Number.isFinite(pnl) && pnl > 0 ? "good" : Number.isFinite(pnl) && pnl < 0 ? "bad" : "";
+        return `
+          <tr>
+            <td>${escapeHtml(fmtTs(trade?.timestamp))}</td>
+            <td>${escapeHtml(trade?.type || "-")}</td>
+            <td>${escapeHtml(trade?.side || "-")}</td>
+            <td>${escapeHtml(fmtNum(trade?.qty))}</td>
+            <td>${escapeHtml(fmtNum(trade?.price))}</td>
+            <td>${escapeHtml(fmtNum(trade?.fee))}</td>
+            <td class="${pnlClass}">${escapeHtml(fmtNum(pnlValue))}</td>
+            <td>${escapeHtml(fmtNum(trade?.equity_after))}</td>
+            <td>${escapeHtml(trade?.trade_id ?? "-")}</td>
+          </tr>
+        `;
+      }).join("");
+    }
+
     function getParams() {
       const strategyName = document.getElementById("strategy_name").value;
       const strategyParams = readStrategyParams();
@@ -379,6 +654,8 @@
       statusEl.textContent = "Running backtest...";
       resultsEl.textContent = "";
       tradesEl.textContent = "";
+      resetMetricsView();
+      renderTradesTable([]);
 
       try {
         const p = getParams();
@@ -396,6 +673,8 @@
         }
 
         statusEl.textContent = "Done";
+        renderMetrics(data.result?.metrics || null, data.result || {});
+        renderTradesTable(data.result?.trades || []);
         resultsEl.textContent = JSON.stringify(data.result ?? data, null, 2);
         tradesEl.textContent = JSON.stringify(data.result?.trades ?? [], null, 2);
       } catch (e) {
@@ -428,6 +707,10 @@
 
     document.getElementById("strategy_name").addEventListener("change", () => {
       syncStrategyParamsForSelection(true);
+    });
+
+    document.getElementById("resetMetricsBtn").addEventListener("click", () => {
+      resetMetricsView();
     });
 
     loadStrategyCatalog();

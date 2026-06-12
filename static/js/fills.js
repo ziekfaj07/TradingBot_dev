@@ -33,13 +33,59 @@ window.fillsModule = {
   },
 
   pnlValue(fill) {
-    if (fill?.pnl !== undefined && fill?.pnl !== null) {
-      return fill.pnl;
+    const meta = this.metaPayload(fill);
+    const candidates = [
+      fill?.pnl,
+      fill?.realized_pnl,
+      fill?.realizedPnl,
+      fill?.realizedPnL,
+      fill?.net_pnl,
+      fill?.netPnl,
+      fill?.profit,
+      fill?.info?.pnl,
+      fill?.info?.realized_pnl,
+      fill?.info?.realizedPnl,
+      fill?.data?.pnl,
+      fill?.data?.realized_pnl,
+      meta?.pnl,
+      meta?.realized_pnl,
+      meta?.realizedPnl,
+      meta?.net_pnl,
+      meta?.profit,
+      meta?.info?.pnl,
+      meta?.info?.realized_pnl,
+      meta?.info?.realizedPnl,
+      meta?.data?.pnl,
+      meta?.data?.realized_pnl,
+    ];
+
+    for (const value of candidates) {
+      if (value === undefined || value === null || value === "") continue;
+      const n = Number(value);
+      return Number.isFinite(n) ? n : value;
     }
-    if (fill?.realized_pnl !== undefined && fill?.realized_pnl !== null) {
-      return fill.realized_pnl;
-    }
+
     return null;
+  },
+
+  metaPayload(fill) {
+    const raw = fill?.meta_json ?? fill?.metadata ?? fill?.meta;
+    if (!raw) return null;
+    if (typeof raw === "object") return raw;
+
+    try {
+      return JSON.parse(String(raw));
+    } catch (_) {
+      return null;
+    }
+  },
+
+  pnlClass(fill) {
+    const value = Number(this.pnlValue(fill));
+    if (!Number.isFinite(value)) return "";
+    if (value > 0) return "good";
+    if (value < 0) return "bad";
+    return "";
   },
 
   rowHtml(fill) {
@@ -51,7 +97,7 @@ window.fillsModule = {
         <td>${fmtNum(fill.qty)}</td>
         <td>${fmtNum(fill.price)}</td>
         <td>${fmtNum(fill.fee)}</td>
-        <td>${fmtNum(this.pnlValue(fill))}</td>
+        <td class="${this.pnlClass(fill)}">${fmtNum(this.pnlValue(fill))}</td>
       </tr>
     `;
   },
