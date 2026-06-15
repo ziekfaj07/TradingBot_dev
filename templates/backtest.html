@@ -149,6 +149,23 @@
       grid-column: 1 / -1;
     }
 
+    .section-heading {
+      grid-column: 1 / -1;
+      border-top: 1px solid var(--border);
+      padding-top: 12px;
+      margin-top: 4px;
+    }
+
+    .section-heading h3 {
+      margin: 0 0 6px 0;
+    }
+
+    .hint {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
     a {
       color: var(--blue);
       text-decoration: none;
@@ -223,6 +240,11 @@
         </div>
 
         <div class="field">
+          <label>Max Leverage</label>
+          <input id="max_leverage" type="number" step="0.1" value="50" />
+        </div>
+
+        <div class="field">
           <label>Allow Short</label>
           <select id="allow_short">
             <option value="false" selected>False</option>
@@ -233,6 +255,11 @@
         <div class="field">
           <label>Max Quantity</label>
           <input id="max_qty" type="number" step="0.0001" value="10" />
+        </div>
+
+        <div class="field">
+          <label>Maintenance Margin</label>
+          <input id="maintenance_margin" type="number" step="0.0001" value="0.005" />
         </div>
 
         <div class="field">
@@ -274,6 +301,167 @@
         <div class="field">
           <label>End</label>
           <input id="end" placeholder="Optional" />
+        </div>
+
+        <div class="section-heading">
+          <h3>Risk, Exits & Runtime Protection</h3>
+          <div class="hint">
+            Recommended defaults are pre-filled for safer backtests: 2% stop, 4% take-profit,
+            20% max drawdown stop, cooldown, trade-frequency cap, liquidation simulation,
+            and full equity sampling. Spot runs are automatically forced to leverage 1,
+            no shorts, and no liquidation simulation.
+          </div>
+        </div>
+
+        <div class="field">
+          <label>Max Drawdown %</label>
+          <input id="max_drawdown_pct" type="number" step="0.01" value="20" />
+        </div>
+
+        <div class="field">
+          <label>Max Trades / Day</label>
+          <input id="max_trades_per_day" type="number" step="1" value="20" />
+        </div>
+
+        <div class="field">
+          <label>Cooldown Seconds</label>
+          <input id="cooldown_seconds" type="number" step="1" value="300" />
+        </div>
+
+        <div class="field">
+          <label>Stop Loss %</label>
+          <input id="stop_loss_pct" type="number" step="0.01" value="2" />
+        </div>
+
+        <div class="field">
+          <label>Take Profit %</label>
+          <input id="take_profit_pct" type="number" step="0.01" value="4" />
+        </div>
+
+        <div class="field">
+          <label>Exit On Opposite Signal</label>
+          <select id="exit_on_signal">
+            <option value="true" selected>True</option>
+            <option value="false">False</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label>Exit Mode</label>
+          <select id="exit_mode">
+            <option value="static" selected>Static %</option>
+            <option value="atr">ATR</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label>ATR Period</label>
+          <input id="atr_period" type="number" step="1" value="14" />
+        </div>
+
+        <div class="field">
+          <label>ATR Stop Mult</label>
+          <input id="atr_stop_mult" type="number" step="0.01" value="1.5" />
+        </div>
+
+        <div class="field">
+          <label>ATR Take Mult</label>
+          <input id="atr_take_mult" type="number" step="0.01" value="2.5" />
+        </div>
+
+        <div class="field">
+          <label>ATR Reference</label>
+          <select id="atr_reference_mode">
+            <option value="entry" selected>Entry</option>
+            <option value="floating">Floating</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label>Volatility Scaling</label>
+          <select id="enable_volatility_scaling">
+            <option value="false" selected>Disabled</option>
+            <option value="true">Enabled</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label>Vol Target %</label>
+          <input id="volatility_target_pct" type="number" step="0.01" value="2" />
+        </div>
+
+        <div class="field">
+          <label>Min Vol Scale</label>
+          <input id="min_volatility_scale" type="number" step="0.01" value="0.5" />
+        </div>
+
+        <div class="field">
+          <label>Max Vol Scale</label>
+          <input id="max_volatility_scale" type="number" step="0.01" value="1.5" />
+        </div>
+
+        <div class="field">
+          <label>Margin Mode</label>
+          <select id="margin_mode">
+            <option value="cross" selected>Cross</option>
+            <option value="isolated">Isolated</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label>Liquidation Simulation</label>
+          <select id="enable_liquidation">
+            <option value="true" selected>Enabled</option>
+            <option value="false">Disabled</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label>Use Mark Price For Liquidation</label>
+          <select id="use_mark_price_for_liquidation">
+            <option value="true" selected>Enabled</option>
+            <option value="false">Disabled</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label>Mark Price Source</label>
+          <select id="mark_price_source">
+            <option value="close" selected>Close</option>
+            <option value="hlc3">HLC3</option>
+            <option value="ohlc4">OHLC4</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label>Liquidation Fee Rate</label>
+          <input id="liquidation_fee_rate" type="number" step="0.0001" value="0.005" />
+        </div>
+
+        <div class="field">
+          <label>Maintenance Override</label>
+          <input id="maintenance_margin_override" type="number" step="0.0001" placeholder="Optional; default uses margin tiers" />
+        </div>
+
+        <div class="field">
+          <label>Include Equity Curve</label>
+          <select id="include_equity">
+            <option value="true" selected>True</option>
+            <option value="false">False</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label>Equity Stride</label>
+          <input id="equity_stride" type="number" step="1" value="1" />
+        </div>
+
+        <div class="field">
+          <label>Risk Telemetry</label>
+          <select id="debug_risk_telemetry">
+            <option value="false" selected>Summary Only</option>
+            <option value="true">Verbose</option>
+          </select>
         </div>
 
         <div class="field wide">
@@ -346,6 +534,24 @@
     </div>
 
     <div class="card">
+      <h3>Risk Events Table</h3>
+      <div class="muted">Backtest risk exits, entry blocks, cooldown/max-drawdown stops, and liquidation events.</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Event</th>
+            <th>Reason</th>
+            <th>Meta</th>
+          </tr>
+        </thead>
+        <tbody id="riskEventsTableBody">
+          <tr><td colspan="4" class="muted">No risk events yet.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
       <h3>Raw Trades JSON</h3>
       <pre id="trades"></pre>
     </div>
@@ -356,6 +562,7 @@
     const resultsEl = document.getElementById("results");
     const tradesEl = document.getElementById("trades");
     const tradesTableBody = document.getElementById("tradesTableBody");
+    const riskEventsTableBody = document.getElementById("riskEventsTableBody");
     const metricsStatusEl = document.getElementById("metricsStatus");
 
     const FALLBACK_STRATEGY_DEFAULT_PARAMS = Object.freeze({
@@ -619,19 +826,59 @@
       }).join("");
     }
 
+    function renderRiskEventsTable(events) {
+      const rows = Array.isArray(events) ? [...events].reverse() : [];
+      if (!rows.length) {
+        riskEventsTableBody.innerHTML = `<tr><td colspan="4" class="muted">No risk events yet.</td></tr>`;
+        return;
+      }
+
+      riskEventsTableBody.innerHTML = rows.map((event) => `
+        <tr>
+          <td>${escapeHtml(fmtTs(event?.timestamp))}</td>
+          <td>${escapeHtml(event?.event || "-")}</td>
+          <td>${escapeHtml(event?.reason || "-")}</td>
+          <td><pre style="max-height: 120px; margin: 0;">${escapeHtml(JSON.stringify(event?.meta || {}, null, 2))}</pre></td>
+        </tr>
+      `).join("");
+    }
+
+    function numOrNull(id) {
+      const raw = String(document.getElementById(id)?.value ?? "").trim();
+      if (!raw) return null;
+      const n = Number(raw);
+      return Number.isFinite(n) ? n : null;
+    }
+
+    function intOrNull(id) {
+      const n = numOrNull(id);
+      return n === null ? null : Math.trunc(n);
+    }
+
+    function boolValue(id, fallback = false) {
+      const el = document.getElementById(id);
+      if (!el) return fallback;
+      return el.value === "true";
+    }
+
     function getParams() {
       const strategyName = document.getElementById("strategy_name").value;
       const strategyParams = readStrategyParams();
+      const marketType = document.getElementById("market_type").value;
+      const isSpot = marketType === "spot";
+      const exitMode = document.getElementById("exit_mode").value || "static";
       return {
         symbol: document.getElementById("symbol").value.trim().toUpperCase(),
         interval: document.getElementById("interval").value,
-        market_type: document.getElementById("market_type").value,
+        market_type: marketType,
         initial_balance: Number(document.getElementById("initial_balance").value),
         fee_rate: Number(document.getElementById("fee_rate").value),
         slippage_bps: Number(document.getElementById("slippage_bps").value),
-        leverage: Number(document.getElementById("leverage").value),
-        allow_short: document.getElementById("allow_short").value === "true",
+        leverage: isSpot ? 1 : Number(document.getElementById("leverage").value),
+        max_leverage: Number(document.getElementById("max_leverage").value),
+        allow_short: !isSpot && document.getElementById("allow_short").value === "true",
         max_qty: Number(document.getElementById("max_qty").value),
+        maintenance_margin: Number(document.getElementById("maintenance_margin").value),
         position_sizing_mode: document.getElementById("position_sizing_mode").value,
         position_size_value: document.getElementById("position_size_value").value
           ? Number(document.getElementById("position_size_value").value)
@@ -646,7 +893,33 @@
           : {}),
         candle_limit: Number(document.getElementById("candle_limit").value),
         start: document.getElementById("start").value.trim() || null,
-        end: document.getElementById("end").value.trim() || null
+        end: document.getElementById("end").value.trim() || null,
+
+        include_equity: boolValue("include_equity", true),
+        equity_stride: intOrNull("equity_stride") ?? 1,
+        include_risk_events: true,
+        debug_risk_telemetry: boolValue("debug_risk_telemetry", false),
+        max_drawdown_pct: numOrNull("max_drawdown_pct"),
+        max_trades_per_day: intOrNull("max_trades_per_day"),
+        cooldown_seconds: intOrNull("cooldown_seconds") ?? 0,
+        stop_loss_pct: numOrNull("stop_loss_pct"),
+        take_profit_pct: numOrNull("take_profit_pct"),
+        exit_on_signal: boolValue("exit_on_signal", true),
+        exit_mode: exitMode,
+        atr_period: intOrNull("atr_period") ?? 14,
+        atr_stop_mult: numOrNull("atr_stop_mult"),
+        atr_take_mult: numOrNull("atr_take_mult"),
+        atr_reference_mode: document.getElementById("atr_reference_mode").value || "entry",
+        enable_volatility_scaling: boolValue("enable_volatility_scaling", false),
+        volatility_target_pct: numOrNull("volatility_target_pct"),
+        min_volatility_scale: numOrNull("min_volatility_scale"),
+        max_volatility_scale: numOrNull("max_volatility_scale"),
+        margin_mode: isSpot ? "isolated" : document.getElementById("margin_mode").value,
+        enable_liquidation: !isSpot && boolValue("enable_liquidation", true),
+        use_mark_price_for_liquidation: !isSpot && boolValue("use_mark_price_for_liquidation", true),
+        mark_price_source: isSpot ? "close" : document.getElementById("mark_price_source").value,
+        liquidation_fee_rate: numOrNull("liquidation_fee_rate") ?? 0.005,
+        maintenance_margin_override: isSpot ? null : numOrNull("maintenance_margin_override")
       };
     }
 
@@ -656,6 +929,7 @@
       tradesEl.textContent = "";
       resetMetricsView();
       renderTradesTable([]);
+      renderRiskEventsTable([]);
 
       try {
         const p = getParams();
@@ -675,6 +949,7 @@
         statusEl.textContent = "Done";
         renderMetrics(data.result?.metrics || null, data.result || {});
         renderTradesTable(data.result?.trades || []);
+        renderRiskEventsTable(data.result?.risk_events || []);
         resultsEl.textContent = JSON.stringify(data.result ?? data, null, 2);
         tradesEl.textContent = JSON.stringify(data.result?.trades ?? [], null, 2);
       } catch (e) {
