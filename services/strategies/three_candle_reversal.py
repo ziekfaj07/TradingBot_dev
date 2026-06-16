@@ -143,3 +143,18 @@ class ThreeCandleReversalStrategy(BaseStrategy):
         d.loc[bearish_mask, "pattern"] = "bearish_3cr"
 
         return d
+
+
+class ThreeCandleReversalV2Strategy(ThreeCandleReversalStrategy):
+    name = "three_candle_reversal_v2"
+    display_name = "3-Candle Reversal V2"
+    description = "3-candle reversal gated by a configurable volume spike filter."
+    default_params = {
+        **ThreeCandleReversalStrategy.default_params,
+        "volume_spike_mult": 1.5,
+        "volume_spike_lookback": 20,
+    }
+    min_bars = 21
+
+    def apply(self, df: pd.DataFrame) -> pd.DataFrame:
+        return self.apply_volume_spike_filter(super().apply(df))

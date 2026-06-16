@@ -252,14 +252,25 @@ class ModeController:
             if kwargs.get("ema_long") is not None:
                 incoming["long"] = int(kwargs["ema_long"])
 
-            if strategy_name == "ema_crossover":
+            def add_volume_spike_defaults(params: dict, source: dict) -> dict:
+                params["volume_spike_mult"] = source.get("volume_spike_mult", 1.5)
+                params["volume_spike_lookback"] = source.get("volume_spike_lookback", 20)
+                params["volume_spike_mult"] = float(params["volume_spike_mult"])
+                params["volume_spike_lookback"] = int(params["volume_spike_lookback"])
+                return params
+
+            if strategy_name in {"ema_crossover", "ema_crossover_v2"}:
                 clean = {
                     "short": int(incoming.get("short", 9)),
                     "long": int(incoming.get("long", 21)),
                 }
-            elif strategy_name == "donchian_breakout":
+                if strategy_name == "ema_crossover_v2":
+                    clean = add_volume_spike_defaults(clean, incoming)
+            elif strategy_name in {"donchian_breakout", "donchian_breakout_v2"}:
                 clean = {"lookback": int(incoming.get("lookback", 20))}
-            elif strategy_name == "three_candle_reversal":
+                if strategy_name == "donchian_breakout_v2":
+                    clean = add_volume_spike_defaults(clean, incoming)
+            elif strategy_name in {"three_candle_reversal", "three_candle_reversal_v2"}:
                 clean = {
                     "min_body_ratio": float(incoming.get("min_body_ratio", 0.55)),
                     "require_full_range_engulf": bool(
@@ -269,6 +280,10 @@ class ModeController:
                         incoming.get("confirm_break_prev_extreme", True)
                     ),
                 }
+                if strategy_name == "three_candle_reversal_v2":
+                    clean = add_volume_spike_defaults(clean, incoming)
+            elif strategy_name == "bollinger_mean_reversion_v2":
+                clean = add_volume_spike_defaults(incoming, incoming)
             else:
                 clean = incoming
 
@@ -318,9 +333,13 @@ class ModeController:
         params = dict(getattr(cfg, "strategy_params", {}) or {})
         strategy_name = self._resolved_strategy_name_from_config(cfg)
 
-        if strategy_name == "ema_crossover":
+        if strategy_name in {"ema_crossover", "ema_crossover_v2"}:
             params.setdefault("short", int(getattr(cfg, "ema_short", 9)))
             params.setdefault("long", int(getattr(cfg, "ema_long", 21)))
+
+        if strategy_name.endswith("_v2"):
+            params.setdefault("volume_spike_mult", 1.5)
+            params.setdefault("volume_spike_lookback", 20)
 
         return params
 

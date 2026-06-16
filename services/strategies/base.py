@@ -43,6 +43,40 @@ class BaseStrategy(ABC):
         except Exception:
             return 0
 
+    def apply_volume_spike_filter(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Gate non-zero signals behind a current-volume spike.
+
+        Version-2 strategies use this helper after computing their normal
+        signals. The rolling baseline is shifted by one bar so the current
+        candle's volume is not included in its own threshold.
+        """
+        if "signal" not in df.columns:
+            return df
+        if "volume" not in df.columns:
+            raise ValueError(
+                f"{self.display_name} requires a 'volume' column for volume spike filtering."
+            )
+
+        multiplier = max(0.000001, float(self.params.get("volume_spike_mult", 1.5)))
+        lookback = max(1, int(self.params.get("volume_spike_lookback", 20)))
+
+        d = df.copy()
+        volume = pd.to_numeric(d["volume"], errors="coerce").fillna(0.0)
+        baseline = volume.rolling(lookback, min_periods=lookback).mean().shift(1)
+        threshold = baseline * multiplier
+        spike_ok = (baseline > 0.0) & (volume >= threshold)
+
+        d["volume_spike_baseline"] = baseline
+        d["volume_spike_threshold"] = threshold
+        d["volume_spike_ok"] = spike_ok.fillna(False)
+
+        blocked = (d["signal"].fillna(0) != 0) & (~d["volume_spike_ok"])
+        d.loc[blocked, "signal"] = 0
+        if "pattern" in d.columns:
+            d.loc[blocked, "pattern"] = None
+
+        return d
+
     @classmethod
     def meta(cls) -> dict[str, Any]:
         return {

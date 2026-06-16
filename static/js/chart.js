@@ -65,7 +65,7 @@ window.chartModule = {
     const name = String(cfg.strategy_name || "ema_crossover").trim().toLowerCase();
     const params = { ...(cfg.strategy_params || {}) };
 
-    if (name === "ema_crossover") {
+    if (name === "ema_crossover" || name === "ema_crossover_v2") {
       if (params.short === undefined || params.short === null) {
         params.short = Number(cfg.ema_short ?? 9);
       }
@@ -587,7 +587,7 @@ window.chartModule = {
 
     const legend = [{ key: "pnlCurve", label: "PnL Curve" }];
 
-    if (name === "ema_crossover") {
+    if (name === "ema_crossover" || name === "ema_crossover_v2") {
       const shortPeriod = Math.max(1, Number(params.short ?? 9));
       const longPeriod = Math.max(shortPeriod + 1, Number(params.long ?? 21));
 
@@ -610,7 +610,7 @@ window.chartModule = {
 
       legend.push({ key: "emaShort", label: `EMA ${shortPeriod}` });
       legend.push({ key: "emaLong", label: `EMA ${longPeriod}` });
-    } else if (name === "bollinger_mean_reversion") {
+    } else if (name === "bollinger_mean_reversion" || name === "bollinger_mean_reversion_v2") {
       const length = Math.max(2, Number(params.length ?? 20));
       const stdDev = Math.max(0.000001, Number(params.std_dev ?? 2.0));
       const bands = this.calculateBollingerData(candles, length, stdDev);

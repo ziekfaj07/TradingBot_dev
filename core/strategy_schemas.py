@@ -27,14 +27,34 @@ class EmaCrossoverParams(StrategyParamsBase):
         return self
 
 
+class VolumeSpikeParams(StrategyParamsBase):
+    volume_spike_mult: float = Field(1.5, gt=0.0)
+    volume_spike_lookback: int = Field(20, ge=1)
+
+
+class EmaCrossoverV2Params(EmaCrossoverParams):
+    volume_spike_mult: float = Field(1.5, gt=0.0)
+    volume_spike_lookback: int = Field(20, ge=1)
+
+
 class DonchianBreakoutParams(StrategyParamsBase):
     lookback: int = Field(..., ge=2)
+
+
+class DonchianBreakoutV2Params(DonchianBreakoutParams):
+    volume_spike_mult: float = Field(1.5, gt=0.0)
+    volume_spike_lookback: int = Field(20, ge=1)
 
 
 class ThreeCandleReversalParams(StrategyParamsBase):
     min_body_ratio: float = Field(0.55, gt=0.0, le=1.0)
     require_full_range_engulf: bool = True
     confirm_break_prev_extreme: bool = True
+
+
+class ThreeCandleReversalV2Params(ThreeCandleReversalParams):
+    volume_spike_mult: float = Field(1.5, gt=0.0)
+    volume_spike_lookback: int = Field(20, ge=1)
 
 
 class BollingerMeanReversionParams(StrategyParamsBase):
@@ -72,6 +92,11 @@ class BollingerMeanReversionParams(StrategyParamsBase):
                 out[new_key] = out.pop(old_key)
 
         return out
+
+
+class BollingerMeanReversionV2Params(BollingerMeanReversionParams):
+    volume_spike_mult: float = Field(1.5, gt=0.0)
+    volume_spike_lookback: int = Field(20, ge=1)
 
 
 class AtrRiskParams(StrategyParamsBase):
@@ -154,9 +179,21 @@ StrategyRegistry.register(
 )
 
 StrategyRegistry.register(
+    "ema_crossover_v2",
+    EmaCrossoverV2Params,
+    aliases=("ema_v2",),
+)
+
+StrategyRegistry.register(
     "donchian_breakout",
     DonchianBreakoutParams,
     aliases=("donchian",),
+)
+
+StrategyRegistry.register(
+    "donchian_breakout_v2",
+    DonchianBreakoutV2Params,
+    aliases=("donchian_v2",),
 )
 
 StrategyRegistry.register(
@@ -166,7 +203,19 @@ StrategyRegistry.register(
 )
 
 StrategyRegistry.register(
+    "three_candle_reversal_v2",
+    ThreeCandleReversalV2Params,
+    aliases=("3cr_v2",),
+)
+
+StrategyRegistry.register(
     "bollinger_mean_reversion",
     BollingerMeanReversionParams,
     aliases=("bb_mean_reversion", "bollinger", "bbmr"),
+)
+
+StrategyRegistry.register(
+    "bollinger_mean_reversion_v2",
+    BollingerMeanReversionV2Params,
+    aliases=("bb_mean_reversion_v2", "bollinger_v2", "bbmr_v2"),
 )

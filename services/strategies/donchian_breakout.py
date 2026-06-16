@@ -35,3 +35,18 @@ class DonchianBreakoutStrategy(BaseStrategy):
         d.loc[d["close"] < d["channel_low"], "signal"] = -1
 
         return d
+
+
+class DonchianBreakoutV2Strategy(DonchianBreakoutStrategy):
+    name = "donchian_breakout_v2"
+    display_name = "Donchian Breakout V2"
+    description = "Donchian breakout gated by a configurable volume spike filter."
+    default_params = {
+        **DonchianBreakoutStrategy.default_params,
+        "volume_spike_mult": 1.5,
+        "volume_spike_lookback": 20,
+    }
+    min_bars = 21
+
+    def apply(self, df: pd.DataFrame) -> pd.DataFrame:
+        return self.apply_volume_spike_filter(super().apply(df))

@@ -140,3 +140,18 @@ class BollingerMeanReversion(BaseStrategy):
             d.loc[(long_mid_exit | short_mid_exit).fillna(False), "signal"] = 0
 
         return d
+
+
+class BollingerMeanReversionV2(BollingerMeanReversion):
+    name = "bollinger_mean_reversion_v2"
+    display_name = "Bollinger Mean Reversion V2"
+    description = "Bollinger mean reversion gated by a configurable volume spike filter."
+    default_params = {
+        **BollingerMeanReversion.default_params,
+        "volume_spike_mult": 1.5,
+        "volume_spike_lookback": 20,
+    }
+    min_bars = 22
+
+    def apply(self, df: pd.DataFrame) -> pd.DataFrame:
+        return self.apply_volume_spike_filter(super().apply(df))

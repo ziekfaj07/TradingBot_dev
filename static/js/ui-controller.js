@@ -1,10 +1,28 @@
 const FALLBACK_STRATEGY_DEFAULT_PARAMS = Object.freeze({
   ema_crossover: { short: 9, long: 21 },
+  ema_crossover_v2: {
+    short: 9,
+    long: 21,
+    volume_spike_mult: 1.5,
+    volume_spike_lookback: 20,
+  },
   donchian_breakout: { lookback: 20 },
+  donchian_breakout_v2: {
+    lookback: 20,
+    volume_spike_mult: 1.5,
+    volume_spike_lookback: 20,
+  },
   three_candle_reversal: {
     min_body_ratio: 0.55,
     require_full_range_engulf: true,
     confirm_break_prev_extreme: true,
+  },
+  three_candle_reversal_v2: {
+    min_body_ratio: 0.55,
+    require_full_range_engulf: true,
+    confirm_break_prev_extreme: true,
+    volume_spike_mult: 1.5,
+    volume_spike_lookback: 20,
   },
   bollinger_mean_reversion: {
     length: 20,
@@ -12,6 +30,15 @@ const FALLBACK_STRATEGY_DEFAULT_PARAMS = Object.freeze({
     min_band_width_pct: 0.01,
     exit_on_mid: true,
     allow_short: false,
+  },
+  bollinger_mean_reversion_v2: {
+    length: 20,
+    std_dev: 2.0,
+    min_band_width_pct: 0.01,
+    exit_on_mid: true,
+    allow_short: false,
+    volume_spike_mult: 1.5,
+    volume_spike_lookback: 20,
   },
 });
 
@@ -291,7 +318,7 @@ window.uiController = {
       live_poll_seconds: numOrNull("live_poll_seconds") ?? 3,
     };
 
-    if (strategyName === "ema_crossover") {
+    if (strategyName === "ema_crossover" || strategyName === "ema_crossover_v2") {
       const emaShort = Number(strategyParams.short);
       const emaLong = Number(strategyParams.long);
       if (Number.isFinite(emaShort)) payload.ema_short = emaShort;

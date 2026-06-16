@@ -36,3 +36,18 @@ class EmaCrossoverStrategy(BaseStrategy):
         d.loc[(prev >= 0) & (curr < 0), "signal"] = -1
 
         return d
+
+
+class EmaCrossoverV2Strategy(EmaCrossoverStrategy):
+    name = "ema_crossover_v2"
+    display_name = "EMA Crossover V2"
+    description = "EMA crossover gated by a configurable volume spike filter."
+    default_params = {
+        **EmaCrossoverStrategy.default_params,
+        "volume_spike_mult": 1.5,
+        "volume_spike_lookback": 20,
+    }
+    min_bars = 22
+
+    def apply(self, df: pd.DataFrame) -> pd.DataFrame:
+        return self.apply_volume_spike_filter(super().apply(df))

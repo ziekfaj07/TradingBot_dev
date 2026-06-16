@@ -54,6 +54,8 @@ def preview_strategy(
     min_body_ratio: float | None = None,
     require_full_range_engulf: bool | None = None,
     confirm_break_prev_extreme: bool | None = None,
+    volume_spike_mult: float | None = Query(default=None, gt=0.0),
+    volume_spike_lookback: int | None = Query(default=None, ge=1),
 ):
     try:
         params: dict[str, Any] = {}
@@ -65,6 +67,8 @@ def preview_strategy(
             "min_body_ratio": min_body_ratio,
             "require_full_range_engulf": require_full_range_engulf,
             "confirm_break_prev_extreme": confirm_break_prev_extreme,
+            "volume_spike_mult": volume_spike_mult,
+            "volume_spike_lookback": volume_spike_lookback,
         }
 
         for key, value in optional_params.items():
