@@ -313,3 +313,78 @@ class CCXTExchangeAdapter:
             raise ExchangeAuthError(str(exc)) from exc
         except Exception as exc:
             raise ExchangeConnectionError(str(exc)) from exc
+
+    def fetch_order(
+        self,
+        *,
+        order_id: str,
+        symbol: str,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self._require_credentials()
+        normalized_symbol = self.normalize_symbol(symbol, self.public_market_type)
+        try:
+            return self.client.fetch_order(str(order_id), normalized_symbol, params or {})
+        except ccxt.AuthenticationError as exc:
+            raise ExchangeAuthError(str(exc)) from exc
+        except Exception as exc:
+            raise ExchangeConnectionError(str(exc)) from exc
+
+    def fetch_my_trades(
+        self,
+        symbol: str,
+        since: int | None = None,
+        limit: int | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        self._require_credentials()
+        normalized_symbol = self.normalize_symbol(symbol, self.public_market_type)
+        try:
+            return list(
+                self.client.fetch_my_trades(
+                    normalized_symbol,
+                    since=since,
+                    limit=limit,
+                    params=params or {},
+                )
+                or []
+            )
+        except ccxt.AuthenticationError as exc:
+            raise ExchangeAuthError(str(exc)) from exc
+        except Exception as exc:
+            raise ExchangeConnectionError(str(exc)) from exc
+
+    def get_position_mode(self) -> str | None:
+        try:
+            if hasattr(self.client, "fetch_position_mode"):
+                payload = self.client.fetch_position_mode()
+                if isinstance(payload, dict):
+                    mode = payload.get("mode") or payload.get("positionMode")
+                    return str(mode) if mode else None
+            return None
+        except Exception:
+            return None
+
+    def contract_size_for_symbol(self, symbol: str) -> float | None:
+        normalized_symbol = self.normalize_symbol(symbol, self.public_market_type)
+        try:
+            markets = self.client.load_markets()
+            market = markets.get(normalized_symbol)
+            if not market:
+                return None
+            info = market.get("info") if isinstance(market.get("info"), dict) else {}
+            for candidate in (
+                market.get("contractSize"),
+                market.get("contract_size"),
+                info.get("contractSize"),
+                info.get("contract_size"),
+                info.get("quanto_multiplier"),
+            ):
+                if candidate is None or candidate == "":
+                    continue
+                value = float(candidate)
+                if value > 0.0:
+                    return value
+        except Exception:
+            return None
+        return None

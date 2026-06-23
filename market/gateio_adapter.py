@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Any, cast
 
 import ccxt
 
@@ -41,19 +41,20 @@ class GateIOAdapter:
             api_passphrase=(api_passphrase or "").strip() or None,
         )
 
-        self.client = ccxt.gateio(
-            {
-                "apiKey": self.credentials.api_key,
-                "secret": self.credentials.api_secret,
-                "password": self.credentials.api_passphrase,
-                "enableRateLimit": enable_rate_limit,
-                "timeout": int(timeout_ms),
-                "options": {
-                    "defaultType": self.market_type,
-                    "createMarketBuyOrderRequiresPrice": False,
-                },
-            }
-        )
+        client_config: dict[str, Any] = {
+            "apiKey": self.credentials.api_key,
+            "secret": self.credentials.api_secret,
+            "enableRateLimit": enable_rate_limit,
+            "timeout": int(timeout_ms),
+            "options": {
+                "defaultType": self.market_type,
+                "createMarketBuyOrderRequiresPrice": False,
+            },
+        }
+        if self.credentials.api_passphrase is not None:
+            client_config["password"] = self.credentials.api_passphrase
+
+        self.client = ccxt.gateio(cast(Any, client_config))
 
         if self.testnet and hasattr(self.client, "set_sandbox_mode"):
             try:
@@ -188,7 +189,9 @@ class GateIOAdapter:
         public_market_type = normalize_market_type(market_type)
         normalized_market_type = self._normalize_market_type(public_market_type)
         if normalized_market_type != self.market_type:
-            self.client.options["defaultType"] = normalized_market_type
+            options = dict(getattr(self.client, "options", {}) or {})
+            options["defaultType"] = normalized_market_type
+            self.client.options = cast(Any, options)
             self.market_type = normalized_market_type
             self.public_market_type = public_market_type
 
@@ -225,7 +228,7 @@ class GateIOAdapter:
     def fetch_ticker(self, symbol: str) -> dict[str, Any]:
         normalized_symbol = self.normalize_symbol(symbol)
         try:
-            return self.client.fetch_ticker(normalized_symbol)
+            return cast(dict[str, Any], self.client.fetch_ticker(normalized_symbol))
         except Exception as exc:
             raise ExchangeConnectionError(str(exc)) from exc
 
@@ -233,7 +236,10 @@ class GateIOAdapter:
         self._require_credentials()
         normalized_symbol = self.normalize_symbol(symbol) if symbol else None
         try:
-            return self.client.fetch_open_orders(normalized_symbol)
+            return cast(
+                list[dict[str, Any]],
+                list(self.client.fetch_open_orders(normalized_symbol) or []),
+            )
         except ccxt.AuthenticationError as exc:
             raise ExchangeAuthError(str(exc)) from exc
         except Exception as exc:
@@ -248,7 +254,7 @@ class GateIOAdapter:
             raise ExchangeAuthError(str(exc)) from exc
         except Exception as exc:
             raise ExchangeConnectionError(str(exc)) from exc
-        return list(positions or [])
+        return cast(list[dict[str, Any]], list(positions or []))
 
     def set_margin_mode(
         self,
@@ -306,7 +312,11 @@ class GateIOAdapter:
             params["marginMode"] = str(margin_mode).lower()
             params["margin_mode"] = str(margin_mode).lower()
         try:
-            result = self.client.set_leverage(float(leverage), normalized_symbol, params)
+            result = self.client.set_leverage(
+                cast(Any, float(leverage)),
+                normalized_symbol,
+                params,
+            )
         except ccxt.AuthenticationError as exc:
             raise ExchangeAuthError(str(exc)) from exc
         except Exception as exc:
@@ -357,11 +367,52 @@ class GateIOAdapter:
         self._require_credentials()
         normalized_symbol = self.normalize_symbol(symbol)
         try:
-            return self.client.fetch_order(str(order_id), normalized_symbol, params or {})
+            return cast(
+                dict[str, Any],
+                self.client.fetch_order(str(order_id), normalized_symbol, params or {}),
+            )
         except ccxt.AuthenticationError as exc:
             raise ExchangeAuthError(str(exc)) from exc
         except Exception as exc:
             raise ExchangeConnectionError(str(exc)) from exc
+
+    def fetch_my_trades(
+        self,
+        symbol: str,
+        since: int | None = None,
+        limit: int | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        self._require_credentials()
+        normalized_symbol = self.normalize_symbol(symbol)
+        try:
+            return cast(
+                list[dict[str, Any]],
+                list(
+                    self.client.fetch_my_trades(
+                        normalized_symbol,
+                        since=since,
+                        limit=limit,
+                        params=params or {},
+                    )
+                    or []
+                ),
+            )
+        except ccxt.AuthenticationError as exc:
+            raise ExchangeAuthError(str(exc)) from exc
+        except Exception as exc:
+            raise ExchangeConnectionError(str(exc)) from exc
+
+    def get_position_mode(self) -> str | None:
+        try:
+            if hasattr(self.client, "fetch_position_mode"):
+                payload = self.client.fetch_position_mode()
+                if isinstance(payload, dict):
+                    mode = payload.get("mode") or payload.get("positionMode")
+                    return str(mode) if mode else None
+            return None
+        except Exception:
+            return None
 
     def contract_size_for_symbol(self, symbol: str) -> float | None:
         normalized_symbol = self.normalize_symbol(symbol)
@@ -402,13 +453,16 @@ class GateIOAdapter:
         self._require_credentials()
         normalized_symbol = self.normalize_symbol(symbol)
         try:
-            return self.client.create_order(
-                normalized_symbol,
-                str(order_type).lower(),
-                str(side).lower(),
-                float(amount),
-                None if price is None else float(price),
-                params or {},
+            return cast(
+                dict[str, Any],
+                self.client.create_order(
+                    normalized_symbol,
+                    cast(Any, str(order_type).lower()),
+                    cast(Any, str(side).lower()),
+                    float(amount),
+                    None if price is None else float(price),
+                    params or {},
+                ),
             )
         except ccxt.AuthenticationError as exc:
             raise ExchangeAuthError(str(exc)) from exc
@@ -425,7 +479,10 @@ class GateIOAdapter:
         self._require_credentials()
         normalized_symbol = self.normalize_symbol(symbol)
         try:
-            return self.client.cancel_order(str(order_id), normalized_symbol, params or {})
+            return cast(
+                dict[str, Any],
+                self.client.cancel_order(str(order_id), normalized_symbol, params or {}),
+            )
         except ccxt.AuthenticationError as exc:
             raise ExchangeAuthError(str(exc)) from exc
         except Exception as exc:

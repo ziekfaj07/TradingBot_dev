@@ -32,6 +32,49 @@ class ExchangeAdapter(Protocol):
 
     def fetch_positions(self, symbol: str | None = None) -> list[dict[str, Any]]: ...
 
+    def fetch_order(
+        self,
+        *,
+        order_id: str,
+        symbol: str,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]: ...
+
+    def fetch_my_trades(
+        self,
+        symbol: str,
+        since: int | None = None,
+        limit: int | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]: ...
+
+    def get_position_mode(self) -> str | None: ...
+
+    def contract_size_for_symbol(self, symbol: str) -> float | None: ...
+
+    def set_margin_mode(
+        self,
+        *,
+        margin_mode: str,
+        symbol: str,
+        leverage: float | None = None,
+    ) -> dict[str, Any]: ...
+
+    def set_leverage(
+        self,
+        *,
+        leverage: float,
+        symbol: str,
+        margin_mode: str | None = None,
+    ) -> dict[str, Any]: ...
+
+    def fetch_effective_leverage(
+        self,
+        *,
+        symbol: str,
+        margin_mode: str | None = None,
+    ) -> dict[str, Any]: ...
+
     def create_order(
         self,
         *,
