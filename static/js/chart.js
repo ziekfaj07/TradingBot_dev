@@ -106,6 +106,12 @@ window.chartModule = {
       } catch (_) {}
 
       try {
+        if (state.volumeSeries) {
+          state.chart.removeSeries(state.volumeSeries);
+        }
+      } catch (_) {}
+
+      try {
         state.chart.remove();
       } catch (_) {}
 
@@ -119,6 +125,7 @@ window.chartModule = {
       state.tooltipInitialized = false;
       state.visibleRangeSubscribed = false;
       state.pnlSeries = null;
+      state.volumeSeries = null;
       state.pnlCurveData = [];
       state.selectedMarker = null;
     }
@@ -147,7 +154,7 @@ window.chartModule = {
           borderColor: "rgba(148, 163, 184, 0.22)",
           scaleMargins: {
             top: 0.12,
-            bottom: 0.12,
+            bottom: 0.24,
           },
         },
         localization: {
@@ -191,6 +198,7 @@ window.chartModule = {
       }
     }
 
+    this.ensureVolumeSeries();
     this.ensurePnlSeries();
 
     if (!state.visibleRangeSubscribed) {
@@ -225,6 +233,7 @@ window.chartModule = {
         high: Number(candle?.high),
         low: Number(candle?.low),
         close: Number(candle?.close),
+        volume: Number(candle?.volume ?? 0),
       };
 
       if (
@@ -234,6 +243,9 @@ window.chartModule = {
         Number.isFinite(clean.low) &&
         Number.isFinite(clean.close)
       ) {
+        if (!Number.isFinite(clean.volume) || clean.volume < 0) {
+          clean.volume = 0;
+        }
         map.set(clean.time, clean);
       }
     }
@@ -415,8 +427,8 @@ window.chartModule = {
         visible: true,
         borderColor: "rgba(148, 163, 184, 0.15)",
         scaleMargins: {
-          top: 0.70,
-          bottom: 0.02,
+          top: 0.66,
+          bottom: 0.18,
         },
       });
     } catch (_) {}
@@ -430,6 +442,62 @@ window.chartModule = {
       priceScaleId: "pnl",
     });
     return state.pnlSeries;
+  },
+
+  ensureVolumeSeries() {
+    if (!state.chart) return null;
+    if (state.volumeSeries) return state.volumeSeries;
+
+    try {
+      state.chart.priceScale("volume").applyOptions({
+        visible: false,
+        scaleMargins: {
+          top: 0.82,
+          bottom: 0.00,
+        },
+      });
+    } catch (_) {}
+
+    state.volumeSeries = state.chart.addSeries(LightweightCharts.HistogramSeries, {
+      priceScaleId: "volume",
+      priceFormat: {
+        type: "volume",
+      },
+      priceLineVisible: false,
+      lastValueVisible: false,
+    });
+
+    return state.volumeSeries;
+  },
+
+  volumeData(candles) {
+    if (!Array.isArray(candles)) return [];
+
+    return candles
+      .map((candle) => {
+        const volume = Number(candle?.volume ?? 0);
+        const open = Number(candle?.open);
+        const close = Number(candle?.close);
+
+        if (!Number.isFinite(Number(candle?.time)) || !Number.isFinite(volume)) {
+          return null;
+        }
+
+        return {
+          time: Number(candle.time),
+          value: Math.max(0, volume),
+          color: close >= open
+            ? "rgba(34, 197, 94, 0.32)"
+            : "rgba(239, 68, 68, 0.32)",
+        };
+      })
+      .filter(Boolean);
+  },
+
+  syncVolumeOverlay(candles) {
+    const series = this.ensureVolumeSeries();
+    if (!series) return;
+    series.setData(this.volumeData(candles));
   },
 
   calculateEmaData(candles, period) {
@@ -684,6 +752,9 @@ window.chartModule = {
     if (state.candleSeries) {
       state.candleSeries.setData([]);
     }
+    if (state.volumeSeries) {
+      state.volumeSeries.setData([]);
+    }
 
     state.chartCandles = [];
     state.chartMarkers = [];
@@ -713,6 +784,7 @@ window.chartModule = {
     const markers = this.sanitizeMarkers(data?.markers);
 
     refs.candleSeries.setData(candles);
+    this.syncVolumeOverlay(candles);
     state.chartCandles = candles;
 
     this.applyMarkers(markers);
@@ -777,6 +849,7 @@ window.chartModule = {
     if (!candle) return;
 
     refs.candleSeries.update(candle);
+    state.volumeSeries?.update(this.volumeData([candle])[0]);
 
     const candles = Array.isArray(state.chartCandles) ? [...state.chartCandles] : [];
     const existingIndex = candles.findIndex((item) => item.time === candle.time);
@@ -1008,6 +1081,7 @@ window.chartModule = {
     const markerSlice = (state.rawChartMarkers || []).filter((marker) => Number(marker.time) <= replayTime);
 
     state.candleSeries?.setData(candles);
+    this.syncVolumeOverlay(candles);
     this.applyMarkers(markerSlice, { preserveRaw: true });
     this.focusMarker(current);
   },
@@ -1061,6 +1135,7 @@ window.chartModule = {
     }
     qs("replayExitBtn")?.classList.add("hidden");
     state.candleSeries?.setData(state.chartCandles);
+    this.syncVolumeOverlay(state.chartCandles);
     this.applyMarkers(state.rawChartMarkers, { preserveRaw: true });
     this.renderTradeDetails(state.selectedMarker);
     if (state.autoFollow) {

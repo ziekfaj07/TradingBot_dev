@@ -12,6 +12,7 @@ window.state = {
   rawChartMarkers: [],
   chartCandles: [],
   indicatorSeries: {},
+  volumeSeries: null,
   lastChartKey: null,
   lastCandleTime: null,
   autoFollow: true,
