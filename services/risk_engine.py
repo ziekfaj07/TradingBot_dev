@@ -67,6 +67,10 @@ class RiskEngine:
             "equitypct": "equity_pct",
             "equity-percent": "equity_pct",
             "equity_percentage": "equity_pct",
+            "maxqty": "max_qty",
+            "max-qty": "max_qty",
+            "maximum_qty": "max_qty",
+            "maximum_quantity": "max_qty",
             "riskpct": "risk_pct",
             "risk-percent": "risk_pct",
             "risk_percentage": "risk_pct",
@@ -341,6 +345,34 @@ class RiskEngine:
             telemetry["rejected"] = True
             telemetry["rejection_reason"] = "all_in_uses_engine_default"
             return None, self._finalize_entry_sizing_telemetry(telemetry)
+
+        if mode == "max_qty":
+            if max_qty_safe <= 0.0:
+                telemetry["rejected"] = True
+                telemetry["rejection_reason"] = "invalid_max_qty"
+                return None, self._finalize_entry_sizing_telemetry(telemetry)
+
+            qty = max_qty_safe
+            telemetry["computed_qty_before_clamps"] = qty
+
+            if mt == "spot":
+                max_affordable_qty = cash / px if px > 0.0 else 0.0
+                if qty > max_affordable_qty:
+                    qty = max_affordable_qty
+                    telemetry["clamps"].append("cash_cap")
+            else:
+                max_notional = cash * lev
+                desired_notional = qty * px
+                if desired_notional > max_notional and px > 0.0:
+                    qty = max_notional / px
+                    telemetry["clamps"].append("max_notional_cap")
+
+            if not math.isfinite(qty) or qty <= 0.0:
+                telemetry["computed_qty_after_clamps"] = 0.0
+                return 0.0, self._finalize_entry_sizing_telemetry(telemetry)
+
+            telemetry["computed_qty_after_clamps"] = qty
+            return qty, self._finalize_entry_sizing_telemetry(telemetry)
 
         if value <= 0.0:
             telemetry["rejected"] = True

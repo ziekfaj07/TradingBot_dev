@@ -25,6 +25,7 @@ class BacktestService:
         mark_price_source: str,
         liquidation_fee_rate: float,
         maintenance_margin_override: float | None,
+        max_qty: float,
         position_sizing_mode: str,
         position_size_value: float | None,
         enable_volatility_scaling: bool,
@@ -59,6 +60,9 @@ class BacktestService:
         if liquidation_fee_rate < 0.0:
             return "liquidation_fee_rate must be >= 0"
 
+        if max_qty <= 0.0:
+            return "max_qty must be > 0"
+
         if maintenance_margin_override is not None:
             try:
                 normalize_maintenance_margin_override(maintenance_margin_override)
@@ -72,17 +76,21 @@ class BacktestService:
             "fixed_usdt",
             "fixed_pct",
             "equity_pct",
+            "max_qty",
             "risk_pct",
         }
         if sizing_mode not in valid_sizing_modes:
             return (
                 "position_sizing_mode must be one of: "
-                "all_in, fixed_usdt, fixed_pct, equity_pct, risk_pct"
+                "all_in, fixed_usdt, fixed_pct, equity_pct, max_qty, risk_pct"
             )
 
         if sizing_mode in {"fixed_usdt", "fixed_pct", "equity_pct", "risk_pct"}:
             if position_size_value is None or float(position_size_value) <= 0.0:
                 return f"position_size_value must be > 0 for sizing mode '{sizing_mode}'"
+
+        if sizing_mode == "max_qty" and float(max_qty) <= 0.0:
+            return "max_qty must be > 0 when position_sizing_mode='max_qty'"
 
         if sizing_mode == "risk_pct":
             normalized_exit_mode = str(exit_mode or "static").strip().lower()
@@ -173,6 +181,7 @@ class BacktestService:
         allow_short: bool = False,
         leverage: float = 1.0,
         maintenance_margin: float = 0.005,
+        max_qty: float = 10.0,
         include_equity: bool = False,
         equity_stride: int = 1,
         position_sizing_mode: str = "all_in",
@@ -223,6 +232,7 @@ class BacktestService:
             mark_price_source=mark_price_source,
             liquidation_fee_rate=liquidation_fee_rate,
             maintenance_margin_override=maintenance_margin_override,
+            max_qty=max_qty,
             position_sizing_mode=position_sizing_mode,
             position_size_value=position_size_value,
             enable_volatility_scaling=enable_volatility_scaling,
@@ -262,7 +272,7 @@ class BacktestService:
             liquidation_fee_rate=liquidation_fee_rate,
             slippage_bps=slippage_bps,
             max_leverage=50.0,
-            max_qty=10.0,
+            max_qty=max_qty,
             maintenance_margin=maintenance_margin,
         )
 
@@ -332,6 +342,7 @@ class BacktestService:
                 "allow_short": allow_short,
                 "leverage": leverage,
                 "maintenance_margin": maintenance_margin,
+                "max_qty": max_qty,
                 "maintenance_margin_override": effective_mm_override,
                 "include_equity": include_equity,
                 "equity_stride": equity_stride,

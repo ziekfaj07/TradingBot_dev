@@ -161,7 +161,6 @@ window.uiController = {
       "leverage",
       "maintenance_margin",
       "max_leverage",
-      "max_qty",
       "position_sizing_mode",
       "position_size_value",
       "include_equity",
@@ -204,6 +203,15 @@ window.uiController = {
       } else {
         el.value = String(cfg[key]);
       }
+    }
+
+    if (
+      cfg.position_sizing_mode === "max_qty" &&
+      cfg.max_qty !== undefined &&
+      cfg.max_qty !== null &&
+      qs("position_size_value")
+    ) {
+      qs("position_size_value").value = String(cfg.max_qty);
     }
 
     if (qs("strategy_params_json")) {
@@ -262,6 +270,15 @@ window.uiController = {
       throw new Error("Strategy Params JSON must be an object.");
     }
 
+    const positionSizingMode = qs("position_sizing_mode")?.value || "all_in";
+    const positionSizeValue = numOrNull("position_size_value");
+    if (
+      positionSizingMode === "max_qty" &&
+      (positionSizeValue === null || positionSizeValue <= 0)
+    ) {
+      throw new Error("Sizing Value / Max Qty must be > 0 when Position Sizing is Max Quantity.");
+    }
+
     const payload = {
       symbol: qs("symbol").value,
       interval: qs("interval").value,
@@ -276,11 +293,8 @@ window.uiController = {
       leverage: Number(qs("leverage").value),
       maintenance_margin: Number(qs("maintenance_margin").value),
       max_leverage: Number(qs("max_leverage").value),
-      max_qty: Number(qs("max_qty").value),
-      position_sizing_mode: qs("position_sizing_mode")?.value || "all_in",
-      position_size_value: qs("position_size_value")?.value
-        ? Number(qs("position_size_value").value)
-        : null,
+      position_sizing_mode: positionSizingMode,
+      position_size_value: positionSizingMode === "max_qty" ? null : positionSizeValue,
 
       include_equity: qs("include_equity").value === "true",
       equity_stride: Number(qs("equity_stride").value),
@@ -317,6 +331,10 @@ window.uiController = {
       cancel_open_orders_on_stop: boolValue("cancel_open_orders_on_stop", false),
       live_poll_seconds: numOrNull("live_poll_seconds") ?? 3,
     };
+
+    if (positionSizingMode === "max_qty") {
+      payload.max_qty = positionSizeValue;
+    }
 
     if (strategyName === "ema_crossover" || strategyName === "ema_crossover_v2") {
       const emaShort = Number(strategyParams.short);
